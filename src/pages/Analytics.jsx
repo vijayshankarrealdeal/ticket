@@ -17,14 +17,15 @@ export default function Analytics() {
 
   return (
     <>
-      <TopBar left={<div className="top-bar-title">Analytics</div>} />
+      <TopBar
+        left={
+          <>
+            <div className="top-bar-title">Analytics</div>
+            <span className="top-bar-subcount">Performance across channels and agents</span>
+          </>
+        }
+      />
       <div className="page-scroll">
-        <div className="page-header">
-          <div>
-            <div className="page-title">Analytics</div>
-            <div className="page-sub">Performance metrics across channels and agents.</div>
-          </div>
-        </div>
         <div className="stat-row">
           <div className="stat">
             <div className="label">Tickets this week</div>
