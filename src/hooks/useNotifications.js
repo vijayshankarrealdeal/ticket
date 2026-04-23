@@ -11,6 +11,33 @@ const emit = () => listeners.forEach((l) => l());
 const subscribe = (l) => { listeners.add(l); return () => listeners.delete(l); };
 const getSnapshot = () => state;
 
+let audioCtx = null;
+function playNotificationSound() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    if (!audioCtx) audioCtx = new Ctx();
+    // Some browsers suspend the context until a user gesture; resume best-effort.
+    if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    const now = audioCtx.currentTime;
+    const gain = audioCtx.createGain();
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.18, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.35);
+    gain.connect(audioCtx.destination);
+    const tone = (freq, start, dur) => {
+      const osc = audioCtx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, now + start);
+      osc.connect(gain);
+      osc.start(now + start);
+      osc.stop(now + start + dur);
+    };
+    tone(880, 0, 0.18);
+    tone(1320, 0.12, 0.22);
+  } catch { /* ignore */ }
+}
+
 function attachRealtime() {
   if (currentUnsub) return;
   try {
@@ -22,6 +49,7 @@ function attachRealtime() {
       if (evt.type === 'notification.created') {
         state = [evt.data, ...state];
         emit();
+        playNotificationSound();
       }
     });
   } catch { /* ignore */ }

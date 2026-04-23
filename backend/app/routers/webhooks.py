@@ -27,12 +27,22 @@ from uuid import uuid4
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 
 from ..db import get_db, jl, js
+from ..rate_limit import allow as rate_limit_allow
 from ..ws import broker
 from .conversations import (
     ingest_inbound_message,
     resolve_or_create_conversation,
     resolve_or_create_customer,
 )
+
+
+async def _rl_guard(provider: str, scope: str | None) -> None:
+    """Debit one rate-limit token for this (provider, scope) bucket; raise 429
+    if the bucket is empty. Scope defaults to the provider itself so unknown-
+    origin POSTs share one global bucket and can't DoS the API."""
+    key = scope or provider
+    if not await rate_limit_allow(provider, key):
+        raise HTTPException(429, f"rate limited: {provider}")
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["webhooks"])
@@ -128,6 +138,7 @@ async def whatsapp_inbound(
             ws_id = await _default_workspace_for("whatsapp", phone_number_id)
             if not ws_id:
                 continue
+            await _rl_guard("whatsapp", ws_id)
             contacts = {c.get("wa_id"): c for c in (value.get("contacts") or [])}
             for m in value.get("messages") or []:
                 wa_id = m.get("from")
@@ -190,6 +201,7 @@ async def gmail_push(request: Request) -> dict:
     ws_id = await _default_workspace_for("gmail", email_addr)
     if not ws_id:
         return {"ok": True, "ignored": True}
+    await _rl_guard("gmail", ws_id)
     # Without a Gmail fetch, we record a skeleton inbound. Real adapter would
     # iterate history → messages.get → parse RFC-822 body.
     snippet = payload.get("snippet") or "New email received"
@@ -234,6 +246,7 @@ async def outlook_push(
         ws_id = await _default_workspace_for("outlook", tenant)
         if not ws_id:
             continue
+        await _rl_guard("outlook", ws_id)
         # Real adapter would call /me/messages/{id} on delta; for dev we synthesise.
         data = note.get("resourceData") or {}
         subject = data.get("subject") or "Outlook message"
@@ -289,6 +302,7 @@ async def instagram_inbound(
         ws_id = await _default_workspace_for("instagram", page_id)
         if not ws_id:
             continue
+        await _rl_guard("instagram", ws_id)
         for m in entry.get("messaging", []) or []:
             sender = (m.get("sender") or {}).get("id")
             text = (m.get("message") or {}).get("text") or ""
@@ -333,6 +347,7 @@ async def shopify_webhook(
     ws_id = await _default_workspace_for("shopify", x_shopify_shop_domain)
     if not ws_id:
         return {"ok": True, "ignored": True}
+    await _rl_guard("shopify", x_shopify_shop_domain or ws_id)
     payload = json.loads(raw or b"{}")
     topic = (x_shopify_topic or "").strip()
     db = await get_db()
@@ -427,6 +442,8 @@ async def slack_events(request: Request) -> dict:
         return {"challenge": payload.get("challenge")}
     team_id = payload.get("team_id")
     ws_id = await _default_workspace_for("slack", team_id)
+    if ws_id:
+        await _rl_guard("slack", ws_id)
     event = payload.get("event") or {}
     # Route `message` events back into the teams chat for now; interactive
     # component callbacks land at the /interactions endpoint.
@@ -490,6 +507,7 @@ async def voice_webhook(request: Request) -> dict:
     ws_id = await _default_workspace_for("twilio", body.get("AccountSid"))
     if not ws_id:
         return {"ok": True, "ignored": True}
+    await _rl_guard("voice", ws_id)
     phone = body.get("From") or body.get("CallerNumber")
     recording = body.get("RecordingUrl") or body.get("RecordingURL") or body.get("recording_url")
     duration = body.get("CallDuration") or body.get("DialCallDuration") or "0"

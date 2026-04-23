@@ -635,7 +635,12 @@ def _classify_stage_one(text: str) -> tuple[str, str | None, float, str]:
     for tokens, intent in INTENT_KEYWORDS:
         if any(tok in t for tok in tokens):
             return intent, order_ref, 0.8, f"matched keyword → {intent}"
-    return "general_enquiry", order_ref, 0.4, "no keyword match"
+    # general_enquiry is a first-class, AI-handleable intent (not "unknown"),
+    # so seat it above AI_CONFIDENCE_THRESHOLD (0.5) — AI leads resolution by
+    # default. Kept below the 0.6 stage-2 gate so the LLM router can still
+    # upgrade to a more specific intent (e.g. delivery_status_enquiry) when
+    # keywords were missing.
+    return "general_enquiry", order_ref, 0.55, "no keyword match → general enquiry"
 
 
 async def _classify_stage_two(text: str, default_intent: str) -> tuple[str, float, str]:

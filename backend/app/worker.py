@@ -902,6 +902,18 @@ async def _gmail_poller_tick() -> None:
         log.exception("gmail poller tick crashed")
 
 
+async def _watch_renewer_tick() -> None:
+    """Hourly sweep that keeps Gmail / Outlook / Shopify push subscriptions
+    alive. Real provider calls only fire when the relevant env vars are set
+    (see `channels/subscriptions.py`); otherwise the sweep is a noop so
+    localhost demos don't hammer Graph/Shopify."""
+    try:
+        from .channels.subscriptions import watch_renewer_tick
+        await watch_renewer_tick()
+    except Exception:
+        log.exception("watch renewer tick crashed")
+
+
 async def _shopify_backfill_tick() -> None:
     """Placeholder backfill loop. Real adapter lands with the Shopify connector
     in Build 3 — for now we tap `last_sync_at` so the UI shows fresh sync
@@ -969,6 +981,7 @@ async def main() -> None:
         asyncio.create_task(_run_loop(_gmail_poller_tick,         30,  stop, "gmail_poller")),
         asyncio.create_task(_run_loop(_shopify_backfill_tick,   3600,  stop, "shopify_backfill")),
         asyncio.create_task(_run_loop(_embedding_indexer_tick,    60,  stop, "embedding_indexer")),
+        asyncio.create_task(_run_loop(_watch_renewer_tick,      3600,  stop, "watch_renewer")),
     ]
 
     try:

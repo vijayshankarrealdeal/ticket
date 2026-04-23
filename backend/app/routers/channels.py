@@ -823,7 +823,11 @@ async def _execute_api(db, ws_id: str, api_row: dict, args: dict, customer_id: s
     request against it; otherwise we echo so offline demos keep working. Every
     call writes to `api_logs` with secrets redacted."""
     started = time.perf_counter()
-    trace_id = f"trc_{uuid.uuid4().hex[:12]}"
+    # Inherit the request-scoped trace_id when present so webhook → internal
+    # API → downstream chain shares one id. Fall back to a fresh trc_ when
+    # the call comes from a worker with no request context.
+    from ..tracing import current_trace_id
+    trace_id = current_trace_id() or f"trc_{uuid.uuid4().hex[:12]}"
     spec = jl(api_row.get("spec"), {}) or {}
     method = (api_row.get("method") or spec.get("method") or "GET").upper()
     url = spec.get("url")

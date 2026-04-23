@@ -9,3 +9,6 @@ argon2-cffi==23.1.0
 python-multipart==0.0.18
 httpx==0.28.1
 boto3==1.35.77
+aiosmtplib==3.0.2
+redis==5.2.0
+pydantic-ai-slim[openai]==0.0.14

@@ -18,11 +18,12 @@ const SORT_OPTIONS = [
 
 const FILTERS = [
   { key: 'all-open', label: 'All Open', match: (t) => t.status !== 'resolved' && t.status !== 'closed' },
+  { key: 'resolved', label: 'Resolved', match: (t) => t.status === 'resolved' || t.status === 'closed' },
+  { key: 'all', label: 'All', match: () => true },
   { key: 'my-tickets', label: 'My Tickets', match: (t) => t.assignee === 'Aniket Singh' },
   { key: 'unassigned', label: 'Unassigned', match: (t) => !t.assignee },
   { key: 'blocked', label: 'Blocked', match: (t) => t.status === 'blocked' },
   { key: 'my-created-progress', label: 'My Created · In Progress', match: (t) => t.status === 'assigned' },
-  { key: 'my-created', label: 'My Created', match: () => true },
 ];
 
 const slaHours = (sla) => {
@@ -569,6 +570,28 @@ function EmptyBody({ label }) {
   );
 }
 
+// Gmail/Outlook top-post a reply with the prior thread quoted below an
+// "On <date>, <addr> wrote:" marker — sometimes lines get `> ` prefixes,
+// sometimes long quoted lines get soft-wrapped and lose the prefix on
+// continuations. Cut at the marker and drop any `>` lines that remain,
+// then trim so the bubble shows just what the sender actually wrote.
+function cleanEmailReply(raw) {
+  if (!raw) return '';
+  const text = String(raw).replace(/\r\n/g, '\n');
+  const marker = /\n\s*On\s[\s\S]*?wrote:\s*\n?/i;
+  const m = text.match(marker);
+  let head = m ? text.slice(0, m.index) : text;
+  head = head.replace(/\n--\s*\n[\s\S]*$/, ''); // RFC 3676 signature
+  head = head.split('\n').filter((l) => !/^\s*>/.test(l)).join('\n');
+  return head.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function prettyFromName(name) {
+  if (!name) return '';
+  if (name === 'default-orchestrator') return 'AI Agent';
+  return name;
+}
+
 function ConvoBody({ t }) {
   // Shows the conversation linked to this ticket. The server already carries
   // conversation id on the ticket row (ticket.conversationId when set) — we
@@ -593,20 +616,74 @@ function ConvoBody({ t }) {
     return <div className="empty-state" style={{ margin: 'auto' }}><Icon.InboxEmpty /><div className="empty-state-text">No messages yet.</div></div>;
   }
   return (
-    <div style={{ padding: 16, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 10 }}>
-      {messages.map((m, i) => (
-        <div key={m.id || i} style={{
-          alignSelf: m.from === 'me' || m.from === 'agent' ? 'flex-end' : 'flex-start',
-          maxWidth: '70%',
-          background: m.from === 'me' || m.from === 'agent' ? 'var(--primary, #1e40af)' : 'var(--hover)',
-          color: m.from === 'me' || m.from === 'agent' ? '#fff' : 'var(--text)',
-          padding: '8px 12px', borderRadius: 12, fontSize: 14,
-        }}>
-          {m.fromName && <div style={{ fontSize: 11, opacity: 0.75, marginBottom: 2 }}>{m.fromName}</div>}
-          <div style={{ whiteSpace: 'pre-wrap' }}>{m.text}</div>
-          {m.at && <div style={{ fontSize: 10, opacity: 0.65, marginTop: 4 }}>{m.at}</div>}
+    <div style={{ padding: 16, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {messages.map((m, i) => {
+        const mine = m.from === 'me' || m.from === 'agent';
+        const clean = cleanEmailReply(m.text);
+        const original = String(m.text || '').trim();
+        const hasQuoted = clean && original && clean.length < original.length;
+        return (
+          <MessageBubble
+            key={m.id || i}
+            mine={mine}
+            fromName={prettyFromName(m.fromName)}
+            text={clean || original}
+            quoted={hasQuoted ? original : null}
+            at={m.at}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function MessageBubble({ mine, fromName, text, quoted, at }) {
+  const [showQuoted, setShowQuoted] = useState(false);
+  return (
+    <div style={{
+      alignSelf: mine ? 'flex-end' : 'flex-start',
+      maxWidth: '72%',
+      background: mine ? 'var(--primary, #1e40af)' : 'var(--hover)',
+      color: mine ? '#fff' : 'var(--text)',
+      padding: '10px 14px',
+      borderRadius: 14,
+      fontSize: 14,
+      lineHeight: 1.5,
+      boxShadow: '0 1px 2px rgba(0,0,0,0.15)',
+    }}>
+      {fromName && (
+        <div style={{ fontSize: 11, fontWeight: 600, opacity: 0.8, marginBottom: 4 }}>
+          {fromName}
         </div>
-      ))}
+      )}
+      <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{text}</div>
+      {quoted && (
+        <>
+          <button
+            onClick={() => setShowQuoted((v) => !v)}
+            style={{
+              marginTop: 6, padding: 0, background: 'transparent', border: 'none',
+              color: mine ? 'rgba(255,255,255,0.75)' : 'var(--muted)',
+              fontSize: 11, cursor: 'pointer', textDecoration: 'underline',
+            }}
+          >
+            {showQuoted ? 'Hide quoted text' : 'Show quoted text'}
+          </button>
+          {showQuoted && (
+            <div style={{
+              marginTop: 6, padding: '8px 10px', borderLeft: '2px solid currentColor',
+              opacity: 0.7, fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+            }}>
+              {quoted}
+            </div>
+          )}
+        </>
+      )}
+      {at && (
+        <div style={{ fontSize: 10, opacity: 0.65, marginTop: 6, textAlign: mine ? 'right' : 'left' }}>
+          {at}
+        </div>
+      )}
     </div>
   );
 }

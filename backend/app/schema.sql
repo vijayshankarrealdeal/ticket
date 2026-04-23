@@ -734,3 +734,90 @@ CREATE TABLE IF NOT EXISTS broadcasts (
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS broadcasts_ws_idx ON broadcasts (workspace_id, created_at DESC);
+
+-- ---------- Channel subscriptions (spec §11 watch renewer) ----------
+-- Tracks provider-side push subscriptions that need periodic renewal:
+-- Gmail `users.watch` (expires after 7 days), Outlook Graph subscriptions
+-- (expires after 3 days), Shopify webhook registrations. The worker's daily
+-- watch-renewer tick reads from here and re-creates anything within 24h of
+-- its expiry. `provider_sub_id` is the provider-side identifier (Graph
+-- subscription id, Gmail historyId anchor, Shopify webhook id).
+CREATE TABLE IF NOT EXISTS channel_subscriptions (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id    uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  credential_id   uuid REFERENCES platform_credentials(id) ON DELETE CASCADE,
+  provider        text NOT NULL,              -- gmail | outlook | shopify
+  topic           text,                       -- Pub/Sub topic / Graph resource / Shopify topic
+  provider_sub_id text,                       -- provider-assigned id
+  history_id      text,                       -- Gmail historyId anchor
+  status          text NOT NULL DEFAULT 'active', -- active | expired | error | revoked
+  last_renewed_at timestamptz,
+  expires_at      timestamptz,
+  error           text,
+  meta            jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS channel_subs_ws_idx      ON channel_subscriptions (workspace_id);
+CREATE INDEX IF NOT EXISTS channel_subs_renew_idx   ON channel_subscriptions (expires_at)
+  WHERE status = 'active';
+
+-- ---------- Webhook rate-limit buckets (spec §9 rate-limiter) ----------
+-- Simple token-bucket state per (provider, workspace). `tokens` decays with
+-- time; every inbound webhook debits one and rejects with 429 if the bucket
+-- is empty. `capacity` + `refill_per_sec` defaulted at the router level so a
+-- missing row behaves like a full bucket.
+CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+  bucket_key      text PRIMARY KEY,          -- e.g. "whatsapp:<ws_id>" or "shopify:<shop>"
+  tokens          double precision NOT NULL DEFAULT 60,
+  capacity        double precision NOT NULL DEFAULT 60,
+  refill_per_sec  double precision NOT NULL DEFAULT 1,
+  last_refill_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- ---------- Langflow publish snapshots (spec §3.11.C) ----------
+-- The Langflow → FastAPI publish hook writes one row per agent+version so the
+-- AgentBuilder can diff versions and the orchestrator can pin to a specific
+-- flow snapshot. Already referenced by agents.py; kept as `agent_flow_snapshots`
+-- which lives earlier in this file — this is the companion index + metadata.
+ALTER TABLE agent_flow_snapshots ADD COLUMN IF NOT EXISTS lf_folder_id text;
+ALTER TABLE agent_flow_snapshots ADD COLUMN IF NOT EXISTS lf_flow_id   text;
+ALTER TABLE agent_flow_snapshots ADD COLUMN IF NOT EXISTS lf_version   int;
+CREATE INDEX IF NOT EXISTS agent_flow_snapshots_agent_idx
+  ON agent_flow_snapshots (agent_id, created_at DESC);
+
+-- ---------- pgvector opt-in (spec §7) ----------
+-- Embedding columns remain `bytea` by default (deterministic hashed sketch) so
+-- a vanilla Postgres install keeps working. Set `ENABLE_PGVECTOR=1` during
+-- startup and run the migration file [backend/app/migrations/0002_pgvector.sql]
+-- once. We don't `CREATE EXTENSION` here because it requires superuser on
+-- most managed Postgres offerings; the app's schema-apply runs as a
+-- non-superuser by default.
+
+-- ---------- Secret encryption wrapper helpers (spec §7 pgp_sym_encrypt) ----------
+-- Thin SQL helpers that use `pgcrypto.pgp_sym_encrypt` when
+-- `WORKSPACEX_SECRET_KEY` is set at the session level. Routers call
+-- `SELECT secret_wrap($1, current_setting('app.secret_key', true))` to get
+-- an encrypted TEXT back; reads go the other way with `secret_unwrap`.
+-- No-op passthrough when no key is set so dev installs don't break.
+CREATE OR REPLACE FUNCTION secret_wrap(plaintext text, key text)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+  IF key IS NULL OR length(key) = 0 OR plaintext IS NULL THEN
+    RETURN plaintext;
+  END IF;
+  RETURN encode(pgp_sym_encrypt(plaintext, key), 'base64');
+END $$;
+
+CREATE OR REPLACE FUNCTION secret_unwrap(ciphertext text, key text)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+  IF key IS NULL OR length(key) = 0 OR ciphertext IS NULL THEN
+    RETURN ciphertext;
+  END IF;
+  BEGIN
+    RETURN pgp_sym_decrypt(decode(ciphertext, 'base64'), key);
+  EXCEPTION WHEN OTHERS THEN
+    -- Ciphertext may already be plaintext from a pre-encryption install.
+    RETURN ciphertext;
+  END;
+END $$;

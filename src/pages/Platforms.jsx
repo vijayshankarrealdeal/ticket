@@ -283,6 +283,12 @@ function ManagePlatformModal({ platform, onClose, onConnect, onDisconnect, busy 
         {isConnected ? (
           <div style={{ background: 'var(--bg-soft, #f8fafc)', padding: 12, borderRadius: 8, fontSize: 13 }}>
             This channel is connected. New conversations will appear in Conversations as they arrive.
+            {isOAuth && (
+              <div style={{ marginTop: 8, color: 'var(--muted)', fontSize: 12 }}>
+                Signed in via {OAUTH_CHANNELS[platform.id]}. Disconnecting revokes the stored
+                credentials; inbound messages will stop until you reconnect.
+              </div>
+            )}
             {canSync && (
               <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                 <button className="btn secondary sm" disabled={syncing} onClick={runSync}>
@@ -294,12 +300,6 @@ function ManagePlatformModal({ platform, onClose, onConnect, onDisconnect, busy 
                 {sync && <div style={{ flexBasis: '100%', color: 'var(--muted)', fontSize: 12 }}>{sync}</div>}
               </div>
             )}
-          </div>
-        ) : isOAuth ? (
-          <div style={{ background: 'var(--bg-soft, #f8fafc)', padding: 12, borderRadius: 8, fontSize: 13 }}>
-            <b>{platform.name}</b> uses OAuth. In production clicking Connect would redirect you
-            to the provider consent screen; for this build the connect endpoint flips the local
-            state so you can continue testing the UI.
           </div>
         ) : (
           <div style={{ background: 'var(--bg-soft, #f8fafc)', padding: 12, borderRadius: 8, fontSize: 13 }}>

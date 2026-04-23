@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import CORS_ORIGINS
 from .db import get_db, close_db
 from .s3 import ensure_bucket
+from .tracing import TraceMiddleware
 from .routers import (
     agents,
     analytics,
@@ -20,6 +21,7 @@ from .routers import (
     channels,
     conversations,
     customers,
+    langflow,
     me,
     notifications,
     oauth,
@@ -62,6 +64,7 @@ async def lifespan(app: FastAPI):
             (w._counter_refresh_tick,    30.0,  "counters"),
             (w._embedding_indexer_tick,  60.0,  "embedding_indexer"),
             (w._oauth_state_cleanup_tick, 600,  "oauth_cleanup"),
+            (w._watch_renewer_tick,     3600.0, "watch_renewer"),
         ]
         for fn, interval, name in loops:
             worker_tasks.append(asyncio.create_task(
@@ -97,6 +100,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Stamps every request with a stable `trace_id` and exposes it via the
+# `current_trace_id()` contextvar — used by api_logs and makes webhook →
+# db-write → WS-push chains correlatable.
+app.add_middleware(TraceMiddleware)
 
 
 # Auth + session
@@ -122,6 +129,11 @@ app.include_router(billing.router)
 # Inbound channel webhooks (WA / Gmail / Outlook / IG / Shopify / Slack / Voice /
 # Stripe). Unauthenticated; per-provider HMAC/OIDC validation inside.
 app.include_router(webhooks.router)
+# Langflow: admin SSO launch + publish webhook (spec §3.11.A–E). The launch
+# route mounts under `/flow`; the webhook sits under `/webhooks/langflow/*`
+# so it lines up with the other provider webhooks.
+app.include_router(langflow.launch_router)
+app.include_router(langflow.webhook_router)
 # Widget router includes HTTP (`/widget/bootstrap`, `/widget/messages`,
 # `/widget.js`) and WebSocket (`/widget/ws`) routes — `include_router` mounts
 # all three.

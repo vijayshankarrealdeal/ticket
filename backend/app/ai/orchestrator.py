@@ -630,15 +630,42 @@ async def _fallback_run(ctx: AgentCtx, user_message: str) -> dict:
 async def _pydantic_ai_run(ctx: AgentCtx, user_message: str, model: str) -> dict:
     from pydantic_ai import Agent, RunContext  # type: ignore
 
+    # Pull workspace profile up front so the system prompt can carry product
+    # context. Workspace owners inject services/policies/brand voice via
+    # `workspaces.ai_prompt_append`.
+    ws_name = "the business"
+    ws_profile = ""
+    try:
+        db = await get_db()
+        cur = await db.execute(
+            "SELECT name, ai_prompt_append FROM workspaces WHERE id = ?",
+            (ctx.workspace_id,),
+        )
+        wrow = await cur.fetchone()
+        if wrow:
+            ws_name = wrow["name"] or ws_name
+            ws_profile = (wrow["ai_prompt_append"] or "").strip()
+    except Exception:
+        pass
+
     agent = Agent(
         model=f"openai:{model}",
         deps_type=AgentCtx,
         retries=2,
         system_prompt=(
-            "You are WorkspaceX's AI support agent. Always call tools rather than inventing data. "
-            "Prefer `send_reply` for customer-facing text; `escalate_to_human` when unsure. "
+            f"You are {ws_name}'s AI support agent and you own the ticket end-to-end. "
+            "Always call tools rather than inventing data. Use `kb_search` to ground product / "
+            "policy answers; use `get_order` / `get_shipping_status` for order questions; "
+            "answer directly with `send_reply` when you have the information. "
+            "When you have fully answered the customer's question and no further action is "
+            "pending on our side, call `update_ticket(status='resolved', resolution_notes=...)` "
+            "to close the ticket — don't leave it parked on a human queue. "
+            "Only call `escalate_to_human` when the request truly needs real-world action you "
+            "can't take (refund above cap, legal, account change) or the profile/KB lacks the answer. "
             f"Never issue a refund above ₹{REFUND_CAP_INR}. Never call more than "
-            f"{LOOP_GUARD_TOOL_CALLS} tools in a single turn."
+            f"{LOOP_GUARD_TOOL_CALLS} tools in a single turn.\n\n"
+            f"Business profile — {ws_name}:\n"
+            f"{ws_profile or '(no profile — rely on KB + conversation context)'}"
         ),
     )
 
@@ -725,11 +752,13 @@ def _azure_oai_creds() -> tuple[str | None, str | None, str, str]:
     return key, endpoint or None, api_version, deployment
 
 
-async def _load_conversation_context(ctx: AgentCtx) -> dict:
-    """Pull the recent message history + customer / order context so the LLM
-    can answer the actual question rather than throw a canned response."""
+async def _load_conversation_context(ctx: AgentCtx, query: str | None = None) -> dict:
+    """Pull the recent message history + customer / order context + workspace
+    business profile + relevant KB chunks so the LLM can answer with grounded,
+    product-specific information instead of a canned response."""
     db = await get_db()
-    out: dict = {"customer": None, "orders": [], "history": []}
+    out: dict = {"customer": None, "orders": [], "history": [],
+                 "workspace": None, "kb": []}
     if ctx.customer_id:
         try:
             out["customer"] = await tool_get_customer(ctx, ctx.customer_id)
@@ -750,18 +779,51 @@ async def _load_conversation_context(ctx: AgentCtx) -> dict:
         rows = [dict(r) for r in await cur.fetchall()]
         # Oldest-first for the LLM.
         out["history"] = list(reversed(rows))
+    # Workspace business profile — owners put product/services/policy info in
+    # `ai_prompt_append`; it gets concatenated into the system prompt so the
+    # LLM has product-specific grounding beyond what a KB chunk carries.
+    try:
+        cur = await db.execute(
+            "SELECT name, ai_prompt_append FROM workspaces WHERE id = ?",
+            (ctx.workspace_id,),
+        )
+        wrow = await cur.fetchone()
+        if wrow:
+            out["workspace"] = {"name": wrow["name"],
+                                "ai_prompt_append": (wrow["ai_prompt_append"] or "").strip()}
+    except Exception:
+        pass
+    # Relevant KB — best-effort trigram/ILIKE (the full embedding path lives in
+    # `tool_kb_search`; for tool-less flows we inline the cheap fallback so KB
+    # content still shows up in the prompt).
+    if query:
+        try:
+            cur = await db.execute(
+                """
+                SELECT title, body FROM kb_chunks
+                 WHERE workspace_id = ?
+                   AND (body ILIKE ? OR title ILIKE ?)
+                 LIMIT 6
+                """,
+                (ctx.workspace_id, f"%{query[:80]}%", f"%{query[:80]}%"),
+            )
+            out["kb"] = [dict(r) for r in await cur.fetchall()]
+        except Exception:
+            pass
     return out
 
 
 async def _azure_openai_run(ctx: AgentCtx, user_message: str, deployment: str) -> dict:
     """Direct Azure OpenAI chat completion — no pydantic-ai, no tool-calling.
-    We hand the LLM the conversation history + customer context and let it
-    draft a reply, which `send_reply` then persists + queues for outbound."""
+    We hand the LLM the conversation history + customer context + workspace
+    profile + KB, and ask it for a structured `{reply, outcome}` so we can
+    auto-resolve or escalate based on the AI's own judgement (AI owns the
+    ticket end-to-end, spec §3.11.H)."""
     key, endpoint, api_version, default_deployment = _azure_oai_creds()
     if not key or not endpoint:
         raise RuntimeError("azure openai creds missing")
     deployment = deployment or default_deployment
-    context = await _load_conversation_context(ctx)
+    context = await _load_conversation_context(ctx, query=user_message)
     history_text = "\n".join(
         f"{m['from_role']}: {(m.get('text') or '').strip()[:500]}"
         for m in (context.get("history") or [])
@@ -772,15 +834,31 @@ async def _azure_openai_run(ctx: AgentCtx, user_message: str, deployment: str) -
         f"- order {o.get('id')}: status={o.get('status')} total=₹{o.get('total')}"
         for o in orders
     ) or "  (no recent orders)"
+    workspace = context.get("workspace") or {}
+    ws_name = workspace.get("name") or "the business"
+    ws_profile = workspace.get("ai_prompt_append") or ""
+    kb_rows = context.get("kb") or []
+    kb_block = "\n".join(
+        f"- {(r.get('title') or 'note').strip()}: {(r.get('body') or '').strip()[:400]}"
+        for r in kb_rows
+    ) or "  (no relevant knowledge-base entries found)"
 
     system_prompt = (
-        "You are WorkspaceX's AI support agent replying on behalf of the business. "
-        "Read the customer's latest message and respond directly, helpfully, and concisely. "
-        "If you know the answer or can infer from context, answer it. "
-        "If you genuinely don't have information (e.g. a refund policy they're asking about), "
-        "say what you'll do next ('I'll check with the team and get back to you') instead of a canned line. "
-        "Keep it under 4 short sentences. No salutations needed — they already know they're talking to support. "
-        f"Never promise a refund over ₹{REFUND_CAP_INR} on your own authority."
+        f"You are {ws_name}'s AI support agent and you own this ticket end-to-end. "
+        "Read the customer's latest message and respond directly, helpfully, and concisely, "
+        "grounding your answer in the Business profile and Knowledge base provided below. "
+        "If the Business profile / KB has the answer, give it plainly — do not say 'I'll check with the team'. "
+        "Only defer to a human when the request needs real-world action you cannot take (refunds above cap, "
+        "account changes, legal, or the question truly isn't covered by the profile/KB). "
+        "Keep it under 4 short sentences. No salutations — the customer already knows they're talking to support. "
+        f"Never promise a refund over ₹{REFUND_CAP_INR} on your own authority.\n\n"
+        f"Business profile — {ws_name}:\n"
+        f"{ws_profile or '  (no profile provided — rely on KB + conversation context)'}\n\n"
+        "After drafting the reply, decide the ticket outcome:\n"
+        "  - 'resolved': you fully answered; the customer's question is closed and no further action is pending on our side.\n"
+        "  - 'waiting_for_customer': you replied with info or a follow-up question and are waiting on their response.\n"
+        "  - 'needs_human': the request is outside what you can handle (refund > cap, legal, account change, missing info in profile/KB).\n\n"
+        "Respond with JSON only: {\"reply\": \"...\", \"outcome\": \"resolved|waiting_for_customer|needs_human\", \"reason\": \"...\"}."
     )
     user_prompt = (
         f"Customer profile:\n"
@@ -788,9 +866,10 @@ async def _azure_openai_run(ctx: AgentCtx, user_message: str, deployment: str) -
         f"- email: {customer.get('email') or 'unknown'}\n"
         f"- phone: {customer.get('phone') or 'unknown'}\n"
         f"- orders:\n{orders_block}\n\n"
+        f"Knowledge base (most relevant):\n{kb_block}\n\n"
         f"Recent conversation (oldest first):\n{history_text}\n\n"
         f"Customer's latest message:\n{user_message}\n\n"
-        f"Draft the reply now."
+        f"Draft the JSON response now."
     )
 
     url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
@@ -808,14 +887,28 @@ async def _azure_openai_run(ctx: AgentCtx, user_message: str, deployment: str) -
                     {"role": "user", "content": user_prompt},
                 ],
                 "temperature": 0.3,
-                "max_tokens": 400,
+                "max_tokens": 500,
+                "response_format": {"type": "json_object"},
             },
         )
     if resp.status_code >= 400:
         raise RuntimeError(f"azure openai {resp.status_code}: {resp.text[:300]}")
     data = resp.json()
-    text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-    text = text.strip()
+    raw = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    text = ""
+    outcome = "waiting_for_customer"
+    reason = ""
+    try:
+        parsed = json.loads(raw)
+        text = (parsed.get("reply") or "").strip()
+        outcome = (parsed.get("outcome") or "waiting_for_customer").strip()
+        reason = (parsed.get("reason") or "").strip()
+    except Exception:
+        # Structured-output parse failed — treat the raw text as the reply and
+        # keep the safe default outcome (waiting_for_customer).
+        text = raw.strip()
+    if outcome not in {"resolved", "waiting_for_customer", "needs_human"}:
+        outcome = "waiting_for_customer"
     if not text:
         text = "Thanks — let me check on that and get back to you."
     if ctx.conversation_id:
@@ -825,7 +918,48 @@ async def _azure_openai_run(ctx: AgentCtx, user_message: str, deployment: str) -
             raise
         except Exception:
             log.exception("send_reply failed after azure generation")
-    return {"output": text, "steps": ctx.steps}
+        # Apply the AI's own judgement on ticket state. `send_reply` already
+        # set it to `waiting_for_customer` — upgrade to `resolved` when the
+        # AI is confident the question is fully answered, or hand off to a
+        # human when the AI flagged `needs_human`.
+        try:
+            if outcome == "resolved":
+                db = await get_db()
+                cur = await db.execute(
+                    """
+                    UPDATE tickets SET status = 'resolved', resolved_at = now(),
+                                       resolution_notes = ?, updated_at = now()
+                     WHERE conversation_id = ? AND workspace_id = ?
+                       AND status NOT IN ('resolved','closed')
+                     RETURNING id
+                    """,
+                    (reason or "AI resolved — customer's question fully answered",
+                     ctx.conversation_id, ctx.workspace_id),
+                )
+                tids = [r[0] for r in await cur.fetchall()]
+                for tid in tids:
+                    await db.execute(
+                        "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'ai', ?)",
+                        (tid, f"AI marked resolved — {reason or 'question fully answered'}"),
+                    )
+                await db.commit()
+                from ..ws import broker
+                for tid in tids:
+                    await broker.publish(
+                        f"ticket:{tid}", "ticket.updated",
+                        {"id": f"#{tid}", "status": "resolved"},
+                    )
+                    await broker.publish(
+                        f"inbox:{ctx.workspace_id}", "ticket.updated",
+                        {"id": f"#{tid}", "status": "resolved"},
+                    )
+            elif outcome == "needs_human":
+                await tool_escalate_to_human(ctx, reason=reason or "AI decided human follow-up needed")
+        except GuardrailHit:
+            raise
+        except Exception:
+            log.exception("post-reply outcome apply failed (outcome=%s)", outcome)
+    return {"output": text, "outcome": outcome, "reason": reason, "steps": ctx.steps}
 
 
 # ---------- public entry ----------------------------------------------------

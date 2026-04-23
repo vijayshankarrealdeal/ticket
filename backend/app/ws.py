@@ -1,4 +1,4 @@
-"""In-memory topic broker for WebSocket fan-out.
+"""Topic broker for WebSocket fan-out.
 
 Topics used by the frontend (spec §8):
 - inbox:<workspace_id>           – conversation list updates
@@ -7,22 +7,36 @@ Topics used by the frontend (spec §8):
 - notif:<user_id>                 – notifications for a user
 - teams:<channel_or_dm_id>        – team chat messages
 - presence:<workspace_id>         – presence changes
+- agents:<workspace_id>           – Langflow publish notifications
 
-For prod with multiple workers: replace Broker with a Redis Pub/Sub backed impl
-(same interface). See wire.md §'Scaling the broker'.
+Two backends share a common interface:
+
+- **InProcessBroker** (default) — single-worker Uvicorn. Map `topic → set[ws]`,
+  fan-out happens in the same process.
+- **RedisBroker** (set `BROKER_KIND=redis` + `REDIS_URL`) — every pod `PSUBSCRIBE`s
+  its own channel and re-publishes to its local websockets. Horizontal-ready
+  per wire.md §'Scaling the broker'.
+
+Same `subscribe / unsubscribe / publish` surface so nothing downstream
+changes. Failures on the Redis side fall back to in-process delivery so a
+broker outage never silences the app.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect, status
 
+log = logging.getLogger(__name__)
 
-class Broker:
+
+class InProcessBroker:
     def __init__(self) -> None:
         self._subs: dict[str, set[WebSocket]] = defaultdict(set)
         self._lock = asyncio.Lock()
@@ -41,13 +55,7 @@ class Broker:
                 for t in topics:
                     self._subs.get(t, set()).discard(ws)
 
-    async def publish(self, topic: str, type_: str, data: Any) -> None:
-        envelope = {
-            "type": type_,
-            "topic": topic,
-            "at": datetime.now(timezone.utc).isoformat(),
-            "data": data,
-        }
+    async def _deliver_local(self, topic: str, envelope: dict) -> None:
         dead: list[WebSocket] = []
         subs = list(self._subs.get(topic, ()))
         for ws in subs:
@@ -61,8 +69,109 @@ class Broker:
                     for subs in self._subs.values():
                         subs.discard(ws)
 
+    async def publish(self, topic: str, type_: str, data: Any) -> None:
+        envelope = {
+            "type": type_,
+            "topic": topic,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "data": data,
+        }
+        await self._deliver_local(topic, envelope)
 
-broker = Broker()
+
+class RedisBroker(InProcessBroker):
+    """Fans out publishes through Redis so every Uvicorn pod sees them.
+
+    Each pod `PSUBSCRIBE`s the shared prefix on startup. `publish()` hops
+    through `PUBLISH workspacex:<topic>`; the subscriber task in the pod
+    translates that back into a local `_deliver_local` call so any WS
+    connected to *this* pod receives the envelope.
+
+    If the Redis client isn't installed or the server is unreachable, we
+    degrade to in-process delivery only — the app keeps working, but pods
+    stop seeing each other's events.
+    """
+
+    PREFIX = "workspacex:"
+
+    def __init__(self, url: str) -> None:
+        super().__init__()
+        self._url = url
+        self._redis = None  # set lazily by `_ensure`
+        self._pubsub_task: asyncio.Task | None = None
+
+    async def _ensure(self) -> None:
+        if self._redis is not None:
+            return
+        try:
+            import redis.asyncio as redis_lib  # type: ignore
+        except ImportError:
+            log.warning("redis package not installed — falling back to in-proc broker")
+            return
+        try:
+            self._redis = redis_lib.from_url(self._url, decode_responses=True)
+            await self._redis.ping()
+        except Exception as e:
+            log.warning("redis unavailable (%r) — falling back to in-proc broker", e)
+            self._redis = None
+            return
+        # Kick off the pubsub listener once per process.
+        if self._pubsub_task is None or self._pubsub_task.done():
+            self._pubsub_task = asyncio.create_task(self._listen())
+
+    async def _listen(self) -> None:
+        assert self._redis is not None
+        try:
+            ps = self._redis.pubsub()
+            await ps.psubscribe(f"{self.PREFIX}*")
+            async for msg in ps.listen():
+                if msg.get("type") != "pmessage":
+                    continue
+                channel = (msg.get("channel") or "").removeprefix(self.PREFIX)
+                try:
+                    envelope = json.loads(msg.get("data") or "{}")
+                except Exception:
+                    continue
+                await self._deliver_local(channel, envelope)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("redis pubsub listener crashed — next publish will retry connect")
+            self._redis = None
+
+    async def publish(self, topic: str, type_: str, data: Any) -> None:
+        envelope = {
+            "type": type_,
+            "topic": topic,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "data": data,
+        }
+        await self._ensure()
+        if self._redis is None:
+            await self._deliver_local(topic, envelope)
+            return
+        try:
+            await self._redis.publish(
+                f"{self.PREFIX}{topic}",
+                json.dumps(envelope, default=str),
+            )
+        except Exception as e:
+            log.warning("redis publish failed (%r) — delivering locally only", e)
+            await self._deliver_local(topic, envelope)
+
+
+def _make_broker():
+    kind = (os.environ.get("BROKER_KIND") or "memory").lower()
+    url = os.environ.get("REDIS_URL")
+    if kind == "redis" and url:
+        return RedisBroker(url)
+    return InProcessBroker()
+
+
+broker = _make_broker()
+
+# Backwards-compatibility alias — callers still reference `Broker`.
+Broker = InProcessBroker
 
 
 async def ws_endpoint(ws: WebSocket) -> None:

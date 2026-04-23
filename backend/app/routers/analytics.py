@@ -13,6 +13,39 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 async def summary(range: str = Query("7d"), user: dict = Me) -> dict:
     days = int(range[:-1]) if range.endswith("d") and range[:-1].isdigit() else 7
     db = await get_db()
+    # Try the pre-aggregated `analytics_daily` table first — the rollup worker
+    # refreshes today's row every hour and nightly rows are static, so this
+    # read is O(range) regardless of ticket volume. Fall back to live queries
+    # when the table is empty (fresh install, rollup worker disabled) so the
+    # Analytics page never renders as blank.
+    try:
+        cur = await db.execute(
+            """
+            SELECT SUM(tickets_created) AS created,
+                   SUM(tickets_resolved) AS resolved,
+                   AVG(avg_resolution_h) AS avg_hours,
+                   AVG(csat_avg) AS csat_avg,
+                   AVG(ai_deflection_pct) AS deflection
+              FROM analytics_daily
+             WHERE workspace_id = ?
+               AND day >= (now() AT TIME ZONE 'UTC')::date - make_interval(days => ?)::interval
+            """,
+            (user["workspace_id"], days),
+        )
+        pre = await cur.fetchone()
+    except Exception:
+        pre = None
+    pre_dict = dict(pre) if pre else {}
+    if pre_dict and pre_dict.get("created") is not None:
+        avg_seconds = float(pre_dict.get("avg_hours") or 0) * 3600
+        return {
+            "ticketsThisWeek": int(pre_dict.get("created") or 0),
+            "avgResolution": _format_duration(avg_seconds) if avg_seconds > 0 else None,
+            "csat": round(float(pre_dict["csat_avg"]) * 20, 1) if pre_dict.get("csat_avg") else None,
+            "aiDeflection": round(float(pre_dict["deflection"] or 0), 1) if pre_dict.get("deflection") is not None else None,
+            "resolved": int(pre_dict.get("resolved") or 0),
+            "source": "rollup",
+        }
     cur = await db.execute(
         "SELECT COUNT(*) FROM tickets WHERE workspace_id = ? "
         "AND created_at > now() - make_interval(days => ?)",
@@ -78,6 +111,7 @@ async def summary(range: str = Query("7d"), user: dict = Me) -> dict:
         "csat": csat,
         "aiDeflection": ai_deflection,
         "resolved": resolved,
+        "source": "live",
     }
 
 

@@ -68,7 +68,8 @@ Sign-out: `clearAuth()` removes the localStorage entry and fires `POST /auth/sig
 | [Settings.jsx](src/pages/Settings.jsx) | `POST /workspace/broadcast`, `GET /workspace/broadcasts`, `GET/POST /workspace/members`, `DELETE /me/oauth/:provider`, `GET /workspace/counters`, `GET/POST/DELETE /workspace/sla-policies`, `GET /workspace/delivery-log`, `GET/POST /me/2fa{/setup\|/verify\|/disable}`, `GET /billing/{plan,usage,invoices}`, `POST /billing/{checkout,portal}` | [me.py](backend/app/routers/me.py), [billing.py](backend/app/routers/billing.py) |
 | [AuthPage.jsx](src/pages/AuthPage.jsx) | `GET /auth/oauth/{google,outlook}/start?mode=signin`, `POST /auth/oauth/session-from-fragment` | [oauth.py](backend/app/routers/oauth.py) |
 | [Platforms.jsx](src/pages/Platforms.jsx) / [ChannelsOverview.jsx](src/pages/channels/ChannelsOverview.jsx) | `GET /auth/oauth/{google,outlook}/start?mode=connect` (OAuth channel connect) | [oauth.py](backend/app/routers/oauth.py) |
-| Provider webhooks (no SPA caller) | `POST /webhooks/{whatsapp,gmail,outlook,instagram,shopify,slack/events,slack/interactions,voice,stripe}` | [webhooks.py](backend/app/routers/webhooks.py) |
+| Provider webhooks (no SPA caller) | `POST /webhooks/{whatsapp,gmail,outlook,instagram,shopify,slack/events,slack/interactions,voice,stripe,langflow/published}` | [webhooks.py](backend/app/routers/webhooks.py) + [langflow.py](backend/app/routers/langflow.py) |
+| [AgentBuilder.jsx](src/pages/AgentBuilder.jsx) "Open in Langflow" | `GET /flow/launch?agent=<id>` (admin SSO) | [langflow.py](backend/app/routers/langflow.py) |
 | Embedded chat widget (third-party site) | `GET /widget/bootstrap`, `POST /widget/messages`, `wss:/widget/ws` (unauth, workspace+visitor query params) | [widget.py](backend/app/routers/widget.py) |
 | [Conversations.jsx](src/pages/Conversations.jsx) | `GET /conversations`, `GET /conversations/:id`, `POST /conversations/:id/messages`, `POST /conversations/:id/inbound` (auto-reply streams back on `conv:<id>`) | [conversations.py](backend/app/routers/conversations.py) |
 | [Tickets.jsx](src/pages/Tickets.jsx), [CreateTicketModal.jsx](src/components/CreateTicketModal.jsx) | `GET /tickets`, `GET /tickets/:id`, `POST /tickets`, `PATCH /tickets/:id`, `POST /tickets/similar` | [tickets.py](backend/app/routers/tickets.py) |
@@ -151,7 +152,8 @@ Server → client:
 | `ticket:<ticket_id>` | `ticket.updated`, `ticket.timeline.appended`, `sla.breach_warning` | [Tickets.jsx](src/pages/Tickets.jsx) (only while the ticket is open) |
 | `teams:<channel_or_dm_id>` | `team.message.created`, `team.typing`, `team.reaction.updated`, `team.channel.mentioned` | [Teams.jsx](src/pages/Teams.jsx) |
 | `workspace:<workspace_id>` | `presence.changed` | [Teams.jsx](src/pages/Teams.jsx) |
-| `notif:<user_id>` | `notification.created` (types: `assign`, `sla`, `reply`, `mention`, `broadcast`, `teammate_joined`) | [useNotifications.js](src/hooks/useNotifications.js) |
+| `notif:<user_id>` | `notification.created` (types: `assign`, `sla`, `reply`, `mention`, `broadcast`, `teammate_joined`, `reauth`) | [useNotifications.js](src/hooks/useNotifications.js) |
+| `agents:<workspace_id>` | `flow.published` (Langflow publish hook) | [AgentBuilder.jsx](src/pages/AgentBuilder.jsx) |
 
 ### Client singleton
 

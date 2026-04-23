@@ -185,6 +185,7 @@ export default function Conversations() {
   const imageInputRef = useRef(null);
   const textareaRef = useRef(null);
   const dragDepth = useRef(0);
+  const chatBodyRef = useRef(null);
 
   const rightAnim = useDelayUnmount(rightPanel !== null, 240);
   const lastRightRef = useRef(rightPanel);
@@ -226,6 +227,16 @@ export default function Conversations() {
         (t.name && t.name === selected.name))
     ) || null;
   }, [list, selected, activeChannel]);
+
+  const threadId = activeThread?.id;
+  const msgCount = activeThread?.messages?.length || 0;
+  const lastMsg = activeThread?.messages?.[msgCount - 1];
+  const lastMsgKey = lastMsg ? `${lastMsg.id || lastMsg.tempId || lastMsg.streamId || ''}:${(lastMsg.text || '').length}:${lastMsg.streaming ? 1 : 0}` : '';
+  useEffect(() => {
+    const el = chatBodyRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [threadId, msgCount, lastMsgKey]);
 
   const activeFilterCount =
     (filters.assignment !== 'any' ? 1 : 0) +
@@ -681,7 +692,7 @@ export default function Conversations() {
                     </div>
                   </div>
                 )}
-                <div className="chat-body">
+                <div className="chat-body" ref={chatBodyRef}>
                   {activeThread ? (
                     (activeThread.messages || []).length === 0 ? (
                       <div className="empty-state" style={{ margin: 'auto' }}>
@@ -1847,6 +1858,10 @@ function MediaSidePanel({ attachments, onClose, closing }) {
 }
 
 function TicketSidePanel({ tickets, onClose, closing }) {
+  // Hooks must run on every render in the same order — keep them above any
+  // early return, otherwise React flags a mismatched hook count and tears
+  // down the whole tree.
+  const navigate = useNavigate();
   if (!tickets || tickets.length === 0) {
     return (
       <aside className={'right-sidebar ticket-panel' + (closing ? ' closing' : '')}>
@@ -1863,7 +1878,6 @@ function TicketSidePanel({ tickets, onClose, closing }) {
     );
   }
   const t = tickets[0];
-  const navigate = useNavigate();
   const openFullTicket = () => {
     const raw = String(t.id || '').replace(/^#/, '');
     if (!raw) return;
