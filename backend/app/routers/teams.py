@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from ..db import get_db, jl, js
 from ..deps import Me
 from ..schemas import ReactionIn, TeamMessageIn
 from ..ws import broker
+from .notifications import create_notification
 
 router = APIRouter(prefix="/teams", tags=["teams"])
 
@@ -90,22 +92,145 @@ async def _is_channel(db, cid: str) -> bool:
     return bool(await cur.fetchone())
 
 
+# Matches `@Name` and `@First Last` (a second word must itself be Capitalized
+# so we don't swallow following lowercase prose: `@Priya and @Raj` stays two).
+_MENTION_RE = re.compile(r"@([A-Z][A-Za-z0-9_.-]*(?:[ ][A-Z][A-Za-z0-9_.-]*)?|[a-z][a-z0-9_.-]*)")
+# `#channel-name` references — Slack-style. Lowercase + `-`/`_` only so it
+# doesn't collide with @user mentions or hex colours pasted into messages.
+_CHANNEL_RE = re.compile(r"#([a-z0-9][a-z0-9_-]{1,40})")
+_REL_FMT_RECENT = timedelta(seconds=60)
+
+
+def _fmt_team_time(ts) -> str:
+    """Frontend displays `at` as a human string ('Just now', '10:42 AM', etc.)."""
+    if not ts:
+        return ""
+    try:
+        dt = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return str(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    if delta < _REL_FMT_RECENT:
+        return "Just now"
+    if delta < timedelta(hours=24):
+        return dt.astimezone().strftime("%I:%M %p").lstrip("0")
+    return dt.astimezone().strftime("%b %d, %I:%M %p").replace(" 0", " ")
+
+
+async def _reply_snapshot(db, reply_to_id: str | None) -> dict | None:
+    if not reply_to_id:
+        return None
+    cur = await db.execute(
+        "SELECT id, user_id, text, blocks FROM teams_messages WHERE id = ?",
+        (reply_to_id,),
+    )
+    r = await cur.fetchone()
+    if not r:
+        return None
+    r = dict(r)
+    preview = (r.get("text") or "").strip()
+    if not preview:
+        blocks = jl(r.get("blocks"), [])
+        for b in blocks:
+            if b.get("type") == "text" and b.get("value"):
+                preview = b["value"]; break
+    return {
+        "messageId": r["id"],
+        "userId": r["user_id"],
+        "preview": (preview[:117] + "…") if len(preview) > 120 else preview,
+    }
+
+
 async def _serialize_tmsg(db, m: dict) -> dict:
     cur = await db.execute(
-        "SELECT emoji, COUNT(*) FROM teams_reactions WHERE message_id = ? GROUP BY emoji",
+        "SELECT emoji, user_id FROM teams_reactions WHERE message_id = ?",
         (m["id"],),
     )
-    reactions = {emoji: count for (emoji, count) in await cur.fetchall()}
+    grouped: dict[str, list[str]] = {}
+    for row in await cur.fetchall():
+        emoji, uid = (row["emoji"], row["user_id"]) if isinstance(row, dict) else (row[0], row[1])
+        grouped.setdefault(emoji, []).append(uid)
+    reactions = [{"emoji": e, "userIds": uids} for e, uids in grouped.items()]
+    reply_to = await _reply_snapshot(db, m.get("reply_to_id"))
     return {
         "id": m["id"],
         "userId": m["user_id"],
         "text": m.get("text") or "",
         "blocks": jl(m.get("blocks"), []),
         "attachments": jl(m.get("attachments"), []),
-        "replyTo": m.get("reply_to_id"),
+        "replyTo": reply_to,
+        "at": _fmt_team_time(m.get("at")),
         "ts": m["at"],
-        "reaction": reactions,
+        "reactions": reactions,
     }
+
+
+async def _resolve_mentions(db, workspace_id: str, text: str | None, blocks: list | None) -> list[str]:
+    """Find user IDs mentioned in a message body. Looks at any `{type:"mention",userId}`
+    blocks the client sent *and* at `@Name` substrings in raw text — either is
+    a valid mention because clients don't always parse before sending."""
+    mentioned: set[str] = set()
+    for b in blocks or []:
+        if isinstance(b, dict) and b.get("type") == "mention":
+            uid = b.get("userId")
+            if uid:
+                mentioned.add(str(uid))
+    if text:
+        names = {m.strip().rstrip(".,!?") for m in _MENTION_RE.findall(text)}
+        names = {n for n in names if n}
+        if names:
+            params = [workspace_id, *names]
+            placeholders = ",".join(["?"] * len(names))
+            cur = await db.execute(
+                f"SELECT id, name FROM users WHERE workspace_id = ? AND name IN ({placeholders})",
+                params,
+            )
+            for r in await cur.fetchall():
+                r = dict(r)
+                mentioned.add(str(r["id"]))
+    return list(mentioned)
+
+
+async def _resolve_channel_mentions(db, workspace_id: str, text: str | None,
+                                     blocks: list | None) -> list[dict]:
+    """Resolve `#channel` references — both `{type:"channel_mention",channelId}`
+    blocks and `#name` substrings — to a list of `{id, name}` channel rows in
+    the same workspace. Used to fan a `team.channel.mentioned` event to every
+    referenced channel so members with the channel open see the highlight."""
+    ids: set[str] = set()
+    names: set[str] = set()
+    for b in blocks or []:
+        if isinstance(b, dict) and b.get("type") == "channel_mention":
+            cid = b.get("channelId")
+            if cid:
+                ids.add(str(cid))
+    if text:
+        for m in _CHANNEL_RE.findall(text):
+            names.add(m.lower())
+    if not ids and not names:
+        return []
+    rows: dict[str, dict] = {}
+    if ids:
+        ph = ",".join(["?"] * len(ids))
+        cur = await db.execute(
+            f"SELECT id, name FROM teams_channels WHERE workspace_id = ? AND id IN ({ph})",
+            [workspace_id, *ids],
+        )
+        for r in await cur.fetchall():
+            r = dict(r)
+            rows[r["id"]] = r
+    if names:
+        ph = ",".join(["?"] * len(names))
+        cur = await db.execute(
+            f"SELECT id, name FROM teams_channels WHERE workspace_id = ? AND lower(name) IN ({ph})",
+            [workspace_id, *names],
+        )
+        for r in await cur.fetchall():
+            r = dict(r)
+            rows[r["id"]] = r
+    return list(rows.values())
 
 
 @router.get("/conversations/{cid}/messages")
@@ -129,6 +254,11 @@ async def post_team_message(cid: str, body: TeamMessageIn, user: dict = Me) -> d
     db = await get_db()
     mid = str(uuid4())
     is_channel = await _is_channel(db, cid)
+    reply_to_id = None
+    if body.replyTo:
+        # Clients pass the raw id in `replyTo` (wire.md compat) or a snapshot-object
+        # the caller already assembled locally.
+        reply_to_id = body.replyTo if isinstance(body.replyTo, str) else body.replyTo.get("messageId")
     await db.execute(
         """
         INSERT INTO teams_messages (id, workspace_id, channel_id, dm_id, user_id,
@@ -136,13 +266,45 @@ async def post_team_message(cid: str, body: TeamMessageIn, user: dict = Me) -> d
         VALUES (?,?,?,?,?,?,?,?,?)
         """,
         (mid, user["workspace_id"], cid if is_channel else None, None if is_channel else cid,
-         user["id"], body.text, js(body.blocks), js(body.attachments), body.replyTo),
+         user["id"], body.text, js(body.blocks), js(body.attachments), reply_to_id),
     )
     await db.commit()
     cur = await db.execute("SELECT * FROM teams_messages WHERE id = ?", (mid,))
     row = dict(await cur.fetchone())
     msg = await _serialize_tmsg(db, row)
+    # Frontend uses `tempId` for optimistic dedupe — echo it back to the sender.
+    if getattr(body, "tempId", None):
+        msg["tempId"] = body.tempId
+
     await broker.publish(f"teams:{cid}", "team.message.created", msg)
+
+    # Notify anyone mentioned in the message so their bell lights up (spec §3.7).
+    mentioned = await _resolve_mentions(db, user["workspace_id"], body.text, body.blocks)
+    if mentioned:
+        scope = "#channel" if is_channel else "DM"
+        for uid in mentioned:
+            if uid == user["id"]:
+                continue
+            await create_notification(
+                uid, "mention",
+                title=f"{user['name']} mentioned you in {scope}",
+                body=(body.text or "").strip()[:160],
+                link=f"/teams?id={cid}",
+            )
+
+    # `#channel-name` cross-references — fan a lightweight event to every
+    # referenced channel so anyone with the channel open sees a "mentioned in
+    # #other-channel" pill, and persist a `channel_mention` notification so it
+    # shows up in the bell.
+    chan_refs = await _resolve_channel_mentions(db, user["workspace_id"], body.text, body.blocks)
+    for ch in chan_refs:
+        if ch["id"] == cid:
+            continue
+        await broker.publish(
+            f"teams:{ch['id']}", "team.channel.mentioned",
+            {"fromChannelId": cid, "fromUserId": user["id"], "fromName": user["name"],
+             "messageId": mid, "text": (body.text or "")[:200]},
+        )
     return msg
 
 
@@ -168,14 +330,23 @@ async def toggle_reaction(message_id: str, body: ReactionIn, user: dict = Me) ->
     row = await cur.fetchone()
     if not row:
         raise HTTPException(404, "message not found")
-    return await _serialize_tmsg(db, dict(row))
+    row = dict(row)
+    msg = await _serialize_tmsg(db, row)
+    topic_id = row.get("channel_id") or row.get("dm_id")
+    if topic_id:
+        await broker.publish(f"teams:{topic_id}", "team.reaction.updated", {
+            "messageId": message_id,
+            "reactions": msg["reactions"],
+        })
+    return msg
 
 
 @router.post("/typing/{cid}")
-async def typing(cid: str, body: dict, user: dict = Me) -> dict:
+async def typing(cid: str, body: dict | None = None, user: dict = Me) -> dict:
+    on = (body or {}).get("on", True) if isinstance(body, dict) else True
     await broker.publish(
         f"teams:{cid}", "team.typing",
-        {"user_id": user["id"], "name": user["name"], "on": body.get("on", True)},
+        {"userId": user["id"], "userName": user["name"], "on": on},
     )
     return {"ok": True}
 

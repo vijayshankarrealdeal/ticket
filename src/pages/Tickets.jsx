@@ -63,7 +63,13 @@ export default function Tickets() {
       .then((res) => {
         if (!alive) return;
         const items = Array.isArray(res) ? res : res?.items || [];
-        setTickets(items);
+        // Preserve detail fields (customerDetails, timeline, notes, order,
+        // …) that the list endpoint doesn't return, so a refetch doesn't
+        // wipe the currently-open ticket's cached detail.
+        setTickets((prev) => items.map((it) => {
+          const cached = prev.find((t) => t.id === it.id);
+          return cached ? { ...cached, ...it } : it;
+        }));
         setSelectedId((cur) => cur ?? items[0]?.id ?? null);
       })
       .catch(() => { if (alive) setTickets([]); });
@@ -76,7 +82,15 @@ export default function Tickets() {
     api.get(`/tickets/${encodeURIComponent(selectedId)}`)
       .then((detail) => {
         if (!alive || !detail) return;
-        setTickets((prev) => prev.map((t) => t.id === selectedId ? { ...t, ...detail } : t));
+        setTickets((prev) => {
+          // If the list hasn't landed yet (or this ticket was pruned by
+          // a filter), still cache the detail by inserting it — otherwise
+          // the merge no-ops against an empty/stale list and the detail
+          // is quietly dropped.
+          const idx = prev.findIndex((t) => t.id === selectedId);
+          if (idx === -1) return [...prev, { ...detail, id: selectedId }];
+          return prev.map((t, i) => i === idx ? { ...t, ...detail, id: t.id } : t);
+        });
       })
       .catch(() => {});
     return () => { alive = false; };
@@ -115,24 +129,41 @@ export default function Tickets() {
   }, [params]);
 
   // Realtime — push updates for the inbox (list) + the open ticket.
+  //
+  // Publishers aren't consistent about `evt.data.id`: the PATCH/resolve
+  // routes send the serialized ticket (id = "#9", string) while the
+  // orchestrator + worker + merge endpoint send raw DB ids (id = 9, int).
+  // Pin `t.id` across the spread so an int payload can never clobber the
+  // canonical "#"-prefixed id — otherwise the next
+  // `tickets.find(t => t.id === selectedId)` returns undefined and the
+  // whole detail pane goes blank until a full refetch.
+  const normalizeTicketId = (raw) => {
+    if (raw === null || raw === undefined) return null;
+    const s = String(raw);
+    return s.startsWith('#') ? s : `#${s}`;
+  };
   const workspaceId = loadAuth()?.workspaceId;
   useRealtimeTopic(workspaceId ? `inbox:${workspaceId}` : null, (evt) => {
     if (evt.type === 'ticket.updated') {
-      setTickets((prev) => prev.map((t) => t.id === evt.data.id ? { ...t, ...evt.data } : t));
+      const eid = normalizeTicketId(evt.data?.id);
+      if (!eid) return;
+      setTickets((prev) => prev.map((t) => t.id === eid ? { ...t, ...evt.data, id: t.id } : t));
     } else if (evt.type === 'ticket.created') {
-      setTickets((prev) => prev.some((t) => t.id === evt.data.id) ? prev : [evt.data, ...prev]);
+      const eid = normalizeTicketId(evt.data?.id);
+      if (!eid) return;
+      setTickets((prev) => prev.some((t) => t.id === eid) ? prev : [{ ...evt.data, id: eid }, ...prev]);
     }
   });
   useRealtimeTopic(
     selectedId ? `ticket:${selectedId.replace(/^#/, '')}` : null,
     (evt) => {
       if (evt.type === 'ticket.updated') {
-        setTickets((prev) => prev.map((t) => t.id === selectedId ? { ...t, ...evt.data } : t));
+        setTickets((prev) => prev.map((t) => t.id === selectedId ? { ...t, ...evt.data, id: t.id } : t));
       } else if (evt.type === 'ticket.timeline.appended') {
         // refetch the detail to pick up the appended timeline entry
         api.get(`/tickets/${encodeURIComponent(selectedId)}`).then((detail) => {
           if (!detail) return;
-          setTickets((prev) => prev.map((t) => t.id === selectedId ? { ...t, ...detail } : t));
+          setTickets((prev) => prev.map((t) => t.id === selectedId ? { ...t, ...detail, id: t.id } : t));
         }).catch(() => {});
       }
     }
@@ -174,23 +205,22 @@ export default function Tickets() {
     const filterFn = FILTERS.find((f) => f.key === filterKey)?.match || (() => true);
     let out = tickets.filter(filterFn).filter((t) => {
       if (!q) return true;
-      return (
-        t.id.toLowerCase().includes(q) ||
-        t.customer.toLowerCase().includes(q) ||
-        t.task.toLowerCase().includes(q) ||
-        (t.assignee || '').toLowerCase().includes(q)
-      );
+      const id = String(t.id || '').toLowerCase();
+      const cust = String(t.customer || '').toLowerCase();
+      const task = String(t.task || '').toLowerCase();
+      const assignee = String(t.assignee || '').toLowerCase();
+      return id.includes(q) || cust.includes(q) || task.includes(q) || assignee.includes(q);
     });
-    const idNum = (t) => parseInt(t.id.replace(/\D/g, ''), 10) || 0;
+    const idNum = (t) => parseInt(String(t.id || '').replace(/\D/g, ''), 10) || 0;
     switch (sort) {
       case 'oldest':    out = [...out].sort((a, b) => idNum(a) - idNum(b)); break;
       case 'sla-asc':   out = [...out].sort((a, b) => slaHours(a.sla) - slaHours(b.sla)); break;
       case 'sla-desc':  out = [...out].sort((a, b) => slaHours(b.sla) - slaHours(a.sla)); break;
-      case 'customer':  out = [...out].sort((a, b) => a.customer.localeCompare(b.customer)); break;
+      case 'customer':  out = [...out].sort((a, b) => String(a.customer || '').localeCompare(String(b.customer || ''))); break;
       default:          out = [...out].sort((a, b) => idNum(b) - idNum(a));
     }
     return out;
-  }, [search, sort, filterKey]);
+  }, [search, sort, filterKey, tickets]);
 
   const filterLabel = FILTERS.find((f) => f.key === filterKey)?.label;
   const sortLabel = SORT_OPTIONS.find((o) => o.key === sort)?.label;
@@ -330,6 +360,9 @@ export default function Tickets() {
               t={selected}
               onExpand={() => setExpandedOpen(true)}
               onCollapse={() => setSidebarCollapsed(true)}
+              onPatch={(patch) =>
+                setTickets((prev) => prev.map((x) => x.id === selected.id ? { ...x, ...patch } : x))
+              }
             />
           )}
         </div>
@@ -420,38 +453,55 @@ function DetailHeader({ t, sidebarCollapsed, onShowSidebar }) {
 }
 
 function InfoBody({ t }) {
+  // Defensive: the list endpoint only returns base fields — `customerDetails`,
+  // `timeline`, and `order` arrive via the detail fetch. Before that fetch
+  // lands (and for tickets that simply have no order), those keys are absent,
+  // so every access has to be guarded or the whole Tickets page blanks out.
+  const customerName = t.customer || 'Unknown';
+  const cd = t.customerDetails || {};
+  const timeline = t.timeline || [];
+  const order = t.order || null;
+  const navigate = useNavigate();
+  const gotoCustomer = () => {
+    const qp = new URLSearchParams();
+    if (t.customerId) qp.set('id', t.customerId);
+    else if (cd.phone) qp.set('phone', cd.phone);
+    else if (cd.email) qp.set('email', cd.email);
+    else qp.set('name', customerName);
+    navigate('/customers' + (qp.toString() ? `?${qp}` : ''));
+  };
   return (
     <div className="detail-body">
       {/* Customer */}
       <div className="panel">
         <div className="panel-head">
           <span>Customer</span>
-          <button className="link link-btn">View details <Icon.Chevron style={{ transform: 'rotate(-90deg)', width: 12, height: 12 }} /></button>
+          <button className="link link-btn" onClick={gotoCustomer}>View details <Icon.Chevron style={{ transform: 'rotate(-90deg)', width: 12, height: 12 }} /></button>
         </div>
         <div className="customer-top-row">
           <div className="avatar" style={{ background: '#1e40af' }}>
-            {t.customer.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()}
+            {customerName.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()}
           </div>
           <div style={{ minWidth: 0 }}>
-            <div className="customer-top-name">{t.customer}</div>
-            <div className="customer-top-sub">Customer since {t.customerDetails.since}</div>
+            <div className="customer-top-name">{customerName}</div>
+            <div className="customer-top-sub">Customer since {cd.since || '—'}</div>
           </div>
         </div>
         <div className="kv-list">
-          <div className="kv-row"><Icon.Phone className="icon" /><span>{t.customerDetails.phone}</span></div>
-          <div className="kv-row"><Icon.Mail className="icon" /><span>{t.customerDetails.email}</span></div>
+          <div className="kv-row"><Icon.Phone className="icon" /><span>{cd.phone || '—'}</span></div>
+          <div className="kv-row"><Icon.Mail className="icon" /><span>{cd.email || '—'}</span></div>
           <div className="kv-row" style={{ alignItems: 'flex-start' }}>
             <Icon.MapPin className="icon" style={{ marginTop: 2 }} />
-            <span>{t.customerDetails.address}</span>
+            <span>{cd.address || '—'}</span>
           </div>
         </div>
         <div className="customer-metric-row">
           <div className="customer-metric">
-            <div className="metric-value">{t.customerDetails.orders}</div>
+            <div className="metric-value">{cd.orders ?? 0}</div>
             <div className="metric-label">Orders</div>
           </div>
           <div className="customer-metric">
-            <div className="metric-value">{t.customerDetails.returns}</div>
+            <div className="metric-value">{cd.returns ?? 0}</div>
             <div className="metric-label">Returns</div>
           </div>
         </div>
@@ -461,7 +511,9 @@ function InfoBody({ t }) {
       <div className="panel">
         <div className="panel-head"><span>Activity</span></div>
         <div className="timeline">
-          {t.timeline.map((e, i) => (
+          {timeline.length === 0 ? (
+            <div style={{ color: 'var(--muted)', fontSize: 13 }}>No activity yet.</div>
+          ) : timeline.map((e, i) => (
             <div key={i} className="tl-item">
               <div>
                 <div className="txt">{e.text}</div>
@@ -472,36 +524,38 @@ function InfoBody({ t }) {
         </div>
       </div>
 
-      {/* Order spans full width */}
-      <div className="panel" style={{ gridColumn: '1 / -1' }}>
-        <div className="panel-head">
-          <span>Order</span>
-          <span className="muted-small">Ordered {t.order.placedOn || 'Apr 22, 2026'}</span>
-        </div>
-        <div className="order-card">
-          <div className="order-card-top">
-            <div>
-              <div className="order-id">#{t.order.id}</div>
-              <div className="order-sub">
-                <span className="muted-dot success" /> Paid
-                <span className="order-sub-sep">·</span>
-                {t.orderStatus || 'Processing'}
-              </div>
-            </div>
-            <div className="order-total">₹{t.order.price.toLocaleString()}</div>
+      {/* Order spans full width — omit if this ticket has no linked order */}
+      {order && (
+        <div className="panel" style={{ gridColumn: '1 / -1' }}>
+          <div className="panel-head">
+            <span>Order</span>
+            <span className="muted-small">Ordered {order.placedOn || 'Apr 22, 2026'}</span>
           </div>
-          {(t.order.items || []).map((it, i) => (
-            <div key={i} className="order-item">
-              <div className="order-thumb"><Icon.ShoppingBag /></div>
-              <div style={{ minWidth: 0 }}>
-                <div className="order-item-name">{it.name}</div>
-                <div className="order-item-qty">SKU: {it.sku} · Qty: {it.qty}</div>
+          <div className="order-card">
+            <div className="order-card-top">
+              <div>
+                <div className="order-id">#{order.id}</div>
+                <div className="order-sub">
+                  <span className="muted-dot success" /> Paid
+                  <span className="order-sub-sep">·</span>
+                  {t.orderStatus || 'Processing'}
+                </div>
               </div>
-              <div className="order-item-price">₹{(it.price * it.qty).toLocaleString()}</div>
+              <div className="order-total">₹{Number(order.price || 0).toLocaleString()}</div>
             </div>
-          ))}
+            {(order.items || []).map((it, i) => (
+              <div key={i} className="order-item">
+                <div className="order-thumb"><Icon.ShoppingBag /></div>
+                <div style={{ minWidth: 0 }}>
+                  <div className="order-item-name">{it.name}</div>
+                  <div className="order-item-qty">SKU: {it.sku} · Qty: {it.qty}</div>
+                </div>
+                <div className="order-item-price">₹{Number((it.price || 0) * (it.qty || 1)).toLocaleString()}</div>
+              </div>
+            ))}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -561,6 +615,9 @@ function NotesBody({ t }) {
   const [draft, setDraft] = useState('');
   const [notes, setNotes] = useState(Array.isArray(t?.notes) ? t.notes : []);
   const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    setNotes(Array.isArray(t?.notes) ? t.notes : []);
+  }, [t?.id, t?.notes]);
   async function submit(e) {
     e.preventDefault();
     const text = draft.trim();
@@ -631,12 +688,12 @@ function PropRow({ label, children }) {
   );
 }
 
-function TicketSidebar({ t, onExpand, onCollapse }) {
+function TicketSidebar({ t, onExpand, onCollapse, onPatch }) {
   const [resolTab, setResolTab] = useState('resolution');
   const [busy, setBusy] = useState(null);
   const [flash, setFlash] = useState(null);
   const [modal, setModal] = useState(null); // 'merge'|'split'|'attach'|null
-  const meta = statusMeta[t.status];
+  const meta = statusMeta[t.status] || { label: t.status || 'Queued', tone: 'info' };
 
   const flashOk = (msg) => { setFlash({ ok: true, msg }); setTimeout(() => setFlash(null), 2500); };
   const flashErr = (msg) => { setFlash({ ok: false, msg }); setTimeout(() => setFlash(null), 3500); };
@@ -723,31 +780,7 @@ function TicketSidebar({ t, onExpand, onCollapse }) {
 
       <div className="side-section">
         <div className="side-section-title">Assignment</div>
-        {t.assignee ? (
-          <div className="assign-row">
-            <div className="avatar sm" style={{ background: '#1e40af' }}>
-              {t.assignee.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()}
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div className="assign-name">{t.assignee}</div>
-              <div className="assign-sub">{t.team}</div>
-            </div>
-            <button className="icon-btn" title="Change assignee"><Icon.Pencil /></button>
-          </div>
-        ) : (
-          <button className="assign-empty">
-            <Icon.User />
-            <span>Unassigned</span>
-            <span className="assign-empty-action">Assign</span>
-          </button>
-        )}
-        <div className="owner-row">
-          <Icon.User style={{ color: 'var(--muted)' }} />
-          <span className="owner-text">No owner</span>
-          <button className="btn ghost owner-btn">
-            <Icon.Plus /> Set owner
-          </button>
-        </div>
+        <AssigneePicker ticket={t} onPatch={onPatch} />
       </div>
 
       {t.pendingChild ? (
@@ -786,14 +819,7 @@ function TicketSidebar({ t, onExpand, onCollapse }) {
             Execution
           </button>
         </div>
-        <div className="form-group" style={{ marginBottom: 12 }}>
-          <label>VOC <span style={{ color: 'var(--danger)' }}>*</span></label>
-          <button className="select-input"><span>Select VOC</span> <Icon.Chevron /></button>
-        </div>
-        <div className="resolution-foot">
-          <span className="resolution-status">Disposition saved</span>
-          <button className="btn">Save</button>
-        </div>
+        <ResolutionForm ticket={t} onPatch={onPatch} />
       </div>
 
       <div className="side-section">
@@ -849,25 +875,246 @@ function TicketSidebar({ t, onExpand, onCollapse }) {
   );
 }
 
+// Voice-of-customer dispositions — the support team uses these to classify
+// what the ticket was actually about at close time. Drives reporting.
+const VOC_OPTIONS = [
+  'product_inquiry',
+  'bug_or_defect',
+  'feature_request',
+  'delivery_issue',
+  'refund_requested',
+  'billing_question',
+  'account_help',
+  'complaint',
+  'praise',
+  'other',
+];
+
+function AssigneePicker({ ticket, onPatch }) {
+  // Admins (and anyone with the AgentOrAdmin role server-side) can reassign;
+  // backend enforces the role — we just light up the picker for everyone
+  // logged in. Members come from `/workspace/members`.
+  const [open, setOpen] = useState(false);
+  const [members, setMembers] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open || members.length) return;
+    api.get('/workspace/members')
+      .then((rows) => setMembers(Array.isArray(rows) ? rows : []))
+      .catch(() => setMembers([]));
+  }, [open, members.length]);
+
+  useEffect(() => {
+    function onDocClick(e) {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
+
+  async function assign(memberId, memberName) {
+    setBusy(true); setErr(null);
+    try {
+      const updated = await api.patch(
+        `/tickets/${encodeURIComponent(ticket.id)}`,
+        { assigneeId: memberId },
+      );
+      onPatch?.(updated || { assignee: memberName });
+      setOpen(false);
+    } catch (e) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function unassign() {
+    setBusy(true); setErr(null);
+    try {
+      const updated = await api.patch(
+        `/tickets/${encodeURIComponent(ticket.id)}`,
+        { assigneeId: null },
+      );
+      onPatch?.(updated || { assignee: null });
+      setOpen(false);
+    } catch (e) {
+      setErr(String(e?.message || e));
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      {ticket.assignee ? (
+        <div className="assign-row" onClick={() => setOpen((v) => !v)}
+             style={{ cursor: 'pointer' }}>
+          <div className="avatar sm" style={{ background: '#1e40af' }}>
+            {ticket.assignee.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()}
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="assign-name">{ticket.assignee}</div>
+            <div className="assign-sub">{ticket.team}</div>
+          </div>
+          <button className="icon-btn" title="Change assignee"><Icon.Pencil /></button>
+        </div>
+      ) : (
+        <button className="assign-empty" onClick={() => setOpen((v) => !v)}>
+          <Icon.User />
+          <span>Unassigned</span>
+          <span className="assign-empty-action">Assign</span>
+        </button>
+      )}
+      {open && (
+        <div style={{
+          position: 'absolute', top: 'calc(100% + 6px)', left: 0, right: 0, zIndex: 10,
+          background: 'var(--card, #0f172a)', border: '1px solid var(--border)',
+          borderRadius: 10, padding: 6, boxShadow: '0 18px 40px rgba(0,0,0,0.35)',
+          maxHeight: 280, overflow: 'auto',
+        }}>
+          {ticket.assignee && (
+            <button
+              onClick={unassign}
+              disabled={busy}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                width: '100%', padding: '8px 10px', background: 'transparent',
+                border: 'none', color: 'var(--danger, #ef4444)', fontSize: 13,
+                cursor: 'pointer', borderRadius: 6, textAlign: 'left',
+              }}
+            >
+              <Icon.Close style={{ width: 14, height: 14 }} /> Unassign
+            </button>
+          )}
+          {members.length === 0 ? (
+            <div style={{ padding: 10, color: 'var(--muted)', fontSize: 12 }}>Loading…</div>
+          ) : members.map((m) => {
+            const selected = ticket.assignee === m.name;
+            return (
+              <button
+                key={m.id}
+                onClick={() => !selected && assign(m.id, m.name)}
+                disabled={busy || selected}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  width: '100%', padding: '8px 10px',
+                  background: selected ? 'var(--hover, rgba(255,255,255,0.05))' : 'transparent',
+                  border: 'none', color: 'var(--text)', fontSize: 13,
+                  cursor: selected ? 'default' : 'pointer', borderRadius: 6,
+                  textAlign: 'left',
+                }}
+              >
+                <div className="avatar sm" style={{ background: '#475569', flexShrink: 0 }}>
+                  {m.name.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 500 }}>{m.name}</div>
+                  <div style={{ color: 'var(--muted)', fontSize: 11 }}>
+                    {m.email} · {m.role}
+                  </div>
+                </div>
+                {selected && <span style={{ color: 'var(--success, #22c55e)' }}>✓</span>}
+              </button>
+            );
+          })}
+          {err && (
+            <div style={{ padding: 8, color: 'var(--danger, #ef4444)', fontSize: 12 }}>
+              {err}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ResolutionForm({ ticket, onPatch }) {
+  const [voc, setVoc] = useState(ticket.voc || '');
+  const [notes, setNotes] = useState(ticket.resolutionNotes || '');
+  const [state, setState] = useState('idle'); // 'idle' | 'saving' | 'saved' | 'error'
+  const [err, setErr] = useState(null);
+  const dirty = voc !== (ticket.voc || '') || notes !== (ticket.resolutionNotes || '');
+
+  // Keep local state in sync if the ticket prop changes (new selection).
+  useEffect(() => {
+    setVoc(ticket.voc || '');
+    setNotes(ticket.resolutionNotes || '');
+    setState('idle');
+  }, [ticket.id, ticket.voc, ticket.resolutionNotes]);
+
+  async function save(e) {
+    e?.preventDefault?.();
+    if (!voc) { setErr('Select a VOC before saving.'); return; }
+    setState('saving'); setErr(null);
+    try {
+      const updated = await api.patch(
+        `/tickets/${encodeURIComponent(ticket.id)}`,
+        { voc, resolutionNotes: notes },
+      );
+      onPatch?.(updated || { voc, resolutionNotes: notes });
+      setState('saved');
+      setTimeout(() => setState((s) => (s === 'saved' ? 'idle' : s)), 2000);
+    } catch (e) {
+      setErr(String(e?.message || e));
+      setState('error');
+    }
+  }
+
+  return (
+    <form onSubmit={save}>
+      <div className="form-group" style={{ marginBottom: 10 }}>
+        <label>VOC <span style={{ color: 'var(--danger)' }}>*</span></label>
+        <select
+          value={voc}
+          onChange={(e) => setVoc(e.target.value)}
+          style={{ width: '100%', padding: '8px 10px', background: 'var(--card, #111827)',
+                   color: 'var(--text)', border: '1px solid var(--border)',
+                   borderRadius: 8, fontSize: 13 }}
+        >
+          <option value="">Select VOC</option>
+          {VOC_OPTIONS.map((v) => (
+            <option key={v} value={v}>{v.replace(/_/g, ' ')}</option>
+          ))}
+        </select>
+      </div>
+      <div className="form-group" style={{ marginBottom: 10 }}>
+        <label>Resolution notes</label>
+        <textarea
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+          placeholder="Enter resolution details…"
+          className="chat-input"
+          style={{ minHeight: 90, width: '100%', resize: 'vertical' }}
+        />
+      </div>
+      <div className="resolution-foot">
+        <span className="resolution-status" style={{
+          color: state === 'saved' ? 'var(--success, #22c55e)'
+               : state === 'error' ? 'var(--danger, #ef4444)'
+               : 'var(--muted)',
+        }}>
+          {state === 'saving' ? 'Saving…'
+           : state === 'saved' ? '✓ Saved'
+           : state === 'error' ? (err || 'Error')
+           : dirty ? 'Unsaved changes'
+           : (ticket.voc ? 'Disposition saved' : 'Disposition not set')}
+        </span>
+        <button type="submit" className="btn" disabled={state === 'saving' || !dirty}>
+          {state === 'saving' ? 'Saving…' : 'Save'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
 function ActionModalShell({ title, onClose, children, footer }) {
   return (
-    <div
-      style={{
-        position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 60,
-      }}
-      onClick={onClose}
-    >
-      <div
-        style={{
-          background: 'var(--card, #fff)', borderRadius: 12, padding: 20, width: 480,
-          maxWidth: '94%', boxShadow: '0 20px 50px rgba(15,23,42,0.25)',
-        }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3 style={{ margin: '0 0 12px' }}>{title}</h3>
-        {children}
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+    <div className="action-modal-overlay" onClick={onClose}>
+      <div className="action-modal" onClick={(e) => e.stopPropagation()}>
+        <h3 className="action-modal-title">{title}</h3>
+        <div className="action-modal-body">{children}</div>
+        <div className="action-modal-footer">
           <button className="btn secondary" onClick={onClose}>Cancel</button>
           {footer}
         </div>
@@ -1051,9 +1298,12 @@ function CollapsibleSection({ title, icon, defaultOpen = true, children, count }
 }
 
 function TicketDetailModal({ t, onClose }) {
-  const meta = statusMeta[t.status];
-  const items = t.order.items || [];
+  const meta = statusMeta[t.status] || { label: t.status || 'Queued', tone: 'info' };
+  const order = t.order || null;
+  const items = order?.items || [];
   const cf = t.customFields || {};
+  const cd = t.customerDetails || {};
+  const customerName = t.customer || 'Unknown';
   const navigate = useNavigate();
   const goToProfile = () => {
     const phone = t.customerDetails?.phone;
@@ -1104,72 +1354,74 @@ function TicketDetailModal({ t, onClose }) {
               </div>
               <div className="customer-top-row">
                 <div className="avatar" style={{ background: '#1e40af' }}>
-                  {t.customer.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()}
+                  {customerName.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()}
                 </div>
                 <div style={{ minWidth: 0 }}>
-                  <div className="customer-top-name">{t.customer}</div>
-                  <div className="customer-top-sub">Customer since {t.customerDetails.since}</div>
+                  <div className="customer-top-name">{customerName}</div>
+                  <div className="customer-top-sub">Customer since {cd.since || '—'}</div>
                 </div>
               </div>
               <div className="kv-list">
-                <div className="kv-row"><Icon.Phone className="icon" /><span>{t.customerDetails.phone}</span></div>
-                <div className="kv-row"><Icon.Mail className="icon" /><span>{t.customerDetails.email}</span></div>
+                <div className="kv-row"><Icon.Phone className="icon" /><span>{cd.phone || '—'}</span></div>
+                <div className="kv-row"><Icon.Mail className="icon" /><span>{cd.email || '—'}</span></div>
                 <div className="kv-row" style={{ alignItems: 'flex-start' }}>
                   <Icon.MapPin className="icon" style={{ marginTop: 2 }} />
-                  <span>{t.customerDetails.address}</span>
+                  <span>{cd.address || '—'}</span>
                 </div>
               </div>
               <div className="customer-metric-row">
                 <div className="customer-metric">
-                  <div className="metric-value">{t.customerDetails.orders}</div>
+                  <div className="metric-value">{cd.orders ?? 0}</div>
                   <div className="metric-label">Orders</div>
                 </div>
                 <div className="customer-metric">
-                  <div className="metric-value">{t.customerDetails.returns}</div>
+                  <div className="metric-value">{cd.returns ?? 0}</div>
                   <div className="metric-label">Returns</div>
                 </div>
               </div>
             </div>
 
-            <div className="modal-panel">
-              <CollapsibleSection
-                title="Order"
-                icon={<Icon.ShoppingBag />}
-                count={items.length}
-              >
-                <div className="order-summary-grid">
-                  <div>
-                    <div className="muted-tiny">Order ID</div>
-                    <div className="order-summary-value">#{t.order.id}</div>
-                  </div>
-                  <div>
-                    <div className="muted-tiny">Total</div>
-                    <div className="order-summary-value">₹{t.order.price.toLocaleString()}</div>
-                  </div>
-                  <div>
-                    <div className="muted-tiny">Placed on</div>
-                    <div className="order-summary-value">{t.order.placedOn || '—'}</div>
-                  </div>
-                  <div>
-                    <div className="muted-tiny">Status</div>
-                    <div className="order-summary-value">{t.orderStatus || '—'}</div>
-                  </div>
-                </div>
-
-                <div className="item-list">
-                  {items.map((it, i) => (
-                    <div key={i} className="item-list-row">
-                      <div className="order-thumb"><Icon.ShoppingBag /></div>
-                      <div className="item-list-meta">
-                        <div className="item-list-name">{it.name}</div>
-                        <div className="item-list-sub">SKU {it.sku} · Qty {it.qty}</div>
-                      </div>
-                      <div className="item-list-price">₹{(it.price * it.qty).toLocaleString()}</div>
+            {order && (
+              <div className="modal-panel">
+                <CollapsibleSection
+                  title="Order"
+                  icon={<Icon.ShoppingBag />}
+                  count={items.length}
+                >
+                  <div className="order-summary-grid">
+                    <div>
+                      <div className="muted-tiny">Order ID</div>
+                      <div className="order-summary-value">#{order.id}</div>
                     </div>
-                  ))}
-                </div>
-              </CollapsibleSection>
-            </div>
+                    <div>
+                      <div className="muted-tiny">Total</div>
+                      <div className="order-summary-value">₹{Number(order.price || 0).toLocaleString()}</div>
+                    </div>
+                    <div>
+                      <div className="muted-tiny">Placed on</div>
+                      <div className="order-summary-value">{order.placedOn || '—'}</div>
+                    </div>
+                    <div>
+                      <div className="muted-tiny">Status</div>
+                      <div className="order-summary-value">{t.orderStatus || '—'}</div>
+                    </div>
+                  </div>
+
+                  <div className="item-list">
+                    {items.map((it, i) => (
+                      <div key={i} className="item-list-row">
+                        <div className="order-thumb"><Icon.ShoppingBag /></div>
+                        <div className="item-list-meta">
+                          <div className="item-list-name">{it.name}</div>
+                          <div className="item-list-sub">SKU {it.sku} · Qty {it.qty}</div>
+                        </div>
+                        <div className="item-list-price">₹{Number((it.price || 0) * (it.qty || 1)).toLocaleString()}</div>
+                      </div>
+                    ))}
+                  </div>
+                </CollapsibleSection>
+              </div>
+            )}
           </section>
 
           {/* CENTER column */}
@@ -1258,7 +1510,7 @@ function TicketDetailModal({ t, onClose }) {
             <div className="modal-panel">
               <div className="modal-panel-head"><span>Activity</span></div>
               <div className="timeline">
-                {t.timeline.map((e, i) => (
+                {(t.timeline || []).map((e, i) => (
                   <div key={i} className="tl-item">
                     <div>
                       <div className="txt">{e.text}</div>

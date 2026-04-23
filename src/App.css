@@ -2234,25 +2234,60 @@
 .mail-msg {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
+  border-radius: 10px;
   box-shadow: var(--shadow-sm);
-  max-width: 760px;
   width: 100%;
-  align-self: flex-start;
+  max-width: 100%;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 .mail-head {
-  display: flex; align-items: center; gap: 12px;
-  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
   border-bottom: 1px solid var(--border);
-  background: var(--panel);
+  background: transparent;
 }
+.mail-head > .avatar { flex: none; }
+.mail-head > div:nth-child(2) {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+.mail-head > div:nth-child(2) > div {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mail-head > div:nth-child(3) { flex: none; }
+.mail-head > .msg-reply-btn { flex: none; }
 .mail-body {
-  padding: 18px 16px;
+  padding: 16px 18px 18px;
   font-size: 14px;
   color: var(--text);
-  line-height: 1.55;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
+.mail-msg.mail-msg-mine {
+  background: var(--panel);
+  border-color: var(--border);
+}
+.mail-msg.mail-msg-mine .mail-head { background: transparent; }
+
+/* Streaming AI reply cursor — blinks while deltas land. */
+.stream-cursor {
+  display: inline-block;
+  margin-left: 2px;
+  color: #7c3aed;
+  animation: stream-cursor-blink 0.9s steps(2, start) infinite;
+}
+@keyframes stream-cursor-blink { to { opacity: 0.25; } }
+.bubble.streaming { border-color: #ddd6fe; }
 
 /* ---------- Circle icon buttons in chat head ---------- */
 .icon-btn.circle {
@@ -2464,6 +2499,15 @@
   color: white;
 }
 .chat-channel-switcher .icon-btn.circle.on:hover { background: var(--primary-600); }
+
+.icon-btn.circle.chat-head-delete {
+  width: 32px; height: 32px;
+  color: #ef4444;
+}
+.icon-btn.circle.chat-head-delete:hover {
+  background: rgba(239, 68, 68, 0.12);
+  color: #dc2626;
+}
 
 .call-btn.solid {
   background: var(--primary);
@@ -5145,5 +5189,82 @@
 }
 @media (max-width: 640px) {
   .auth-hero-side { display: none; }
+}
+
+/* ---------- Ticket action modals (merge / split / attach) ---------- */
+.action-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+  animation: fade-in 120ms ease-out;
+}
+.action-modal {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  width: 520px;
+  max-width: 94%;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.action-modal-title {
+  margin: 0;
+  padding: 18px 22px 14px;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+}
+.action-modal-body {
+  padding: 18px 22px;
+  display: grid;
+  gap: 12px;
+  color: var(--text);
+}
+.action-modal-body label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.action-modal-body select,
+.action-modal-body input,
+.action-modal-body textarea {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 14px;
+  font-weight: 400;
+  outline: none;
+  width: 100%;
+  appearance: none;
+}
+.action-modal-body select:focus,
+.action-modal-body input:focus,
+.action-modal-body textarea:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-50);
+}
+.action-modal-body select option {
+  background: var(--panel);
+  color: var(--text);
+}
+.action-modal-footer {
+  padding: 14px 22px 18px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
 }
 

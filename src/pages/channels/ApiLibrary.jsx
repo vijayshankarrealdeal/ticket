@@ -450,42 +450,30 @@ function ApiModal({ mode, initial, integrations, onClose, onSaved }) {
   }
 
   return (
-    <div
-      style={{
-        position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50,
-      }}
-      onClick={onClose}
-    >
-      <div
-        style={{
-          background: 'var(--card, #fff)', borderRadius: 12, padding: 20, width: 460,
-          maxWidth: '94%', boxShadow: '0 20px 50px rgba(15,23,42,0.25)',
-        }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3 style={{ margin: '0 0 12px' }}>
+    <div className="ch-modal-overlay" onClick={onClose}>
+      <div className="ch-modal" onClick={(e) => e.stopPropagation()}>
+        <h3 className="ch-modal-title">
           {isNewIntegration ? 'New integration' : initial?.id ? 'Edit API' : 'Add API'}
         </h3>
-        <div style={{ display: 'grid', gap: 10 }}>
-          <label>Name
+        <div className="ch-modal-body">
+          <label className="ch-modal-field">Name
             <input value={form.name} onChange={(e) => setField('name', e.target.value)} />
           </label>
           {isNewIntegration ? (
-            <label>Description
+            <label className="ch-modal-field">Description
               <input value={form.description} onChange={(e) => setField('description', e.target.value)} />
             </label>
           ) : (
             <>
-              <label>Method
+              <label className="ch-modal-field">Method
                 <select value={form.method} onChange={(e) => setField('method', e.target.value)}>
                   {EDITABLE_METHODS.map((m) => <option key={m}>{m}</option>)}
                 </select>
               </label>
-              <label>Description
+              <label className="ch-modal-field">Description
                 <input value={form.description} onChange={(e) => setField('description', e.target.value)} />
               </label>
-              <label>Integration
+              <label className="ch-modal-field">Integration
                 <select
                   value={form.integrationId}
                   onChange={(e) => setField('integrationId', e.target.value)}
@@ -496,7 +484,7 @@ function ApiModal({ mode, initial, integrations, onClose, onSaved }) {
                   ))}
                 </select>
               </label>
-              <label>URL (use {'{{arg}}'} tokens)
+              <label className="ch-modal-field">URL (use {'{{arg}}'} tokens)
                 <input
                   value={form.url}
                   onChange={(e) => setField('url', e.target.value)}
@@ -506,8 +494,8 @@ function ApiModal({ mode, initial, integrations, onClose, onSaved }) {
             </>
           )}
         </div>
-        {err && <div style={{ color: 'var(--danger)', marginTop: 8, fontSize: 13 }}>{err}</div>}
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+        {err && <div className="ch-modal-error">{err}</div>}
+        <div className="ch-modal-foot">
           <button className="btn secondary" onClick={onClose}>Cancel</button>
           <button className="btn" onClick={save} disabled={saving || !form.name}>
             {saving ? 'Saving…' : 'Save'}

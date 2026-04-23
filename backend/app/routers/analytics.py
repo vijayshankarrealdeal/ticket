@@ -188,29 +188,87 @@ csat_router = APIRouter(tags=["csat"])
 
 
 @csat_router.post("/tickets/{ticket_id}/csat/send")
-async def issue_csat_token(ticket_id: int, user: dict = Me) -> dict:
-    """Agent-triggered: generate a CSAT survey link for a resolved ticket.
-    Returns the public URL the operator can copy into an email / WhatsApp
-    template until the outbound-delivery worker ships."""
+async def issue_csat_token(ticket_id: int, body: dict | None = None, user: dict = Me) -> dict:
+    """Agent-triggered: generate a CSAT survey link for a resolved ticket and
+    enqueue it for delivery through the outbox (email today, WhatsApp once the
+    WA connector ships). Returns the token + public URL — handy for preview
+    + letting the operator paste manually if they want."""
+    import os
     import secrets
+    import json as _json
     db = await get_db()
     cur = await db.execute(
-        "SELECT customer_id FROM tickets WHERE id = ? AND workspace_id = ?",
+        """
+        SELECT t.id, t.customer_id, t.subject, c.email, c.phone, c.wa_id, c.name
+          FROM tickets t LEFT JOIN customers c ON c.id = t.customer_id
+         WHERE t.id = ? AND t.workspace_id = ?
+        """,
         (ticket_id, user["workspace_id"]),
     )
     row = await cur.fetchone()
     if not row:
         raise HTTPException(404, "ticket not found")
+    t = dict(row)
     token = secrets.token_urlsafe(24)
     await db.execute(
         """
         INSERT INTO csat_tokens (token, workspace_id, ticket_id, customer_id)
         VALUES (?,?,?,?)
         """,
-        (token, user["workspace_id"], ticket_id, row[0]),
+        (token, user["workspace_id"], ticket_id, t["customer_id"]),
     )
+    base = os.environ.get("PUBLIC_APP_URL", "").rstrip("/")
+    public_url = f"{base}/csat/{token}" if base else f"/csat/{token}"
+    sent_via = []
+    channel_override = (body or {}).get("channel")
+    email = t.get("email")
+    phone = t.get("phone") or t.get("wa_id")
+    # Prefer email when available; fall back to WhatsApp template send.
+    if email and channel_override in (None, "email"):
+        await db.execute(
+            """
+            INSERT INTO outbox (workspace_id, kind, payload)
+            VALUES (?, 'email', ?)
+            """,
+            (user["workspace_id"], _json.dumps({
+                "workspace_id": user["workspace_id"],
+                "to": email,
+                "subject": f"How did we do? Ticket #{ticket_id}",
+                "body": (
+                    f"Hi {t.get('name') or 'there'},\n\n"
+                    f"Thanks for contacting support about \"{t.get('subject') or 'your ticket'}\". "
+                    f"We'd love a quick rating:\n\n{public_url}\n\n"
+                    f"One click, 30 seconds — it helps us improve.\n"
+                ),
+                "kind": "csat",
+                "csat_token": token,
+            })),
+        )
+        sent_via.append("email")
+    elif phone and channel_override in (None, "whatsapp"):
+        await db.execute(
+            """
+            INSERT INTO outbox (workspace_id, kind, payload)
+            VALUES (?, 'send_wa', ?)
+            """,
+            (user["workspace_id"], _json.dumps({
+                "workspace_id": user["workspace_id"],
+                "to": phone,
+                "wa_id": t.get("wa_id") or phone,
+                "template": "csat_rating",
+                "text": f"How did we do on ticket #{ticket_id}? Rate us: {public_url}",
+                "kind": "csat",
+                "csat_token": token,
+            })),
+        )
+        sent_via.append("whatsapp")
     await db.commit()
-    return {"token": token, "url": f"/csat/{token}"}
+    return {
+        "token": token,
+        "url": public_url,
+        "sentVia": sent_via,
+        "delivered": bool(sent_via),
+    }
 
 
 @csat_router.get("/csat/{token}")

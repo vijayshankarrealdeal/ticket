@@ -152,9 +152,22 @@ async def _serialize_ticket(db, t: dict, detail: bool = False) -> dict:
         for r in [dict(x) for x in await cur.fetchall()]
     ]
 
-    cur = await db.execute(
-        "SELECT * FROM ticket_notes WHERE ticket_id = ? ORDER BY at", (t["id"],)
-    )
+    conv_id = t.get("conversation_id")
+    if conv_id:
+        cur = await db.execute(
+            """
+            SELECT author, at, text FROM ticket_notes WHERE ticket_id = ?
+            UNION ALL
+            SELECT author_name AS author, at, text FROM conversation_notes WHERE conversation_id = ?
+            ORDER BY at
+            """,
+            (t["id"], conv_id),
+        )
+    else:
+        cur = await db.execute(
+            "SELECT author, at, text FROM ticket_notes WHERE ticket_id = ? ORDER BY at",
+            (t["id"],),
+        )
     notes = [
         {"author": r["author"], "at": _fmt_time(r["at"]), "text": r["text"]}
         for r in [dict(x) for x in await cur.fetchall()]
@@ -356,19 +369,32 @@ async def patch_ticket(ticket_id: str, body: TicketPatchIn, user: dict = AgentOr
     resolution = body.resolution_notes or body.resolutionNotes
     if resolution is not None:
         updates["resolution_notes"] = resolution
-    if body.assigneeId is not None:
-        updates["assignee_id"] = body.assigneeId
-        name = await _get_user_name(db, body.assigneeId)
-        timeline.append(f"Assigned to {name or body.assigneeId}")
-    elif body.assignee is not None:
-        cur = await db.execute(
-            "SELECT id FROM users WHERE workspace_id = ? AND (name = ? OR email = ?)",
-            (user["workspace_id"], body.assignee, body.assignee),
-        )
-        r = await cur.fetchone()
-        if r:
-            updates["assignee_id"] = r[0]
-            timeline.append(f"Assigned to {body.assignee}")
+    # Distinguish "field omitted" (leave alone) from "assigneeId: null"
+    # (explicit unassign). Pydantic defaults both to None, so we peek at
+    # `model_fields_set` which only lists keys actually present in the body.
+    provided = body.model_fields_set
+    if "assigneeId" in provided:
+        if body.assigneeId:
+            updates["assignee_id"] = body.assigneeId
+            name = await _get_user_name(db, body.assigneeId)
+            timeline.append(f"Assigned to {name or body.assigneeId}")
+        else:
+            updates["assignee_id"] = None
+            prev_name = await _get_user_name(db, existing.get("assignee_id"))
+            timeline.append(f"Unassigned from {prev_name or 'previous assignee'}")
+    elif "assignee" in provided:
+        if body.assignee:
+            cur = await db.execute(
+                "SELECT id FROM users WHERE workspace_id = ? AND (name = ? OR email = ?)",
+                (user["workspace_id"], body.assignee, body.assignee),
+            )
+            r = await cur.fetchone()
+            if r:
+                updates["assignee_id"] = r[0]
+                timeline.append(f"Assigned to {body.assignee}")
+        else:
+            updates["assignee_id"] = None
+            timeline.append("Unassigned")
     if body.customFields is not None:
         updates["custom_fields"] = js(body.customFields)
 
@@ -409,10 +435,27 @@ async def add_ticket_note(ticket_id: str, body: dict, user: dict = AgentOrAdmin)
     tid = _parse_ticket_id(ticket_id)
     db = await get_db()
     text = body.get("text", "")
-    await db.execute(
-        "INSERT INTO ticket_notes (ticket_id, author_id, author, text) VALUES (?,?,?,?)",
-        (tid, user["id"], user["name"], text),
+    cur = await db.execute(
+        "SELECT conversation_id FROM tickets WHERE id = ? AND workspace_id = ?",
+        (tid, user["workspace_id"]),
     )
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "ticket not found")
+    conv_id = dict(row).get("conversation_id")
+    if conv_id:
+        await db.execute(
+            """
+            INSERT INTO conversation_notes (id, conversation_id, author_id, author_name, text)
+            VALUES (?,?,?,?,?)
+            """,
+            (str(uuid4()), conv_id, user["id"], user["name"], text),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO ticket_notes (ticket_id, author_id, author, text) VALUES (?,?,?,?)",
+            (tid, user["id"], user["name"], text),
+        )
     await db.commit()
     return {"author": user["name"], "at": _fmt_time(_now()), "text": text}
 
@@ -491,7 +534,7 @@ async def merge_ticket(ticket_id: str, body: dict, user: dict = AgentOrAdmin) ->
         (f"Merged into #{into_id}", _now(), _now(), src_id),
     )
     await db.commit()
-    await broker.publish(f"inbox:{user['workspace_id']}", "ticket.updated", {"id": src_id, "status": "closed"})
+    await broker.publish(f"inbox:{user['workspace_id']}", "ticket.updated", {"id": f"#{src_id}", "status": "closed"})
     await broker.publish(f"ticket:{into_id}", "ticket.timeline.appended", {"ticketId": into_id})
     return {"ok": True, "merged": src_id, "into": into_id}
 
@@ -567,7 +610,7 @@ async def split_ticket(ticket_id: str, body: dict, user: dict = AgentOrAdmin) ->
         (tid, f"Split into ticket #{new_id} from {split_at}"),
     )
     await db.commit()
-    await broker.publish(f"inbox:{user['workspace_id']}", "ticket.created", {"id": new_id})
+    await broker.publish(f"inbox:{user['workspace_id']}", "ticket.created", {"id": f"#{new_id}"})
     return {"ok": True, "newTicketId": new_id}
 
 
@@ -595,6 +638,42 @@ def _classify_stage_one(text: str) -> tuple[str, str | None, float, str]:
     return "general_enquiry", order_ref, 0.4, "no keyword match"
 
 
+async def _classify_stage_two(text: str, default_intent: str) -> tuple[str, float, str]:
+    """Stage-2 LLM router for ambiguous Stage-1 results. Returns
+    (intent_key, confidence, reason). No-ops (returns default_intent) when
+    OPENAI_API_KEY / the `openai` package aren't available so the offline
+    demo still works — the call is best-effort."""
+    import os, json as _json
+    if not os.getenv("OPENAI_API_KEY"):
+        return default_intent, 0.4, "stage-2 skipped — no OPENAI_API_KEY"
+    try:
+        from openai import AsyncOpenAI  # type: ignore
+    except Exception:
+        return default_intent, 0.4, "stage-2 skipped — openai sdk missing"
+    valid = [i for (_toks, i) in INTENT_KEYWORDS] + ["general_enquiry"]
+    try:
+        client = AsyncOpenAI()
+        resp = await client.chat.completions.create(
+            model=os.getenv("INTENT_MODEL", "gpt-4.1-mini"),
+            temperature=0,
+            messages=[
+                {"role": "system",
+                 "content": f"Classify the customer's message into one of: {', '.join(valid)}. "
+                            "Respond with JSON {intent, confidence} only."},
+                {"role": "user", "content": text or ""},
+            ],
+            response_format={"type": "json_object"},
+        )
+        payload = _json.loads(resp.choices[0].message.content or "{}")
+        intent = str(payload.get("intent") or default_intent)
+        if intent not in valid:
+            intent = default_intent
+        conf = float(payload.get("confidence") or 0.75)
+        return intent, max(0.0, min(1.0, conf)), "stage-2 llm"
+    except Exception as e:  # pragma: no cover — best-effort
+        return default_intent, 0.4, f"stage-2 error: {e!r}"[:120]
+
+
 @router.post("/internal/intent/classify")
 async def intent_classify(body: dict, user: dict = Me) -> dict:
     """Server-internal classifier used by the inbound pipeline. Decides
@@ -605,6 +684,11 @@ async def intent_classify(body: dict, user: dict = Me) -> dict:
     if not conv_id:
         raise HTTPException(400, "conversationId required")
     intent, order_ref, confidence, reason = _classify_stage_one(text)
+    # Escalate ambiguous Stage-1 results to the LLM when configured.
+    if confidence < 0.6:
+        stage2_intent, stage2_conf, stage2_reason = await _classify_stage_two(text, intent)
+        if stage2_conf > confidence:
+            intent, confidence, reason = stage2_intent, stage2_conf, f"stage-1 {reason}; {stage2_reason}"
     db = await get_db()
     # Candidate tickets: open ones on this conversation + resolved in last 7d.
     cur = await db.execute(

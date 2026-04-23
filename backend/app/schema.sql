@@ -423,8 +423,23 @@ ALTER TABLE tickets         ADD COLUMN IF NOT EXISTS auto_close_at    timestampt
 -- Notifications: prefs blob on users.
 ALTER TABLE users           ADD COLUMN IF NOT EXISTS notification_prefs jsonb NOT NULL DEFAULT '{"email":true,"browser":true,"digest":"daily"}'::jsonb;
 
+-- TOTP / 2FA columns on users (spec §3.1, Build 4).
+-- `totp_secret_pending` is staged during /me/2fa/setup and only promoted to
+-- `totp_secret` after the user successfully verifies a code.
+ALTER TABLE users           ADD COLUMN IF NOT EXISTS totp_secret text;
+ALTER TABLE users           ADD COLUMN IF NOT EXISTS totp_secret_pending text;
+ALTER TABLE users           ADD COLUMN IF NOT EXISTS totp_enabled boolean NOT NULL DEFAULT false;
+
 -- Conversations: external-channel recordings reference.
 ALTER TABLE conversations   ADD COLUMN IF NOT EXISTS recordings jsonb NOT NULL DEFAULT '[]'::jsonb;
+-- Email threads require the outbound Subject to match the thread's subject
+-- for Gmail's threadId to actually stitch the reply in. Store it here so
+-- `send_reply` in the AI orchestrator can look it up without calling
+-- messages.get again.
+ALTER TABLE conversations   ADD COLUMN IF NOT EXISTS subject text;
+
+-- Messages: track which AI agent drafted an `ai`-role reply (spec §3.11.F).
+ALTER TABLE messages        ADD COLUMN IF NOT EXISTS ai_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL;
 
 -- ---------- KB chunks (spec §7, §3.11.H kb_search tool) ----------
 -- Build-2 subset: ILIKE-over-body until pgvector lands. When vector is enabled,
@@ -436,10 +451,14 @@ CREATE TABLE IF NOT EXISTS kb_chunks (
   title         text,
   body          text NOT NULL,
   embedding     bytea,
+  embedded_at   timestamptz,
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS kb_chunks_ws_idx       ON kb_chunks (workspace_id);
 CREATE INDEX IF NOT EXISTS kb_chunks_body_trgm_idx ON kb_chunks USING gin (body gin_trgm_ops);
+ALTER TABLE kb_chunks       ADD COLUMN IF NOT EXISTS embedded_at timestamptz;
+ALTER TABLE tickets         ADD COLUMN IF NOT EXISTS subject_embedding bytea;
+ALTER TABLE tickets         ADD COLUMN IF NOT EXISTS embedded_at timestamptz;
 
 -- ---------- SLA policy (spec §3.4, §11) ----------
 -- Per-team-per-task SLA hours. Used by POST /tickets to compute sla_due_at.
@@ -571,3 +590,147 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 );
 CREATE INDEX IF NOT EXISTS idem_ws_scope_created_idx
   ON idempotency_keys (workspace_id, scope, created_at DESC);
+
+-- ---------- Workspace counters (spec §9 cache layer) ----------
+-- Pre-aggregated "how many open tickets / unread conversations / pending
+-- notifications per workspace" keyed by kind. Refreshed by worker sweep;
+-- served from /workspace/counters so the sidebar badges don't re-count on
+-- every page render.
+CREATE TABLE IF NOT EXISTS workspace_counters (
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  kind          text NOT NULL,
+  value         bigint NOT NULL DEFAULT 0,
+  updated_at    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (workspace_id, kind)
+);
+
+-- ---------- Analytics daily rollup (spec §3.10, §11) ----------
+-- Nightly aggregator worker folds /analytics/summary + /timeseries into here;
+-- Analytics.jsx falls back to live queries when a given day is missing so a
+-- fresh install doesn't render empty charts.
+CREATE TABLE IF NOT EXISTS analytics_daily (
+  workspace_id       uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  day                date NOT NULL,
+  tickets_created    int  NOT NULL DEFAULT 0,
+  tickets_resolved   int  NOT NULL DEFAULT 0,
+  avg_resolution_h   numeric(8, 2),
+  csat_avg           numeric(4, 2),
+  ai_deflection_pct  numeric(5, 2),
+  refreshed_at       timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (workspace_id, day)
+);
+
+-- ---------- Delivery log (spec §11 outbox) ----------
+-- Every outbound dispatch (email / webhook / channel send) writes one row so
+-- admins can see what was attempted, what failed, and what's still pending.
+-- Drives the Settings → Notifications → "Recent deliveries" panel and the
+-- forgot-password / broadcast flows in dev where SMTP isn't wired.
+CREATE TABLE IF NOT EXISTS delivery_log (
+  id            bigserial PRIMARY KEY,
+  workspace_id  uuid REFERENCES workspaces(id) ON DELETE CASCADE,
+  kind          text NOT NULL,
+  target        text NOT NULL,
+  subject       text,
+  status        text NOT NULL DEFAULT 'sent',
+  error         text,
+  payload       jsonb,
+  at            timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS delivery_log_ws_at_idx ON delivery_log (workspace_id, at DESC);
+
+
+-- ---------- Web widget visitors (spec §6.5) ----------
+-- One row per unique browser session for the embedded widget. `visitor_id` is
+-- a stable client-generated id so a returning visitor lands in the same
+-- conversation. We store `customer_id` once we have enough signal (email /
+-- phone) to merge the visitor into the customer directory.
+CREATE TABLE IF NOT EXISTS widget_visitors (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id    uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  visitor_id      text NOT NULL,
+  customer_id     uuid REFERENCES customers(id) ON DELETE SET NULL,
+  conversation_id uuid REFERENCES conversations(id) ON DELETE SET NULL,
+  user_agent      text,
+  ip              text,
+  first_seen_at   timestamptz NOT NULL DEFAULT now(),
+  last_seen_at    timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, visitor_id)
+);
+
+
+-- ---------- Platform credentials (spec §6, §3.1 OAuth channels) ----------
+-- One row per connected channel account. `secrets` holds the access/refresh
+-- token blob; in prod we'll `pgp_sym_encrypt` it per workspace key. `meta`
+-- carries non-secret scaffolding (phone_number_id, page_id, shop domain, etc.).
+CREATE TABLE IF NOT EXISTS platform_credentials (
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id   uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  provider       text NOT NULL,           -- whatsapp | gmail | outlook | instagram | shopify | slack | twilio
+  account_id     text,                    -- provider-scoped id (phone_number_id / email / page_id / shop / team_id)
+  status         text NOT NULL DEFAULT 'active',
+  secrets        jsonb NOT NULL DEFAULT '{}'::jsonb,
+  meta           jsonb NOT NULL DEFAULT '{}'::jsonb,
+  installed_by   uuid REFERENCES users(id) ON DELETE SET NULL,
+  expires_at     timestamptz,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, provider, account_id)
+);
+CREATE INDEX IF NOT EXISTS platform_credentials_ws_idx ON platform_credentials (workspace_id);
+CREATE INDEX IF NOT EXISTS platform_credentials_provider_idx ON platform_credentials (provider);
+
+-- ---------- OAuth state cache (spec §3.1) ----------
+-- PKCE verifier + nonce + redirect URL scoped to the browser that started the
+-- flow. Consumed once on callback and then dropped. TTL enforced by a worker
+-- sweep (10 min is enough for any well-behaved OAuth dance).
+CREATE TABLE IF NOT EXISTS oauth_states (
+  state          text PRIMARY KEY,
+  provider       text NOT NULL,
+  mode           text NOT NULL DEFAULT 'signin',   -- signin | connect
+  workspace_id   uuid REFERENCES workspaces(id) ON DELETE CASCADE,
+  user_id        uuid REFERENCES users(id) ON DELETE CASCADE,
+  code_verifier  text,
+  nonce          text,
+  redirect_uri   text,
+  return_to      text,
+  created_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS oauth_states_created_idx ON oauth_states (created_at);
+
+-- ---------- Billing invoices (spec §3.12) ----------
+-- Mirrors the rows Stripe would send via webhook; `/billing/invoices` reads
+-- from here and the webhook endpoint upserts.
+CREATE TABLE IF NOT EXISTS invoices (
+  id            text PRIMARY KEY,          -- `in_...` (stripe id or synthetic)
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  number        text,
+  amount_cents  int NOT NULL DEFAULT 0,
+  currency      text NOT NULL DEFAULT 'usd',
+  status        text NOT NULL DEFAULT 'paid',  -- paid | open | void | uncollectible
+  period_start  timestamptz,
+  period_end    timestamptz,
+  hosted_url    text,
+  pdf_url       text,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS invoices_ws_idx ON invoices (workspace_id, created_at DESC);
+
+-- Stripe customer id / subscription id — stored on workspace so we can hit
+-- Stripe in the billing endpoints once keys are configured.
+ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS stripe_customer_id text;
+ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS stripe_subscription_id text;
+ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS plan_renews_at timestamptz;
+
+-- ---------- Broadcast messages (spec §3.7 broadcast generator) ----------
+-- Admin-authored announcements fanned out to every workspace member's
+-- notification feed. Row is kept so we can render a "Recent broadcasts"
+-- section in Settings → Broadcasts later without re-querying notifications.
+CREATE TABLE IF NOT EXISTS broadcasts (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  author_id     uuid REFERENCES users(id) ON DELETE SET NULL,
+  title         text NOT NULL,
+  body          text,
+  link          text,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS broadcasts_ws_idx ON broadcasts (workspace_id, created_at DESC);

@@ -97,7 +97,9 @@ class TeamMessageIn(BaseModel):
     text: str | None = None
     blocks: list[dict[str, Any]] = []
     attachments: list[dict[str, Any]] = []
-    replyTo: str | None = None
+    # Either a raw messageId string or a snapshot-like `{messageId,...}` (wire.md).
+    replyTo: str | dict[str, Any] | None = None
+    tempId: str | None = None
 
 
 class ReactionIn(BaseModel):

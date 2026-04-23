@@ -45,6 +45,15 @@ class AgentCtx:
     channel: str | None
     actor_user_id: str | None
     trace_id: str
+    # Agent selection (inbound pipeline picks the workspace's preferred agent;
+    # `agent_id` ends up on the saved `messages.ai_agent_id` row so Conversations
+    # can show who drafted which reply).
+    agent_id: str | None = None
+    agent_name: str | None = None
+    # When true, callers drive the chunked fan-out themselves — `send_reply`
+    # skips the typing indicator but still persists + fans out the final row
+    # so the SPA reconciles the streaming bubble with the saved message.
+    stream: bool = False
     # Guardrail counters — reset every run.
     tool_calls: int = 0
     consecutive_errors: int = 0
@@ -211,10 +220,37 @@ async def tool_get_shipping_status(ctx: AgentCtx, order_id: str) -> dict:
 
 @_guard_tool("kb_search")
 async def tool_kb_search(ctx: AgentCtx, query: str, k: int = 5) -> list[dict]:
-    """Build-2 knowledge base search. Until pgvector lands we fall back to
-    trigram/ILIKE over `kb_chunks.body` — same interface as the planned HNSW
-    call so we can swap it in without touching the tool."""
+    """Knowledge base search. When chunks have an `embedding` we cosine-rank
+    a candidate set in Python; otherwise fall back to trigram/ILIKE so the
+    tool keeps working on a fresh install. Once pgvector + HNSW land this
+    becomes a single `ORDER BY embedding <=> $1` query — interface unchanged."""
+    from .embeddings import embed as _embed, decode as _decode, cosine as _cos
+
     db = await get_db()
+    k = max(1, min(k, 10))
+    # Try embedding-ranked path first (60-row candidate window keeps it cheap).
+    cur = await db.execute(
+        """
+        SELECT id, title, body, source, embedding FROM kb_chunks
+         WHERE workspace_id = ? AND embedding IS NOT NULL
+         ORDER BY created_at DESC LIMIT 60
+        """,
+        (ctx.workspace_id,),
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    if rows:
+        qvec = _decode(_embed(query))
+        scored = []
+        for r in rows:
+            score = _cos(qvec, _decode(r.get("embedding")))
+            scored.append((score, r))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return [
+            {"id": r["id"], "title": r.get("title"), "body": r["body"],
+             "source": r.get("source"), "score": round(s, 3)}
+            for s, r in scored[:k]
+        ]
+    # Fallback: ILIKE on body/title — same interface, no embedding needed.
     cur = await db.execute(
         """
         SELECT id, title, body, source
@@ -223,14 +259,38 @@ async def tool_kb_search(ctx: AgentCtx, query: str, k: int = 5) -> list[dict]:
            AND (body ILIKE ? OR title ILIKE ?)
          LIMIT ?
         """,
-        (ctx.workspace_id, f"%{query}%", f"%{query}%", max(1, min(k, 10))),
+        (ctx.workspace_id, f"%{query}%", f"%{query}%", k),
     )
     return [dict(r) for r in await cur.fetchall()]
 
 
 @_guard_tool("similar_tickets")
 async def tool_similar_tickets(ctx: AgentCtx, subject: str) -> list[dict]:
+    """Find similar tickets by cosine over `subject_embedding` when present;
+    otherwise fall back to ILIKE."""
+    from .embeddings import embed as _embed, decode as _decode, cosine as _cos
+
     db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT id, subject, status, task, subject_embedding FROM tickets
+         WHERE workspace_id = ? AND subject_embedding IS NOT NULL
+         ORDER BY created_at DESC LIMIT 100
+        """,
+        (ctx.workspace_id,),
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    if rows:
+        qvec = _decode(_embed(subject))
+        scored = sorted(
+            ((_cos(qvec, _decode(r.get("subject_embedding"))), r) for r in rows),
+            key=lambda t: t[0], reverse=True,
+        )
+        return [
+            {"id": r["id"], "subject": r["subject"], "status": r["status"],
+             "task": r["task"], "score": round(s, 3)}
+            for s, r in scored[:5] if s > 0.05
+        ]
     cur = await db.execute(
         """
         SELECT id, subject, status, task FROM tickets
@@ -255,7 +315,7 @@ async def tool_create_ticket(ctx: AgentCtx, subject: str, task: str = "general_e
         INSERT INTO tickets (workspace_id, customer_id, conversation_id, source, channel,
                              task, team, priority, subject, description,
                              tags, custom_fields, status, sla_due_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'queued', ?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'in_progress', ?)
         RETURNING id
         """,
         (ctx.workspace_id, ctx.customer_id, ctx.conversation_id,
@@ -271,7 +331,7 @@ async def tool_create_ticket(ctx: AgentCtx, subject: str, task: str = "general_e
     await db.commit()
     from ..ws import broker
     await broker.publish(f"inbox:{ctx.workspace_id}", "ticket.created",
-                         {"id": tid, "subject": subject, "task": task})
+                         {"id": f"#{tid}", "subject": subject, "task": task})
     return {"ok": True, "ticketId": tid}
 
 
@@ -307,7 +367,7 @@ async def tool_update_ticket(ctx: AgentCtx, ticket_id: int, status: str | None =
         )
     await db.commit()
     from ..ws import broker
-    await broker.publish(f"ticket:{ticket_id}", "ticket.updated", {"id": ticket_id, **updates})
+    await broker.publish(f"ticket:{ticket_id}", "ticket.updated", {"id": f"#{ticket_id}", **updates})
     return {"ok": True, "ticketId": ticket_id}
 
 
@@ -354,35 +414,113 @@ async def tool_add_ticket_note(ctx: AgentCtx, ticket_id: int, text: str) -> dict
 @_guard_tool("send_reply")
 async def tool_send_reply(ctx: AgentCtx, text: str) -> dict:
     """Persist the reply on the conversation + queue it to the outbox for the
-    real adapter. Without a conversation context (test mode) we just echo."""
+    real adapter. Without a conversation context (test mode) we just echo.
+
+    When `ctx.stream=True` the caller is driving its own chunked fan-out via
+    `stream_default_orchestrator`, so we persist + fan out `message.created`
+    with `{stream_final:True}` so the SPA can swap the streaming bubble into
+    the saved row instead of rendering a second one."""
     if not ctx.conversation_id:
         return {"ok": True, "echoed": text}
     db = await get_db()
     mid = str(uuid.uuid4())
+    agent_name = ctx.agent_name or "default-orchestrator"
     await db.execute(
         """
-        INSERT INTO messages (id, workspace_id, conversation_id, from_role, from_name, text, attachments)
-        VALUES (?, ?, ?, 'ai', 'default-orchestrator', ?, '[]'::jsonb)
+        INSERT INTO messages (id, workspace_id, conversation_id, from_role, from_name,
+                              text, attachments, ai_agent_id)
+        VALUES (?, ?, ?, 'ai', ?, ?, '[]'::jsonb, ?)
         """,
-        (mid, ctx.workspace_id, ctx.conversation_id, text),
+        (mid, ctx.workspace_id, ctx.conversation_id, agent_name, text, ctx.agent_id),
     )
     await db.execute(
         "UPDATE conversations SET last_message_at = now(), preview = ? WHERE id = ?",
         (text[:160], ctx.conversation_id),
     )
+    # Build a channel-aware outbox payload. The outbox adapters
+    # (`_send_gmail` / `_send_wa` / …) read `to`/`email`/`phone`/`wa_id` so
+    # we need to resolve the customer's contact info from the conversation.
+    channel = (ctx.channel or "generic").lower()
+    kind = f"send_{channel}"
+    cur = await db.execute(
+        """
+        SELECT cu.email, cu.phone, cu.wa_id, cu.psid, cu.name,
+               c.external_thread_id, c.subject AS conv_subject,
+               (SELECT text FROM messages
+                 WHERE conversation_id = c.id AND from_role = 'customer'
+                 ORDER BY at DESC LIMIT 1) AS last_inbound_text,
+               (SELECT external_message_id FROM messages
+                 WHERE conversation_id = c.id AND from_role = 'customer'
+                 ORDER BY at DESC LIMIT 1) AS last_inbound_ext
+          FROM conversations c LEFT JOIN customers cu ON cu.id = c.customer_id
+         WHERE c.id = ?
+        """,
+        (ctx.conversation_id,),
+    )
+    row = dict(await cur.fetchone() or {})
+    # Subject for email replies: Gmail threading requires the reply subject
+    # to match the thread's subject (ignoring any Re:/Fwd: prefix). Prefer
+    # the conversation's stored subject (set by the poller from the original
+    # Subject header); fall back to first line of the inbound body.
+    subject = None
+    conv_subject = (row.get("conv_subject") or "").strip()
+    if conv_subject:
+        subject = conv_subject if conv_subject.lower().startswith("re:") else f"Re: {conv_subject}"
+    elif row.get("last_inbound_text"):
+        first_line = (row["last_inbound_text"].splitlines() or [""])[0].strip()[:120]
+        subject = f"Re: {first_line}" if first_line else "Re: your message"
+    payload = {
+        "workspace_id": ctx.workspace_id,
+        "conversationId": ctx.conversation_id,
+        "messageId": mid,
+        "text": text,
+        "body": text,
+        "to": row.get("email") or row.get("phone") or row.get("wa_id"),
+        "email": row.get("email"),
+        "phone": row.get("phone"),
+        "wa_id": row.get("wa_id"),
+        "psid": row.get("psid"),
+        "subject": subject,
+        "thread_id": row.get("external_thread_id"),
+        "in_reply_to": row.get("last_inbound_ext"),
+    }
     await db.execute(
         "INSERT INTO outbox (workspace_id, kind, payload) VALUES (?, ?, ?)",
-        (ctx.workspace_id, f"send_{(ctx.channel or 'generic').lower()}",
-         js({"conversationId": ctx.conversation_id, "text": text, "messageId": mid})),
+        (ctx.workspace_id, kind, js(payload)),
     )
+    # AI just sent the reply — flip any live ticket on this conversation to
+    # `waiting_for_customer` so agent queues aren't polluted by tickets the
+    # AI is already handling. Skip blocked/resolved/closed (human-owned).
+    cur = await db.execute(
+        """
+        UPDATE tickets SET status = 'waiting_for_customer', updated_at = now()
+         WHERE conversation_id = ? AND workspace_id = ?
+           AND status IN ('queued','in_progress','assigned')
+         RETURNING id
+        """,
+        (ctx.conversation_id, ctx.workspace_id),
+    )
+    touched = [r[0] for r in await cur.fetchall()]
     await db.commit()
     # Fan out so the conversation pane animates the bubble.
     from ..ws import broker
-    await broker.publish(
-        f"conv:{ctx.conversation_id}", "message.created",
-        {"id": mid, "from": "me", "text": text, "at": None,
-         "fromName": "default-orchestrator", "delivered": True},
-    )
+    for tid in touched:
+        await broker.publish(
+            f"ticket:{tid}", "ticket.updated",
+            {"id": f"#{tid}", "status": "waiting_for_customer"},
+        )
+        await broker.publish(
+            f"inbox:{ctx.workspace_id}", "ticket.updated",
+            {"id": f"#{tid}", "status": "waiting_for_customer"},
+        )
+    payload = {
+        "id": mid, "from": "me", "text": text, "at": None,
+        "fromName": agent_name, "delivered": True,
+        "aiAgentId": ctx.agent_id,
+    }
+    if ctx.stream:
+        payload["streamFinal"] = True
+    await broker.publish(f"conv:{ctx.conversation_id}", "message.created", payload)
     return {"ok": True, "messageId": mid}
 
 
@@ -569,6 +707,127 @@ async def _pydantic_ai_run(ctx: AgentCtx, user_message: str, model: str) -> dict
     return {"output": str(result.data), "steps": ctx.steps}
 
 
+# ---------- Azure OpenAI runner ---------------------------------------------
+
+def _azure_oai_creds() -> tuple[str | None, str | None, str, str]:
+    """Resolve Azure OpenAI env vars with a few alternate spellings. Returns
+    `(key, endpoint, api_version, deployment)`. Key is the auth header; the
+    endpoint + deployment + api_version go into the URL."""
+    key = (os.environ.get("AZURE_OPENAI_API_KEY")
+           or os.environ.get("AZURE_OPEN_AI_KEY")
+           or os.environ.get("AZURE_OPENAI_KEY"))
+    endpoint = (os.environ.get("AZURE_OPENAI_ENDPOINT")
+                or os.environ.get("AZURE_ENDPOINT") or "").rstrip("/")
+    api_version = (os.environ.get("AZURE_OPENAI_API_VERSION")
+                   or os.environ.get("API_VERSION") or "2024-12-01-preview")
+    deployment = (os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+                  or os.environ.get("AZURE_DEPLOYMENT") or "gpt-4o-mini")
+    return key, endpoint or None, api_version, deployment
+
+
+async def _load_conversation_context(ctx: AgentCtx) -> dict:
+    """Pull the recent message history + customer / order context so the LLM
+    can answer the actual question rather than throw a canned response."""
+    db = await get_db()
+    out: dict = {"customer": None, "orders": [], "history": []}
+    if ctx.customer_id:
+        try:
+            out["customer"] = await tool_get_customer(ctx, ctx.customer_id)
+        except Exception:
+            pass
+        try:
+            out["orders"] = await tool_list_customer_orders(ctx, ctx.customer_id, limit=3)
+        except Exception:
+            pass
+    if ctx.conversation_id:
+        cur = await db.execute(
+            """
+            SELECT from_role, from_name, text, at FROM messages
+             WHERE conversation_id = ? ORDER BY at DESC LIMIT 8
+            """,
+            (ctx.conversation_id,),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        # Oldest-first for the LLM.
+        out["history"] = list(reversed(rows))
+    return out
+
+
+async def _azure_openai_run(ctx: AgentCtx, user_message: str, deployment: str) -> dict:
+    """Direct Azure OpenAI chat completion — no pydantic-ai, no tool-calling.
+    We hand the LLM the conversation history + customer context and let it
+    draft a reply, which `send_reply` then persists + queues for outbound."""
+    key, endpoint, api_version, default_deployment = _azure_oai_creds()
+    if not key or not endpoint:
+        raise RuntimeError("azure openai creds missing")
+    deployment = deployment or default_deployment
+    context = await _load_conversation_context(ctx)
+    history_text = "\n".join(
+        f"{m['from_role']}: {(m.get('text') or '').strip()[:500]}"
+        for m in (context.get("history") or [])
+    ) or "(no prior messages)"
+    customer = context.get("customer") or {}
+    orders = context.get("orders") or []
+    orders_block = "\n".join(
+        f"- order {o.get('id')}: status={o.get('status')} total=₹{o.get('total')}"
+        for o in orders
+    ) or "  (no recent orders)"
+
+    system_prompt = (
+        "You are WorkspaceX's AI support agent replying on behalf of the business. "
+        "Read the customer's latest message and respond directly, helpfully, and concisely. "
+        "If you know the answer or can infer from context, answer it. "
+        "If you genuinely don't have information (e.g. a refund policy they're asking about), "
+        "say what you'll do next ('I'll check with the team and get back to you') instead of a canned line. "
+        "Keep it under 4 short sentences. No salutations needed — they already know they're talking to support. "
+        f"Never promise a refund over ₹{REFUND_CAP_INR} on your own authority."
+    )
+    user_prompt = (
+        f"Customer profile:\n"
+        f"- name: {customer.get('name') or 'unknown'}\n"
+        f"- email: {customer.get('email') or 'unknown'}\n"
+        f"- phone: {customer.get('phone') or 'unknown'}\n"
+        f"- orders:\n{orders_block}\n\n"
+        f"Recent conversation (oldest first):\n{history_text}\n\n"
+        f"Customer's latest message:\n{user_message}\n\n"
+        f"Draft the reply now."
+    )
+
+    url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+    try:
+        import httpx  # type: ignore
+    except ImportError:
+        raise RuntimeError("httpx required for Azure OpenAI")
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            url,
+            headers={"api-key": key, "Content-Type": "application/json"},
+            json={
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 400,
+            },
+        )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"azure openai {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    text = text.strip()
+    if not text:
+        text = "Thanks — let me check on that and get back to you."
+    if ctx.conversation_id:
+        try:
+            await tool_send_reply(ctx, text)
+        except GuardrailHit:
+            raise
+        except Exception:
+            log.exception("send_reply failed after azure generation")
+    return {"output": text, "steps": ctx.steps}
+
+
 # ---------- public entry ----------------------------------------------------
 
 async def run_default_orchestrator(ctx: AgentCtx, user_message: str,
@@ -582,6 +841,7 @@ async def run_default_orchestrator(ctx: AgentCtx, user_message: str,
     output: dict[str, Any] = {}
     try:
         await _rate_limit_check(ctx)
+        azure_key, azure_endpoint, _, _ = _azure_oai_creds()
         if os.environ.get("OPENAI_API_KEY"):
             try:
                 output = await _pydantic_ai_run(ctx, user_message, model)
@@ -597,6 +857,15 @@ async def run_default_orchestrator(ctx: AgentCtx, user_message: str,
                     pass
             except Exception as e:
                 log.warning("pydantic-ai run failed (%s) — heuristic fallback", e)
+                output = await _fallback_run(ctx, user_message)
+        elif azure_key and azure_endpoint:
+            try:
+                output = await _azure_openai_run(ctx, user_message, model)
+            except GuardrailHit as gh:
+                status = "guardrail"
+                output = {"output": None, "error": str(gh), "steps": ctx.steps}
+            except Exception as e:
+                log.warning("azure openai run failed (%s) — heuristic fallback", e)
                 output = await _fallback_run(ctx, user_message)
         else:
             output = await _fallback_run(ctx, user_message)
@@ -639,7 +908,7 @@ async def run_default_orchestrator(ctx: AgentCtx, user_message: str,
 async def stream_default_orchestrator(ctx: AgentCtx, user_message: str,
                                       agent_id: str | None = None,
                                       model: str = "gpt-4.1-mini"):
-    """Async generator yielding SSE-shaped dicts for the conversation pane.
+    """Async generator yielding SSE-shaped dicts for `POST /agents/:id/run`.
     Stage 1 emits a tool-event per step + final text — token-delta streaming
     lands when `pydantic-ai` exposes it cleanly."""
     yield {"event": "start", "data": {"traceId": ctx.trace_id}}
@@ -650,3 +919,114 @@ async def stream_default_orchestrator(ctx: AgentCtx, user_message: str,
         yield {"event": "text", "data": {"text": result["output"]}}
     yield {"event": "done", "data": {"status": result.get("status"),
                                      "latencyMs": result.get("latencyMs")}}
+
+
+# ---------- Inbound streaming into a live conversation (spec §10 auto-reply) -
+
+async def stream_inbound_reply(ctx: AgentCtx, user_message: str,
+                               model: str = "gpt-4.1-mini",
+                               chunk_size: int = 24,
+                               chunk_delay: float = 0.04) -> dict:
+    """Run the orchestrator for an inbound customer message and fan the reply
+    out on `conv:<id>` as a typing indicator + incremental `ai.delta` events
+    followed by the saved `message.created` row. The SPA replaces the
+    streaming bubble (keyed by `streamId`) with the persisted message when
+    `streamFinal:True` arrives.
+
+    Returns the orchestrator result so the caller can persist `agent_runs`
+    and show latency. Requires `ctx.conversation_id` — bails otherwise."""
+    if not ctx.conversation_id:
+        return await run_default_orchestrator(ctx, user_message, agent_id=ctx.agent_id, model=model)
+
+    from ..ws import broker
+    topic = f"conv:{ctx.conversation_id}"
+    stream_id = f"stream_{uuid.uuid4().hex[:8]}"
+    agent_name = ctx.agent_name or "default-orchestrator"
+    ctx.stream = True
+
+    await broker.publish(topic, "ai.typing.started", {
+        "streamId": stream_id, "agent": agent_name, "agentId": ctx.agent_id,
+    })
+
+    # Run the orchestrator to completion first. We don't yet have true token-
+    # level deltas from pydantic-ai's streaming surface — instead we chunk the
+    # final text in fixed-size slices so the UI still animates in real time.
+    # When pydantic-ai exposes an `iter_text()` stream, swap this loop for it.
+    result = await run_default_orchestrator(ctx, user_message,
+                                            agent_id=ctx.agent_id, model=model)
+    text = result.get("output") or ""
+    emitted = 0
+    if text:
+        for i in range(0, len(text), max(1, chunk_size)):
+            chunk = text[i: i + chunk_size]
+            await broker.publish(topic, "ai.delta", {
+                "streamId": stream_id,
+                "delta": chunk,
+                "index": emitted,
+            })
+            emitted += 1
+            if chunk_delay > 0:
+                await asyncio.sleep(chunk_delay)
+
+    await broker.publish(topic, "ai.typing.stopped", {
+        "streamId": stream_id, "agent": agent_name,
+    })
+    return result
+
+
+# ---------- Agent selection for the inbound pipeline ------------------------
+
+async def select_inbound_agent(workspace_id: str) -> dict:
+    """Resolve the agent that should auto-reply on this workspace's inbound
+    traffic. Order (spec §3.11 "Agent selection"):
+
+      1. Any `is_active=true` Langflow-published agent — newest first.
+      2. Any `status='published'` builtin agent.
+      3. Fallback to the default-orchestrator placeholder row.
+      4. If the workspace has `ai_force_default=true`, always use the default.
+
+    Returns `{id, name, model, kind}` with the picked agent; `id` may be None
+    when only the placeholder row exists."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT ai_force_default FROM workspaces WHERE id = ?", (workspace_id,)
+    )
+    row = await cur.fetchone()
+    force_default = bool(row and row[0])
+
+    if not force_default:
+        cur = await db.execute(
+            """
+            SELECT id, name, model, kind
+              FROM agents
+             WHERE workspace_id = ? AND kind = 'langflow' AND is_active = true
+             ORDER BY last_published_at DESC NULLS LAST, created_at DESC
+             LIMIT 1
+            """,
+            (workspace_id,),
+        )
+        r = await cur.fetchone()
+        if r:
+            return dict(r)
+        cur = await db.execute(
+            """
+            SELECT id, name, model, kind
+              FROM agents
+             WHERE workspace_id = ? AND status = 'published'
+             ORDER BY last_published_at DESC NULLS LAST, created_at DESC
+             LIMIT 1
+            """,
+            (workspace_id,),
+        )
+        r = await cur.fetchone()
+        if r:
+            return dict(r)
+
+    cur = await db.execute(
+        "SELECT id, name, model, kind FROM agents WHERE workspace_id = ? AND name = 'default-orchestrator' LIMIT 1",
+        (workspace_id,),
+    )
+    r = await cur.fetchone()
+    if r:
+        return dict(r)
+    return {"id": None, "name": "default-orchestrator", "model": "gpt-4.1-mini", "kind": "builtin"}

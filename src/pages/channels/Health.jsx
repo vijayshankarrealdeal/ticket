@@ -30,9 +30,15 @@ export default function Health() {
   useEffect(() => { refresh(); }, []);
 
   async function reRun() {
-    setFlash('Re-running…');
-    await refresh();
-    setFlash('Checks refreshed');
+    setFlash('Re-running probes…');
+    try {
+      // Fires the backend probe so `last_check_at` / p95 move forward.
+      await api.post('/health/probe').catch(() => {});
+      await refresh();
+      setFlash('Checks refreshed');
+    } catch (e) {
+      setFlash(`Probe failed: ${e.message || e}`);
+    }
     setTimeout(() => setFlash(null), 2000);
   }
 

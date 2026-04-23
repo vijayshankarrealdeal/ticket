@@ -11,6 +11,31 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+def _load_dotenv() -> None:
+    """Load a `.env` file from the project root into `os.environ` if the key
+    isn't already set. Tiny hand-rolled parser so we don't take on a
+    python-dotenv dep; handles `KEY=value`, `KEY="value with spaces"`, and
+    comments. Skips empty lines and any existing env vars (real env wins)."""
+    for candidate in (BASE_DIR / ".env", BASE_DIR.parent / ".env"):
+        if not candidate.exists():
+            continue
+        try:
+            for line in candidate.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+        except Exception:
+            pass
+
+
+_load_dotenv()
+
+
 def _env(name: str, default: str) -> str:
     val = os.environ.get(name)
     return val if val is not None and val != "" else default

@@ -7,6 +7,9 @@ export const SHAREABLE_TICKETS = [];
 export const SHAREABLE_CUSTOMERS = [];
 export const SEED_MESSAGES = {};
 
+// Keyed like the /teams/unread response — { channels:{id:count}, dms:{id:count}, total }.
+let TEAMS_UNREAD = { channels: {}, dms: {}, total: 0 };
+
 export const REACTION_PICKER = ['👍', '❤️', '😂', '🎉', '🙌', '😮', '😢', '👀', '🔥', '✅'];
 
 export let CURRENT_USER_ID = null;
@@ -66,6 +69,34 @@ export async function loadConversationMessages(conversationId) {
     SEED_MESSAGES[conversationId] = [];
     return [];
   }
+}
+
+/** GET /teams/presence — refresh the `status` field on every MEMBER in place. */
+export async function refreshTeamsPresence() {
+  const rows = await api.get('/teams/presence').catch(() => []);
+  const byId = new Map((Array.isArray(rows) ? rows : []).map((r) => [r.id, r]));
+  for (const m of MEMBERS) {
+    const p = byId.get(m.id);
+    if (p) m.status = p.status;
+  }
+  return MEMBERS;
+}
+
+/** GET /teams/unread — map each channel/DM into { ...entry, unread }. */
+export async function refreshTeamsUnread() {
+  const res = await api.get('/teams/unread').catch(() => ({ channels: {}, dms: {}, total: 0 }));
+  TEAMS_UNREAD = {
+    channels: res?.channels || {},
+    dms: res?.dms || {},
+    total: res?.total || 0,
+  };
+  for (const c of CHANNELS) c.unread = TEAMS_UNREAD.channels[c.id] || 0;
+  for (const d of DMS) d.unread = TEAMS_UNREAD.dms[d.id] || 0;
+  return TEAMS_UNREAD;
+}
+
+export function getTeamsUnread() {
+  return TEAMS_UNREAD;
 }
 
 export function setSeedMessages(next) {

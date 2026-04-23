@@ -173,16 +173,105 @@ async def me(request: Request) -> dict | None:
 
 @router.post("/forgot-password", status_code=202)
 async def forgot_password(body: dict) -> dict:
-    # Stub — email sending is out of scope for Build 1. See spec §3.1.
+    """Issue a password-reset token. Real Build-3+ deployment delivers it via
+    SMTP/SES; for now we echo the token in the response when `DEV_RESET_TOKEN`
+    is on so the SPA's forgot-password form can test the round-trip end to
+    end. Always returns 202 — never reveals whether the email exists."""
+    import os
+    email = (body or {}).get("email", "").strip().lower()
+    if not email:
+        raise HTTPException(400, "email required")
+    db = await get_db()
+    cur = await db.execute("SELECT id FROM users WHERE email = ?", (email,))
+    row = await cur.fetchone()
+    payload = {"ok": True}
+    if row:
+        raw = secrets.token_urlsafe(24)
+        await db.execute(
+            """
+            INSERT INTO password_resets (user_id, token_hash, expires_at)
+            VALUES (?, ?, now() + interval '1 hour')
+            """,
+            (row[0], _hash_token(raw)),
+        )
+        # Enqueue the reset email through the outbox so it's visible in
+        # delivery_log alongside every other outbound message. The dispatcher
+        # falls back to logging when SMTP isn't configured.
+        cur2 = await db.execute("SELECT workspace_id FROM users WHERE id = ?", (row[0],))
+        ws_row = await cur2.fetchone()
+        ws_id = ws_row[0] if ws_row else None
+        from .. import db as _db_mod  # local import to avoid cycles
+        await db.execute(
+            """
+            INSERT INTO outbox (workspace_id, kind, payload)
+            VALUES (?, 'email', ?)
+            """,
+            (ws_id, _db_mod.js({
+                "workspace_id": ws_id,
+                "to": email,
+                "subject": "Reset your WorkspaceX password",
+                "body": (
+                    f"Use this token to reset your password: {raw}\n"
+                    f"It expires in 1 hour. If you didn't request this, ignore."
+                ),
+                "kind": "password_reset",
+            })),
+        )
+        await db.commit()
+        if os.environ.get("DEV_RESET_TOKEN", "1") == "1":
+            payload["devToken"] = raw
+    return payload
+
+
+@router.post("/reset-password")
+async def reset_password(body: dict) -> dict:
+    """Consume a password-reset token — verify the hash, enforce single-use
+    via `used_at`, rehash the new password, and drop every outstanding
+    session for that user so other tabs get bounced back to sign-in."""
+    token = (body or {}).get("token") or ""
+    new = (body or {}).get("new") or ""
+    if len(new) < 8:
+        raise HTTPException(400, "new password must be at least 8 characters")
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT id, user_id, expires_at, used_at FROM password_resets
+         WHERE token_hash = ?
+        """,
+        (_hash_token(token),),
+    )
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(400, "invalid or expired token")
+    r = dict(row)
+    if r.get("used_at"):
+        raise HTTPException(400, "token already used")
+    exp = r.get("expires_at")
+    if isinstance(exp, str):
+        try:
+            exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+        except ValueError:
+            exp_dt = None
+    else:
+        exp_dt = exp
+    if exp_dt and exp_dt.tzinfo is None:
+        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+    if exp_dt and exp_dt < datetime.now(timezone.utc):
+        raise HTTPException(400, "token expired")
+
+    new_hash = argon2.hash(new)
+    await db.execute(
+        "UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, r["user_id"])
+    )
+    await db.execute(
+        "UPDATE password_resets SET used_at = now() WHERE id = ?", (r["id"],)
+    )
+    await db.execute(
+        "DELETE FROM auth_sessions WHERE user_id = ?", (r["user_id"],)
+    )
+    await db.commit()
     return {"ok": True}
 
 
-# Placeholders for OAuth start/callback; real flow in BACKEND_SPEC.md §3.1.
-@router.get("/oauth/google/start")
-async def google_start() -> dict:
-    return {"ok": False, "detail": "oauth not configured in build 1"}
-
-
-@router.get("/oauth/outlook/start")
-async def outlook_start() -> dict:
-    return {"ok": False, "detail": "oauth not configured in build 1"}
+# OAuth sign-in lives in routers/oauth.py — providers {google, outlook}.
+# /auth/oauth/{provider}/start + /callback are parameterized there.

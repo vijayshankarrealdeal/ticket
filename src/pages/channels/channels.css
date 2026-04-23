@@ -1456,3 +1456,55 @@
   .ch-toolbar { flex-direction: column; align-items: stretch; }
   .ch-toolbar-right { justify-content: flex-start; }
 }
+
+.ch-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  padding: 20px;
+}
+.ch-modal {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  width: 460px;
+  max-width: 100%;
+  box-shadow: var(--shadow-md);
+}
+.ch-modal-title {
+  margin: 0 0 14px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+.ch-modal-body { display: grid; gap: 12px; }
+.ch-modal-field { display: grid; gap: 6px; font-size: 13px; color: var(--text-2); }
+.ch-modal-field > input,
+.ch-modal-field > select {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.ch-modal-field > select { padding-right: 28px; appearance: none; background-image: linear-gradient(45deg, transparent 50%, var(--text-2) 50%), linear-gradient(135deg, var(--text-2) 50%, transparent 50%); background-position: calc(100% - 14px) 50%, calc(100% - 9px) 50%; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
+.ch-modal-field > input::placeholder { color: var(--muted); }
+.ch-modal-field > input:focus,
+.ch-modal-field > select:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 20%, transparent);
+}
+.ch-modal-error { color: var(--danger); margin-top: 10px; font-size: 13px; }
+.ch-modal-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }

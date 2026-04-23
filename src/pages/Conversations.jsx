@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { createPortal } from 'react-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
 import { useDelayUnmount } from '../hooks/useDelayUnmount.js';
@@ -9,6 +10,18 @@ import { useRealtimeTopic } from '../hooks/useRealtime.js';
 import { loadAuth } from './AuthPage.jsx';
 
 const CHANNELS = ['All', 'WhatsApp', 'Instagram', 'Live Chat', 'Mails'];
+
+// Backend stores raw channel names (gmail/whatsapp/outlook/...) while the UI
+// filter labels are capitalized buckets. Normalize both sides so 'gmail' and
+// 'outlook' fall under the 'Mails' filter, 'whatsapp' under 'WhatsApp', etc.
+const channelBucket = (raw) => {
+  const c = (raw || '').toLowerCase();
+  if (c === 'whatsapp') return 'WhatsApp';
+  if (c === 'instagram') return 'Instagram';
+  if (c === 'voice' || c === 'live chat' || c === 'call') return 'Live Chat';
+  if (c === 'gmail' || c === 'outlook' || c === 'email' || c === 'mails') return 'Mails';
+  return raw;
+};
 
 const avatarColors = ['#1e40af', '#0ea5e9', '#16a34a', '#f97316', '#ec4899', '#64748b', '#dc2626', '#0891b2'];
 const initials = (name) =>
@@ -21,11 +34,7 @@ export default function Conversations() {
 
   const [tab, setTab] = useState('all');
   const [channelOpen, setChannelOpen] = useState(false);
-  const [selectedId, setSelectedId] = useState(() => {
-    const raw = params.get('id');
-    const n = raw ? Number(raw) : NaN;
-    return Number.isFinite(n) ? n : null;
-  });
+  const [selectedId, setSelectedId] = useState(() => params.get('id') || null);
   const [draft, setDraft] = useState('');
   const [draftLoading, setDraftLoading] = useState(false);
   const [list, setList] = useState([]);
@@ -58,9 +67,8 @@ export default function Conversations() {
   useEffect(() => {
     const raw = params.get('id');
     if (!raw) return;
-    const n = Number(raw);
-    if (Number.isFinite(n) && list.some((t) => t.id === n)) {
-      setSelectedId(n);
+    if (list.some((t) => t.id === raw)) {
+      setSelectedId(raw);
       const next = new URLSearchParams(params);
       next.delete('id');
       setParams(next, { replace: true });
@@ -72,7 +80,22 @@ export default function Conversations() {
   const workspaceId = loadAuth()?.workspaceId;
   useRealtimeTopic(workspaceId ? `inbox:${workspaceId}` : null, (evt) => {
     if (evt.type === 'conversation.updated') {
-      setList((prev) => prev.map((c) => c.id === evt.data.id ? { ...c, ...evt.data } : c));
+      // If the envelope points at a conversation not in our list (brand-new
+      // inbound from a webhook / poller), refetch the full list so the new
+      // row appears. Otherwise, patch the existing row in place.
+      setList((prev) => {
+        const known = prev.some((c) => c.id === evt.data.id);
+        if (!known) {
+          api.get('/conversations').then((rows) => setList(Array.isArray(rows) ? rows : [])).catch(() => {});
+          return prev;
+        }
+        return prev.map((c) => c.id === evt.data.id ? { ...c, ...evt.data } : c);
+      });
+    } else if (evt.type === 'conversation.deleted') {
+      const gone = evt.data?.id;
+      if (!gone) return;
+      setList((prev) => prev.filter((c) => c.id !== gone));
+      setSelectedId((cur) => (cur === gone ? null : cur));
     } else if (evt.type === 'ticket.created' || evt.type === 'ticket.updated') {
       // a ticket change may affect the right-rail ticket list on the selected thread
       setList((prev) => prev.map((c) =>
@@ -83,19 +106,68 @@ export default function Conversations() {
     }
   });
 
-  // Realtime — messages for the currently open thread.
+  // Realtime — messages + AI streaming for the currently open thread. The
+  // backend's `stream_inbound_reply` pushes:
+  //   ai.typing.started {streamId, agent}  → insert a streaming bubble
+  //   ai.delta          {streamId, delta}  → append text to that bubble
+  //   message.created   {id, streamFinal}  → swap the streaming bubble for
+  //                                           the persisted row
+  //   ai.typing.stopped {streamId}         → clear any leftover streaming bubble
   useRealtimeTopic(selectedId ? `conv:${selectedId}` : null, (evt) => {
-    if (evt.type !== 'message.created') return;
-    setList((prev) => prev.map((c) => {
-      if (c.id !== selectedId) return c;
-      const existing = c.messages || [];
-      // De-dupe vs the optimistic bubble (matched on tempId → id).
-      const tempId = evt.data?.tempId;
-      const withoutTemp = tempId ? existing.filter((m) => m.id !== tempId && m.tempId !== tempId) : existing;
-      // Guard against double-inserts when the server also returns the message from POST.
-      if (evt.data?.id && withoutTemp.some((m) => m.id === evt.data.id)) return c;
-      return { ...c, messages: [...withoutTemp, evt.data], preview: evt.data.text || c.preview };
-    }));
+    if (evt.type === 'message.created') {
+      setList((prev) => prev.map((c) => {
+        if (c.id !== selectedId) return c;
+        const existing = c.messages || [];
+        const tempId = evt.data?.tempId;
+        const withoutTemp = tempId ? existing.filter((m) => m.id !== tempId && m.tempId !== tempId) : existing;
+        // If the final arrived for a streaming bubble, replace it. Otherwise
+        // just drop the streaming row (the non-stream message row takes over).
+        const withoutStream = existing.some((m) => m.streaming)
+          ? withoutTemp.filter((m) => !m.streaming)
+          : withoutTemp;
+        if (evt.data?.id && withoutStream.some((m) => m.id === evt.data.id)) return c;
+        return { ...c, messages: [...withoutStream, evt.data], preview: evt.data.text || c.preview };
+      }));
+      return;
+    }
+    if (evt.type === 'ai.typing.started') {
+      const { streamId, agent } = evt.data || {};
+      if (!streamId) return;
+      setList((prev) => prev.map((c) => c.id !== selectedId ? c : ({
+        ...c,
+        messages: [
+          ...(c.messages || []).filter((m) => m.streamId !== streamId),
+          {
+            id: streamId, streamId, streaming: true,
+            from: 'me', fromName: agent || 'AI',
+            text: '', delivered: false, at: 'now', aiAgentId: evt.data?.agentId,
+          },
+        ],
+      })));
+      return;
+    }
+    if (evt.type === 'ai.delta') {
+      const { streamId, delta } = evt.data || {};
+      if (!streamId || !delta) return;
+      setList((prev) => prev.map((c) => c.id !== selectedId ? c : ({
+        ...c,
+        messages: (c.messages || []).map((m) =>
+          m.streamId === streamId ? { ...m, text: (m.text || '') + delta } : m,
+        ),
+      })));
+      return;
+    }
+    if (evt.type === 'ai.typing.stopped') {
+      const { streamId } = evt.data || {};
+      if (!streamId) return;
+      setList((prev) => prev.map((c) => c.id !== selectedId ? c : ({
+        ...c,
+        // We leave the bubble in place — `message.created` with streamFinal
+        // swaps it to the persisted row. This handler only cleans up orphan
+        // stream rows that never produced a final (errors, guardrails).
+        messages: (c.messages || []).filter((m) => !(m.streamId === streamId && m.streaming && !m.text)),
+      })));
+    }
   });
   const [rightPanel, setRightPanel] = useState('ticket');
   const [viewChannel, setViewChannel] = useState(null);
@@ -131,6 +203,16 @@ export default function Conversations() {
     closePlus();
   }, [selectedId]);
 
+  // When the channel filter changes, drop the current selection if it doesn't
+  // belong to the new channel — otherwise the center pane would keep showing a
+  // thread that's filtered out of the left list.
+  useEffect(() => {
+    if (channel === 'All' || !selected) return;
+    if (channelBucket(selected.channel) !== channel) {
+      setSelectedId(null);
+    }
+  }, [channel, selected]);
+
   const activeChannel = viewChannel || selected?.channel;
 
   const activeThread = useMemo(() => {
@@ -153,7 +235,7 @@ export default function Conversations() {
   const scoped = useMemo(() => {
     const q = search.trim().toLowerCase();
     return list.filter((t) => {
-      if (channel !== 'All' && t.channel !== channel) return false;
+      if (channel !== 'All' && channelBucket(t.channel) !== channel) return false;
       if (filters.assignment === 'assigned' && !t.assignee) return false;
       if (filters.assignment === 'unassigned' && t.assignee) return false;
       if (filters.unreadOnly && !t.unread) return false;
@@ -356,6 +438,54 @@ export default function Conversations() {
     setTicketFilter('');
   };
 
+  const [deletePrompt, setDeletePrompt] = useState(null); // { conv } | null
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState(null);
+  const deleteModal = useDelayUnmount(deletePrompt !== null, 200);
+
+  const requestDeleteConversation = (conv) => {
+    if (!conv?.id) return;
+    setDeleteError(null);
+    setDeletePrompt({ conv });
+  };
+
+  const confirmDeleteConversation = async () => {
+    const conv = deletePrompt?.conv;
+    if (!conv?.id || deleteBusy) return;
+    setDeleteBusy(true);
+    setDeleteError(null);
+    try {
+      await api.del(`/conversations/${encodeURIComponent(conv.id)}`);
+      setList((cur) => cur.filter((c) => c.id !== conv.id));
+      setSelectedId((cur) => (cur === conv.id ? null : cur));
+      setDeletePrompt(null);
+    } catch (err) {
+      setDeleteError(String(err?.message || err || 'Delete failed'));
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
+
+  const cancelDeleteConversation = () => {
+    if (deleteBusy) return;
+    setDeletePrompt(null);
+    setDeleteError(null);
+  };
+
+  useEffect(() => {
+    if (!deletePrompt) return;
+    const onKey = (e) => {
+      if (e.key === 'Escape') cancelDeleteConversation();
+      else if (e.key === 'Enter') {
+        e.preventDefault();
+        confirmDeleteConversation();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deletePrompt, deleteBusy]);
+
   const submitLink = () => {
     if (!linkDraft.trim()) return;
     addLink(linkDraft);
@@ -371,13 +501,37 @@ export default function Conversations() {
     closePlus();
   };
 
-  const addNote = (threadId, text) => {
+  const addNote = async (threadId, text) => {
     if (!text.trim()) return;
     const now = new Date();
     const at = `${now.toLocaleDateString([], { month: 'short', day: 'numeric' })} · ${now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
+    const tempId = `tmp-${Date.now()}`;
     setList((prev) => prev.map((t) => t.id === threadId
-      ? { ...t, notes: [...(t.notes || []), { id: Date.now(), at, text, author: 'You' }] }
+      ? { ...t, notes: [...(t.notes || []), { id: tempId, at, text, author: 'You' }] }
       : t));
+    try {
+      const saved = await api.post(`/conversations/${encodeURIComponent(threadId)}/notes`, { text });
+      setList((prev) => prev.map((t) => t.id === threadId
+        ? { ...t, notes: (t.notes || []).map((n) => (n.id === tempId ? { ...saved } : n)) }
+        : t));
+    } catch {
+      // leave the optimistic note in place so the user can retry by re-adding
+    }
+  };
+
+  const simulateInbound = async () => {
+    if (!activeThread) return;
+    const text = window.prompt('Simulate inbound customer message:');
+    if (!text || !text.trim()) return;
+    try {
+      await api.post(`/conversations/${encodeURIComponent(activeThread.id)}/inbound`, {
+        text: text.trim(),
+        fromName: activeThread.customer?.name || activeThread.name || 'Customer',
+      });
+      // WebSocket `message.created` + `conversation.updated` handle the rest.
+    } catch (e) {
+      alert(`Inbound failed: ${e.message || e}`);
+    }
   };
 
   const tickets = selected?.tickets || [];
@@ -419,6 +573,9 @@ export default function Conversations() {
                     <>{visible.length} {visible.length === 1 ? 'conversation' : 'conversations'}</>
                   )}
                 </div>
+                <SyncInboxButton onSynced={() => {
+                  api.get('/conversations').then((rows) => setList(Array.isArray(rows) ? rows : [])).catch(() => {});
+                }} />
                 <div className="dropdown" style={{ display: 'flex' }}>
                   <button
                     className={'search-icon-btn boxed' + (filterOpen || activeFilterCount > 0 ? ' active' : '')}
@@ -510,6 +667,7 @@ export default function Conversations() {
                   t={selected}
                   activeChannel={activeChannel}
                   onChannelChange={setViewChannel}
+                  onDelete={() => requestDeleteConversation(selected)}
                 />
                 {activeThread?.orderId && (
                   <div className="order-bar">
@@ -539,32 +697,47 @@ export default function Conversations() {
                             </div>
                           );
                         }
-                        if (activeThread.channel === 'Mails' && m.from === 'them') {
+                        const isEmailThread = (
+                          activeThread.channel === 'Mails' ||
+                          activeThread.channel === 'email' ||
+                          activeThread.channel === 'gmail' ||
+                          activeThread.channel === 'outlook'
+                        );
+                        if (isEmailThread) {
+                          const accent = m.from === 'them' ? '#f97316' : '#16a34a';
+                          const displayName = m.fromName || (m.from === 'them' ? activeThread.name : (m.aiAgentId ? 'AI Agent' : 'You'));
+                          const { primary, quoted } = splitEmailBody(m.text || '');
                           return (
-                            <div key={i} className="mail-msg">
+                            <div key={i} className={'mail-msg' + (m.from === 'me' ? ' mail-msg-mine' : '')}>
                               <div className="mail-head">
-                                <div className="avatar" style={{ background: '#f97316' }}>
-                                  {initials(m.fromName || activeThread.name)}
+                                <div className="avatar" style={{ background: accent }}>
+                                  {initials(displayName)}
                                 </div>
                                 <div style={{ flex: 1 }}>
-                                  <div style={{ fontWeight: 700 }}>{m.fromName || activeThread.name}</div>
-                                  {m.to && (
+                                  <div style={{ fontWeight: 700 }}>{displayName}</div>
+                                  {m.from === 'them' && (activeThread.email || activeThread.phone) && (
                                     <div style={{ fontSize: 12, color: 'var(--muted)' }}>
-                                      to {m.to} <Icon.Chevron style={{ verticalAlign: 'middle' }} />
+                                      {activeThread.email || activeThread.phone}
                                     </div>
                                   )}
                                 </div>
                                 <div style={{ fontSize: 12, color: 'var(--muted)' }}>{m.at}</div>
-                                <button
-                                  type="button"
-                                  className="msg-reply-btn inline"
-                                  title="Reply"
-                                  onClick={() => startReply(m)}
-                                >
-                                  <Icon.Reply />
-                                </button>
+                                {!m.streaming && (
+                                  <button
+                                    type="button"
+                                    className="msg-reply-btn inline"
+                                    title="Reply"
+                                    onClick={() => startReply(m)}
+                                  >
+                                    <Icon.Reply />
+                                  </button>
+                                )}
                               </div>
-                              <div className="mail-body">{m.text}</div>
+                              <div className="mail-body">
+                                <MessageText text={primary} />
+                                {m.streaming && <span className="stream-cursor">▍</span>}
+                                {quoted && <QuotedBlock text={quoted} />}
+                              </div>
                             </div>
                           );
                         }
@@ -574,10 +747,10 @@ export default function Conversations() {
                               <div className="avatar sm" style={{ background: '#475569' }}>+8</div>
                             )}
                             {m.from === 'me' && (
-                              <div className="avatar sm" style={{ background: '#16a34a' }}>AI</div>
+                              <div className="avatar sm" style={{ background: m.aiAgentId || m.streaming ? '#7c3aed' : '#16a34a' }}>AI</div>
                             )}
                             <div className="msg-stack">
-                              <div className={'bubble ' + m.from}>
+                              <div className={'bubble ' + m.from + (m.streaming ? ' streaming' : '')}>
                                 {m.replyTo && (
                                   <div className="bubble-quote">
                                     <div className="bubble-quote-bar" />
@@ -587,23 +760,34 @@ export default function Conversations() {
                                     </div>
                                   </div>
                                 )}
-                                {m.text && <div>{m.text}</div>}
+                                {(m.text || m.streaming) && (
+                                  <div>
+                                    {m.text
+                                      ? <MessageText text={m.text} />
+                                      : (m.streaming ? <span style={{ opacity: 0.6 }}>drafting…</span> : null)}
+                                    {m.streaming && <span className="stream-cursor">▍</span>}
+                                  </div>
+                                )}
                                 {m.attachments && m.attachments.length > 0 && (
                                   <MessageAttachments items={m.attachments} />
                                 )}
                               </div>
                               <div className="msg-meta" style={{ justifyContent: m.from === 'me' ? 'flex-end' : 'flex-start' }}>
-                                {m.at} {m.delivered && <><Icon.Check2 /> Delivered</>}
+                                {m.at}
+                                {m.streaming && <> • typing…</>}
+                                {!m.streaming && m.delivered && <><Icon.Check2 /> Delivered</>}
                               </div>
                             </div>
-                            <button
-                              type="button"
-                              className="msg-reply-btn"
-                              title="Reply"
-                              onClick={() => startReply(m)}
-                            >
-                              <Icon.Reply />
-                            </button>
+                            {!m.streaming && (
+                              <button
+                                type="button"
+                                className="msg-reply-btn"
+                                title="Reply"
+                                onClick={() => startReply(m)}
+                              >
+                                <Icon.Reply />
+                              </button>
+                            )}
                           </div>
                         );
                       })
@@ -756,6 +940,38 @@ export default function Conversations() {
                                   </span>
                                 </span>
                               </button>
+                              <button
+                                type="button"
+                                className="chat-plus-item"
+                                disabled={!activeThread || draftLoading}
+                                onClick={() => { closePlus(); requestDraft(); }}
+                                title="Generate an AI draft for this conversation"
+                              >
+                                <Icon.Check2 />
+                                <span className="chat-plus-item-text">
+                                  <span className="chat-plus-item-title">
+                                    {draftLoading ? 'Drafting…' : 'AI Draft'}
+                                  </span>
+                                  <span className="chat-plus-item-sub">
+                                    Generate a reply suggestion
+                                  </span>
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                className="chat-plus-item"
+                                disabled={!activeThread}
+                                onClick={() => { closePlus(); simulateInbound(); }}
+                                title="Simulate an inbound customer message — hits POST /conversations/:id/inbound (intent classifier, attach/reopen/create)"
+                              >
+                                <Icon.Reply />
+                                <span className="chat-plus-item-text">
+                                  <span className="chat-plus-item-title">Simulate inbound</span>
+                                  <span className="chat-plus-item-sub">
+                                    Post a fake customer message
+                                  </span>
+                                </span>
+                              </button>
                             </>
                           )}
                           {plusMode === 'link' && (
@@ -870,18 +1086,6 @@ export default function Conversations() {
                         </div>
                       )}
                     </div>
-                    {activeThread && (
-                      <button
-                        type="button"
-                        className="ai-draft-chip inline"
-                        title="Generate an AI draft for this conversation"
-                        onClick={requestDraft}
-                        disabled={draftLoading}
-                        style={{ cursor: draftLoading ? 'progress' : 'pointer' }}
-                      >
-                        <Icon.Check2 /> {draftLoading ? 'Drafting…' : 'AI Draft'}
-                      </button>
-                    )}
                     <textarea
                       ref={textareaRef}
                       className="chat-input with-hint-placeholder"
@@ -1014,23 +1218,267 @@ export default function Conversations() {
           </aside>
         </div>
       </div>
+      {deleteModal.mounted && createPortal(
+        <DeleteConversationDialog
+          conv={deletePrompt?.conv}
+          busy={deleteBusy}
+          error={deleteError}
+          exiting={deleteModal.state === 'exiting'}
+          onCancel={cancelDeleteConversation}
+          onConfirm={confirmDeleteConversation}
+        />,
+        document.body,
+      )}
     </>
   );
 }
 
+function DeleteConversationDialog({ conv, busy, error, exiting, onCancel, onConfirm }) {
+  const confirmBtnRef = useRef(null);
+  useEffect(() => {
+    if (!exiting) confirmBtnRef.current?.focus();
+  }, [exiting]);
+  const name = conv?.name || 'this customer';
+  const channel = conv?.channel || 'the source channel';
+  return (
+    <div
+      className={'modal-backdrop confirm-backdrop' + (exiting ? ' closing' : '')}
+      onClick={onCancel}
+    >
+      <div
+        className={'confirm-dialog' + (exiting ? ' anim-exit' : ' anim-enter')}
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="delete-conv-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="confirm-icon" style={{ background: 'rgba(239,68,68,0.12)', color: '#dc2626' }}>
+          <Icon.Trash style={{ width: 22, height: 22 }} />
+        </div>
+        <div className="confirm-body">
+          <div className="confirm-title" id="delete-conv-title">
+            Delete conversation with {name}?
+          </div>
+          <ul className="confirm-sub" style={{ margin: 0, paddingLeft: 18 }}>
+            <li>All messages and notes in this thread will be removed.</li>
+            <li>Linked tickets (including parent/child tickets) will be removed.</li>
+            <li>The source thread on {channel} will also be trashed where supported.</li>
+          </ul>
+          <div className="confirm-sub" style={{ marginTop: 8, fontWeight: 600 }}>
+            This cannot be undone.
+          </div>
+          {error && (
+            <div className="confirm-sub" style={{ marginTop: 8, color: '#dc2626' }}>
+              {error}
+            </div>
+          )}
+        </div>
+        <div className="confirm-actions">
+          <button
+            className="confirm-btn confirm-btn-ghost"
+            onClick={onCancel}
+            disabled={busy}
+          >
+            Cancel
+          </button>
+          <button
+            ref={confirmBtnRef}
+            className="confirm-btn confirm-btn-danger"
+            onClick={onConfirm}
+            disabled={busy}
+          >
+            {busy ? 'Deleting…' : 'Delete'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Strip the quoted-reply block (`On <date>, <addr> wrote:` + everything after,
+// plus `>`-prefixed lines) out of an email body so the primary text reads
+// cleanly. Returns `{primary, quoted}` so the UI can still show the quote in
+// a collapsed block.
+function splitEmailBody(raw) {
+  if (!raw) return { primary: '', quoted: '' };
+  const lines = String(raw).split(/\r?\n/);
+  // Find the quote header line: "On <date>, <addr> wrote:"
+  let cut = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^on .+ wrote:\s*$/i.test(lines[i].trim())) { cut = i; break; }
+    if (/^-----original message-----/i.test(lines[i].trim())) { cut = i; break; }
+  }
+  if (cut < 0) {
+    // Also treat a block of `>`-prefixed lines at the end as quoted.
+    let j = lines.length - 1;
+    while (j >= 0 && lines[j].trim() === '') j--;
+    let start = j;
+    while (start >= 0 && /^\s*>/.test(lines[start])) start--;
+    if (start < j - 1) cut = start + 1;
+  }
+  if (cut < 0) return { primary: raw.trim(), quoted: '' };
+  const primary = lines.slice(0, cut).join('\n').trim();
+  const quoted = lines.slice(cut).join('\n').trim();
+  return { primary, quoted };
+}
+
+// Render a plain-text body with newlines preserved, URLs linkified, and light
+// markdown support (**bold**, `code`). Intentionally minimal — we're rendering
+// text from customer/agent/AI, and we never want to let raw HTML through.
+function MessageText({ text }) {
+  if (!text) return null;
+  const withLinks = linkify(text);
+  return <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{withLinks}</span>;
+}
+
+function linkify(text) {
+  const parts = [];
+  const re = /(https?:\/\/[^\s<>]+|www\.[^\s<>]+)/gi;
+  let last = 0;
+  let m;
+  let idx = 0;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) parts.push(renderMd(text.slice(last, m.index), idx++));
+    const url = m[0].startsWith('http') ? m[0] : `http://${m[0]}`;
+    parts.push(
+      <a key={`l-${idx++}`} href={url} target="_blank" rel="noreferrer"
+         style={{ color: 'var(--accent, #60a5fa)', textDecoration: 'underline' }}>
+        {m[0]}
+      </a>
+    );
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) parts.push(renderMd(text.slice(last), idx++));
+  return parts;
+}
+
+function renderMd(chunk, key) {
+  // **bold** and `code` only — keep scope tight, no HTML injection.
+  const out = [];
+  const re = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+  let last = 0;
+  let m;
+  let idx = 0;
+  while ((m = re.exec(chunk)) !== null) {
+    if (m.index > last) out.push(chunk.slice(last, m.index));
+    const token = m[0];
+    if (token.startsWith('**')) {
+      out.push(<strong key={`b-${key}-${idx++}`}>{token.slice(2, -2)}</strong>);
+    } else {
+      out.push(<code key={`c-${key}-${idx++}`} style={{
+        background: 'var(--surface-2, #1f2937)', padding: '1px 5px',
+        borderRadius: 4, fontSize: '0.92em',
+      }}>{token.slice(1, -1)}</code>);
+    }
+    last = m.index + token.length;
+  }
+  if (last < chunk.length) out.push(chunk.slice(last));
+  return <span key={`t-${key}`}>{out}</span>;
+}
+
+function QuotedBlock({ text }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ marginTop: 10 }}>
+      <button type="button" onClick={() => setOpen((v) => !v)}
+              style={{
+                fontSize: 12, color: 'var(--muted)', background: 'transparent',
+                border: 'none', cursor: 'pointer', padding: '2px 0',
+              }}>
+        {open ? '▾ hide quoted' : '▸ show quoted'}
+      </button>
+      {open && (
+        <div style={{
+          marginTop: 6, paddingLeft: 10, borderLeft: '3px solid var(--border)',
+          color: 'var(--muted)', fontSize: 13, whiteSpace: 'pre-wrap',
+        }}>
+          {text}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SyncInboxButton({ onSynced }) {
+  // Forces a Gmail pull through `POST /platforms/gmail/sync`. The background
+  // worker runs the same poll every 30 s, but clicking here gives the operator
+  // an immediate signal that inbound email pulled into the inbox — and works
+  // even if they never started the worker process.
+  const [state, setState] = useState('idle');
+  const [tip, setTip] = useState(null);
+  const run = async () => {
+    setState('syncing'); setTip(null);
+    try {
+      const r = await api.post('/platforms/gmail/sync');
+      const ingested = r?.ingested ?? 0;
+      const fetched = r?.fetched ?? 0;
+      const accounts = r?.accounts ?? 0;
+      setTip(accounts === 0
+        ? 'No Gmail connected — connect it from Platforms.'
+        : `Pulled ${ingested} new / ${fetched} unread across ${accounts} account(s).`);
+      setState(ingested > 0 ? 'done' : 'idle');
+      onSynced?.();
+    } catch (e) {
+      setTip(`Sync failed: ${e?.message || e}`);
+      setState('idle');
+    } finally {
+      setTimeout(() => setTip(null), 4000);
+    }
+  };
+  return (
+    <div style={{ position: 'relative' }}>
+      <button
+        className="search-icon-btn boxed"
+        title="Pull inbound from connected Gmail"
+        onClick={run}
+        disabled={state === 'syncing'}
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          width: 'auto',
+          height: 32,
+          padding: '0 10px',
+          flexShrink: 0,
+          whiteSpace: 'nowrap',
+        }}
+      >
+        <span style={{
+          display: 'inline-block', width: 14, height: 14,
+          animation: state === 'syncing' ? 'spin 0.8s linear infinite' : 'none',
+        }}>↻</span>
+        <span style={{ fontSize: 12, fontWeight: 600 }}>
+          {state === 'syncing' ? 'Syncing…' : 'Sync'}
+        </span>
+      </button>
+      {tip && (
+        <div style={{
+          position: 'absolute', top: '110%', right: 0, zIndex: 5,
+          background: 'var(--card, #111827)', color: 'var(--text, #e5e7eb)',
+          border: '1px solid var(--border, #374151)', borderRadius: 8,
+          padding: '8px 10px', fontSize: 12, whiteSpace: 'nowrap',
+          boxShadow: '0 10px 24px rgba(0,0,0,0.25)',
+        }}>{tip}</div>
+      )}
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
+
 function ConvItem({ t, selected, onClick }) {
-  const channelClass = t.channel === 'WhatsApp' ? 'whatsapp'
-    : t.channel === 'Mails' ? 'mail'
-    : t.channel === 'Instagram' ? 'instagram' : 'call';
+  const bucket = channelBucket(t.channel);
+  const channelClass = bucket === 'WhatsApp' ? 'whatsapp'
+    : bucket === 'Mails' ? 'mail'
+    : bucket === 'Instagram' ? 'instagram' : 'call';
   return (
     <div className={'conv-item' + (selected ? ' selected' : '')} onClick={onClick}>
       <div className="avatar" style={{ background: t.isPhone ? '#475569' : colorFor(t.name) }}>
         {t.isPhone ? '+8' : initials(t.name)}
         <span className={'avatar-ch ' + channelClass}>
-          {t.channel === 'WhatsApp' && <Icon.WhatsApp />}
-          {t.channel === 'Mails' && <Icon.Mail style={{ width: 10, height: 10 }} />}
-          {t.channel === 'Instagram' && <Icon.Instagram style={{ width: 10, height: 10 }} />}
-          {t.channel === 'Live Chat' && <Icon.Phone style={{ width: 10, height: 10 }} />}
+          {bucket === 'WhatsApp' && <Icon.WhatsApp />}
+          {bucket === 'Mails' && <Icon.Mail style={{ width: 10, height: 10 }} />}
+          {bucket === 'Instagram' && <Icon.Instagram style={{ width: 10, height: 10 }} />}
+          {bucket === 'Live Chat' && <Icon.Phone style={{ width: 10, height: 10 }} />}
         </span>
       </div>
       <div className="conv-body">
@@ -1050,7 +1498,7 @@ function ConvItem({ t, selected, onClick }) {
   );
 }
 
-function ChatHead({ t, activeChannel, onChannelChange }) {
+function ChatHead({ t, activeChannel, onChannelChange, onDelete }) {
   const channels = [];
   if (t.phone) channels.push('WhatsApp');
   if (t.email) channels.push('Mails');
@@ -1110,6 +1558,15 @@ function ChatHead({ t, activeChannel, onChannelChange }) {
               </button>
             )}
           </div>
+        )}
+        {onDelete && (
+          <button
+            className="icon-btn circle chat-head-delete"
+            title="Delete conversation"
+            onClick={onDelete}
+          >
+            <Icon.Trash style={{ width: 16, height: 16 }} />
+          </button>
         )}
       </div>
     </div>
@@ -1406,6 +1863,12 @@ function TicketSidePanel({ tickets, onClose, closing }) {
     );
   }
   const t = tickets[0];
+  const navigate = useNavigate();
+  const openFullTicket = () => {
+    const raw = String(t.id || '').replace(/^#/, '');
+    if (!raw) return;
+    navigate(`/tickets?id=${encodeURIComponent(raw)}`);
+  };
   return (
     <aside className={'right-sidebar ticket-panel' + (closing ? ' closing' : '')}>
       <div className="ticket-panel-head">
@@ -1414,7 +1877,9 @@ function TicketSidePanel({ tickets, onClose, closing }) {
         </button>
         <div style={{ fontWeight: 700, fontSize: 16 }}>{t.id}</div>
         <div style={{ marginLeft: 'auto' }} />
-        <button className="icon-btn" title="Expand"><Icon.Expand /></button>
+        <button className="icon-btn" title="Open in Tickets" onClick={openFullTicket}>
+          <Icon.Expand />
+        </button>
       </div>
 
       <div className="ticket-panel-body">

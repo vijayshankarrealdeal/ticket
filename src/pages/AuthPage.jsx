@@ -53,6 +53,36 @@ export default function AuthPage({ onAuthenticated }) {
     firstFieldRef.current?.focus();
   }, [mode]);
 
+  // Post-OAuth landing: the backend redirects to /#/oauth-landing?token=…
+  // We pick the fragment up once, finalize the session, clear the hash,
+  // and land the user in the app.
+  useEffect(() => {
+    const hash = window.location.hash || '';
+    const marker = '#/oauth-landing?';
+    if (!hash.startsWith(marker)) return;
+    const params = new URLSearchParams(hash.slice(marker.length));
+    const token = params.get('token');
+    if (!token) return;
+    (async () => {
+      try {
+        const res = await api.post('/auth/oauth/session-from-fragment', { token });
+        const user = res?.user || {};
+        onAuthenticated({
+          ...user,
+          provider: user.provider || params.get('provider') || 'oauth',
+          token: res?.token || token,
+          accessToken: res?.accessToken || token,
+          signedInAt: new Date().toISOString(),
+        });
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      } catch {
+        setBanner({ kind: 'error', message: 'OAuth session could not be finalized.' });
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const isSignUp = mode === 'signup';
 
   const passwordStrength = useMemo(() => {
@@ -132,20 +162,16 @@ export default function AuthPage({ onAuthenticated }) {
     }
   };
 
-  const handleSso = (provider) => async () => {
+  const handleSso = (provider) => () => {
+    // Redirect the whole tab to the backend OAuth starter. The backend
+    // stashes PKCE state, bounces to the provider, then drops us back at
+    // /#/oauth-landing?token=… which the effect above finalizes.
     setBanner(null);
     setSsoLoading(provider);
-    await new Promise((r) => setTimeout(r, 800));
-    setSsoLoading(null);
-    const profiles = {
-      outlook: { name: 'Outlook User', email: 'you@outlook.com' },
-      google: { name: 'Google User', email: 'you@gmail.com' },
-    };
-    onAuthenticated({
-      ...profiles[provider],
-      provider,
-      signedInAt: new Date().toISOString(),
-    });
+    const base = import.meta.env.VITE_API_URL || '/api';
+    const returnTo = window.location.origin + window.location.pathname;
+    const qs = new URLSearchParams({ mode: 'signin', return_to: returnTo }).toString();
+    window.location.href = `${base}/auth/oauth/${provider}/start?${qs}`;
   };
 
   const switchMode = (next) => {
@@ -269,11 +295,27 @@ export default function AuthPage({ onAuthenticated }) {
                   <button
                     type="button"
                     className="auth-inline-link"
-                    onClick={() =>
-                      setBanner(
-                        'Password reset is not wired up in this demo — contact your admin.'
-                      )
-                    }
+                    onClick={async () => {
+                      const email = values.email.trim() || window.prompt('Email for password reset?')?.trim();
+                      if (!email) return;
+                      setBanner(null);
+                      try {
+                        const res = await api.post('/auth/forgot-password', { email });
+                        if (res?.devToken) {
+                          const newPw = window.prompt(
+                            `Dev reset token issued:\n${res.devToken}\n\nEnter a new password (8+ chars) to apply it now, or Cancel.`,
+                          );
+                          if (newPw && newPw.length >= 8) {
+                            await api.post('/auth/reset-password', { token: res.devToken, new: newPw });
+                            setBanner({ kind: 'success', message: 'Password reset — sign in with your new password.' });
+                            return;
+                          }
+                        }
+                        setBanner({ kind: 'success', message: 'If that email is registered, a reset link has been sent.' });
+                      } catch (err) {
+                        setBanner({ kind: 'error', message: 'Could not start password reset. Try again shortly.' });
+                      }
+                    }}
                   >
                     Forgot password?
                   </button>

@@ -139,7 +139,7 @@ export default function Customers() {
         break;
     }
     return out;
-  }, [search, sort, filterKey]);
+  }, [customers, search, sort, filterKey]);
 
   const filterLabel = FILTERS.find((f) => f.key === filterKey)?.label;
   const sortLabel = SORT_OPTIONS.find((o) => o.key === sort)?.label;

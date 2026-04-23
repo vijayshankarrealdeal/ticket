@@ -100,6 +100,65 @@ async def sync_store(sid: str, user: dict = Me) -> dict:
     return {"ok": True, "lastSync": _now()}
 
 
+@router.get("/ecommerce/stats")
+async def ecomm_stats(user: dict = Me) -> dict:
+    """KPI tiles for the E-Commerce page — computed from ecommerce_stores and
+    ecommerce_events so the UI never renders stale demo numbers."""
+    db = await get_db()
+    ws = user["workspace_id"]
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    day_ago = (now - timedelta(hours=24)).isoformat()
+    two_day_ago = (now - timedelta(hours=48)).isoformat()
+
+    cur = await db.execute(
+        """
+        SELECT
+          COALESCE(SUM(orders_30d), 0)                               AS total_orders_30d,
+          COUNT(*) FILTER (WHERE status = 'connected')               AS active_stores,
+          COUNT(*) FILTER (WHERE status = 'connected' AND created_at >= ?) AS new_this_month
+        FROM ecommerce_stores WHERE workspace_id = ?
+        """,
+        (month_start, ws),
+    )
+    s = dict(await cur.fetchone()) or {}
+
+    cur = await db.execute(
+        """
+        SELECT
+          COUNT(*) FILTER (WHERE tone IN ('danger','warning') AND at >= ?) AS failed_24h,
+          COUNT(*) FILTER (WHERE tone IN ('danger','warning') AND at >= ? AND at < ?) AS failed_prev_24h
+        FROM ecommerce_events WHERE workspace_id = ?
+        """,
+        (day_ago, two_day_ago, day_ago, ws),
+    )
+    e = dict(await cur.fetchone()) or {}
+
+    cur = await db.execute(
+        """
+        SELECT AVG(l.latency_ms) AS avg_latency
+        FROM api_logs l LEFT JOIN apis a ON a.id = l.api_id
+        LEFT JOIN integrations i ON i.id = a.integration_id
+        WHERE l.workspace_id = ? AND l.at >= ?
+          AND (i.kind = 'ecommerce' OR a.name ILIKE '%shopify%' OR a.name ILIKE '%ecommerce%')
+        """,
+        (ws, day_ago),
+    )
+    lat_row = await cur.fetchone()
+    avg_latency = float(lat_row["avg_latency"]) if lat_row and lat_row["avg_latency"] is not None else None
+
+    failed_24h = int(e.get("failed_24h") or 0)
+    failed_prev = int(e.get("failed_prev_24h") or 0)
+    return {
+        "totalOrders30d": int(s.get("total_orders_30d") or 0),
+        "activeStores": int(s.get("active_stores") or 0),
+        "newStoresThisMonth": int(s.get("new_this_month") or 0),
+        "avgSyncLatencyMs": int(avg_latency) if avg_latency is not None else None,
+        "failedWebhooks": failed_24h,
+        "failedWebhooksDelta": failed_24h - failed_prev,
+    }
+
+
 @router.get("/ecommerce/events")
 async def ecomm_events(limit: int = Query(50, ge=1, le=200), user: dict = Me) -> list[dict]:
     """Recent webhook activity. Returns whatever the Shopify/ingestion workers
@@ -438,20 +497,171 @@ async def api_logs_stream(limit: int = Query(1000, ge=1, le=10000),
                              headers={"Content-Disposition": "attachment; filename=api-logs.ndjson"})
 
 
-# ---------- Sheets (lean stub until connector ships) ----------
+# ---------- Sheets (spec §3.9.5) ----------
+
+# Service-account address rendered into the page so admins know which Google
+# email to share their sheet with. Override via env in prod.
+import os
+SHEETS_SERVICE_EMAIL = os.environ.get(
+    "SHEETS_SERVICE_EMAIL", "workspacex-sheets@workspacex-demo.iam.gserviceaccount.com"
+)
+
+# `/spreadsheets/d/<id>` — Google Sheets URL spreadsheet-id pattern.
+_SHEET_ID_RE = re.compile(r"/spreadsheets/d/([a-zA-Z0-9_-]{16,})")
+
+
+def _serialize_sheet(r: dict) -> dict:
+    return {
+        "id": r["id"],
+        "url": r["url"],
+        "name": r.get("name"),
+        "tabs": jl(r.get("tabs"), []),
+        "rows": int(r.get("rows") or 0),
+        "status": r.get("status") or "connected",
+        "lastSync": _rel(r.get("last_sync_at")),
+        "lastSyncAt": r.get("last_sync_at"),
+    }
+
 
 @router.get("/sheets")
-async def sheets(user: dict = Me) -> list[dict]:
+async def sheets(user: dict = Me) -> dict:
     db = await get_db()
     cur = await db.execute(
         "SELECT * FROM sheets WHERE workspace_id = ? ORDER BY created_at DESC",
         (user["workspace_id"],),
     )
-    return [
-        {"id": r["id"], "url": r["url"], "name": r.get("name"), "tabs": jl(r.get("tabs"), []),
-         "rows": r.get("rows", 0), "status": r.get("status"), "lastSync": r.get("last_sync_at")}
-        for r in [dict(x) for x in await cur.fetchall()]
-    ]
+    rows = [_serialize_sheet(dict(x)) for x in await cur.fetchall()]
+    # Returning a dict (not just an array) so the page can show the service
+    # account email even before the first sheet is connected. The frontend
+    # accepts both shapes (`Array.isArray(res) ? res : res.items`).
+    return {"items": rows, "serviceEmail": SHEETS_SERVICE_EMAIL}
+
+
+@router.post("/sheets/validate")
+async def sheets_validate(body: dict, user: dict = Me) -> dict:
+    """Confirm the URL looks like a Google Sheet, extract the spreadsheet id,
+    and synthesize a name + tab list. The real connector will replace this with
+    a `spreadsheets.get` call against the Sheets API once OAuth ships."""
+    url = (body or {}).get("url", "").strip()
+    if not url:
+        raise HTTPException(400, "url required")
+    m = _SHEET_ID_RE.search(url)
+    if not m:
+        raise HTTPException(400, "not a Google Sheets URL")
+    sid_part = m.group(1)
+    name = body.get("name") or f"Sheet {sid_part[:6]}"
+    tabs = body.get("tabs") or ["Sheet1"]
+    return {"url": url, "name": name, "tabs": tabs, "rows": 0,
+            "spreadsheetId": sid_part}
+
+
+@router.post("/sheets")
+async def sheets_create(body: dict, user: dict = Me) -> dict:
+    url = (body or {}).get("url", "").strip()
+    if not url:
+        raise HTTPException(400, "url required")
+    db = await get_db()
+    sid = str(uuid.uuid4())
+    await db.execute(
+        """
+        INSERT INTO sheets (id, workspace_id, url, name, tabs, rows, status)
+        VALUES (?,?,?,?,?,?,?)
+        """,
+        (sid, user["workspace_id"], url, body.get("name") or "Untitled sheet",
+         js(body.get("tabs") or []), int(body.get("rows") or 0),
+         body.get("status") or "connected"),
+    )
+    await db.commit()
+    cur = await db.execute("SELECT * FROM sheets WHERE id = ?", (sid,))
+    return _serialize_sheet(dict(await cur.fetchone()))
+
+
+@router.patch("/sheets/{sid}")
+async def sheets_patch(sid: str, body: dict, user: dict = Me) -> dict:
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM sheets WHERE id = ? AND workspace_id = ?",
+        (sid, user["workspace_id"]),
+    )
+    if not await cur.fetchone():
+        raise HTTPException(404, "sheet not found")
+    fields: dict[str, Any] = {}
+    for k in ("name", "status"):
+        if k in body:
+            fields[k] = body[k]
+    if "tabs" in body:
+        fields["tabs"] = js(body["tabs"])
+    if fields:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        await db.execute(
+            f"UPDATE sheets SET {sets} WHERE id = ? AND workspace_id = ?",
+            (*fields.values(), sid, user["workspace_id"]),
+        )
+        await db.commit()
+    cur = await db.execute("SELECT * FROM sheets WHERE id = ?", (sid,))
+    return _serialize_sheet(dict(await cur.fetchone()))
+
+
+@router.delete("/sheets/{sid}")
+async def sheets_delete(sid: str, user: dict = Me) -> dict:
+    db = await get_db()
+    # Drop kb chunks sourced from this sheet so the agent's `kb_search` tool
+    # stops returning rows from a sheet the operator removed.
+    await db.execute(
+        "DELETE FROM kb_chunks WHERE workspace_id = ? AND source = ?",
+        (user["workspace_id"], f"sheet:{sid}"),
+    )
+    await db.execute(
+        "DELETE FROM sheets WHERE id = ? AND workspace_id = ?",
+        (sid, user["workspace_id"]),
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/sheets/{sid}/sync")
+async def sheets_sync(sid: str, user: dict = Me) -> dict:
+    """Re-sync a sheet to `kb_chunks`. The real connector pulls each tab via
+    Sheets API and breaks rows into chunks; here we synthesise N chunks per
+    tab so `kb_search` has data to return for demos."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM sheets WHERE id = ? AND workspace_id = ?",
+        (sid, user["workspace_id"]),
+    )
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "sheet not found")
+    sheet = dict(row)
+    tabs = jl(sheet.get("tabs"), []) or ["Sheet1"]
+
+    await db.execute(
+        "DELETE FROM kb_chunks WHERE workspace_id = ? AND source = ?",
+        (user["workspace_id"], f"sheet:{sid}"),
+    )
+    chunks_created = 0
+    for tab in tabs:
+        for i in range(5):  # 5 synthetic rows per tab — enough for demo recall.
+            await db.execute(
+                """
+                INSERT INTO kb_chunks (workspace_id, source, title, body)
+                VALUES (?,?,?,?)
+                """,
+                (user["workspace_id"], f"sheet:{sid}",
+                 f"{sheet.get('name') or 'Sheet'} · {tab} · row {i+1}",
+                 f"Row {i+1} from tab '{tab}' of sheet '{sheet.get('name')}' "
+                 f"({sheet.get('url')}). Replace with real Sheets API rows."),
+            )
+            chunks_created += 1
+    await db.execute(
+        "UPDATE sheets SET last_sync_at = now(), rows = ? WHERE id = ?",
+        (chunks_created, sid),
+    )
+    await db.commit()
+    cur = await db.execute("SELECT * FROM sheets WHERE id = ?", (sid,))
+    out = _serialize_sheet(dict(await cur.fetchone()))
+    out["chunks"] = chunks_created
+    return out
 
 
 # ---------- Health services + incidents (spec §3.9.6) ----------
@@ -541,6 +751,28 @@ async def incidents_subscribe(body: dict, user: dict = Me) -> dict:
     )
     await db.commit()
     return {"ok": True, "email": email}
+
+
+@router.post("/health/probe")
+async def health_probe(user: dict = Me) -> list[dict]:
+    """Re-run the 'checks' button — touch every health service for this
+    workspace, bump `last_check_at`, and randomly nudge the latency so the
+    dashboard reflects fresh state. Real prober worker lands in Build 3."""
+    import random
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM health_services WHERE workspace_id = ?",
+        (user["workspace_id"],),
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    for r in rows:
+        lat = max(20, int(r.get("latency_p95_ms") or 100) + random.randint(-20, 20))
+        await db.execute(
+            "UPDATE health_services SET last_check_at = now(), latency_p95_ms = ? WHERE id = ?",
+            (lat, r["id"]),
+        )
+    await db.commit()
+    return await health_services(user)
 
 
 def _rel(ts) -> str:

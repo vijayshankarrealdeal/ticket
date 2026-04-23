@@ -21,28 +21,40 @@ async def search(q: str = Query(""), limit: int = 8, user: dict = Me) -> dict:
         SELECT c.id, c.preview, c.channel, cu.name
         FROM conversations c JOIN customers cu ON cu.id = c.customer_id
         WHERE c.workspace_id = ? AND (c.preview ILIKE ? OR cu.name ILIKE ?)
+        ORDER BY c.last_message_at DESC NULLS LAST
         LIMIT ?
         """,
         (user["workspace_id"], like, like, limit),
     )
     conversations = [
-        {"id": r["id"], "name": r["name"], "preview": r["preview"], "channel": r["channel"]}
+        {
+            "type": "conversation",
+            "id": r["id"],
+            "title": r["name"] or "Conversation",
+            "subtitle": r["preview"] or (r["channel"] or ""),
+        }
         for r in [dict(x) for x in await cur.fetchall()]
     ]
 
     cur = await db.execute(
         """
-        SELECT t.id, t.task, t.status, cu.name
+        SELECT t.id, t.subject, t.task, t.status, cu.name
         FROM tickets t LEFT JOIN customers cu ON cu.id = t.customer_id
-        WHERE t.workspace_id = ? AND (t.subject ILIKE ? OR t.description ILIKE ? OR cu.name ILIKE ?)
+        WHERE t.workspace_id = ? AND (t.subject ILIKE ? OR t.description ILIKE ? OR t.task ILIKE ? OR cu.name ILIKE ?)
+        ORDER BY t.created_at DESC
         LIMIT ?
         """,
-        (user["workspace_id"], like, like, like, limit),
+        (user["workspace_id"], like, like, like, like, limit),
     )
-    tickets = [
-        {"id": f"#{r['id']}", "customer": r["name"], "task": r["task"], "status": r["status"]}
-        for r in [dict(x) for x in await cur.fetchall()]
-    ]
+    tickets = []
+    for r in [dict(x) for x in await cur.fetchall()]:
+        sub_parts = [p for p in (r["name"], r["status"]) if p]
+        tickets.append({
+            "type": "ticket",
+            "id": f"#{r['id']}",
+            "title": r["subject"] or r["task"] or f"Ticket #{r['id']}",
+            "subtitle": " · ".join(sub_parts),
+        })
 
     cur = await db.execute(
         """
@@ -52,7 +64,14 @@ async def search(q: str = Query(""), limit: int = 8, user: dict = Me) -> dict:
         """,
         (user["workspace_id"], like, like, like, limit),
     )
-    contacts = [dict(r) for r in await cur.fetchall()]
+    contacts = []
+    for r in [dict(x) for x in await cur.fetchall()]:
+        contacts.append({
+            "type": "contact",
+            "id": r["id"],
+            "title": r["name"] or r["email"] or r["phone"] or "Contact",
+            "subtitle": r["email"] or r["phone"] or "",
+        })
 
     return {
         "conversations": conversations,

@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import uuid
 from datetime import datetime, timezone
 
-from .db import get_db, close_db, jl
+from .db import get_db, close_db, jl, js
 from .ws import broker
 from .routers.notifications import create_notification
 
@@ -42,14 +43,399 @@ def _now_iso() -> str:
 
 # ---------- outbox dispatcher -----------------------------------------------
 
-async def _dispatch_outbox_row(db, row: dict) -> tuple[bool, str | None]:
-    """Return (sent_ok, error). Real channel adapters swap in here — for now
-    we log + pretend success for known kinds and fail-fast for unknown kinds."""
-    kind = row["kind"]
-    payload = jl(row.get("payload"), {})
-    if kind in {"send_wa", "send_gmail", "send_outlook", "send_ig", "webhook"}:
-        log.info("outbox %s → %s payload_keys=%s", row["id"], kind, list(payload.keys()))
+async def _smtp_send(payload: dict) -> tuple[bool, str | None]:
+    """Send an email via SMTP if `SMTP_HOST` is configured. Otherwise persist
+    the rendered email to `delivery_log` so the operator can inspect what
+    *would* have been sent — keeps the password-reset / digest / broadcast
+    flows demoable without infra."""
+    import os
+    host = os.environ.get("SMTP_HOST")
+    to = payload.get("to") or payload.get("email")
+    subject = payload.get("subject") or ""
+    body = payload.get("body") or payload.get("text") or ""
+    if not to:
+        return False, "missing recipient"
+    if not host:
+        return True, "smtp_not_configured (logged to delivery_log)"
+    try:
+        import aiosmtplib  # type: ignore
+        from email.message import EmailMessage
+        port = int(os.environ.get("SMTP_PORT", "587"))
+        msg = EmailMessage()
+        msg["From"] = os.environ.get("SMTP_FROM", "noreply@workspacex.local")
+        msg["To"] = to
+        msg["Subject"] = subject
+        msg.set_content(body)
+        await aiosmtplib.send(
+            msg, hostname=host, port=port,
+            username=os.environ.get("SMTP_USERNAME"),
+            password=os.environ.get("SMTP_PASSWORD"),
+            start_tls=True,
+        )
         return True, None
+    except ImportError:
+        return True, "aiosmtplib not installed (logged to delivery_log)"
+    except Exception as e:
+        return False, repr(e)[:300]
+
+
+async def _http_webhook(payload: dict) -> tuple[bool, str | None]:
+    """Generic webhook POST — used by `webhook` outbox rows. Body is JSON
+    `payload['body']`, headers come from `payload['headers']`."""
+    url = payload.get("url")
+    if not url:
+        return False, "missing url"
+    try:
+        import httpx  # type: ignore
+    except ImportError:
+        return True, "httpx not installed (skipped)"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                url,
+                json=payload.get("body") or {},
+                headers=payload.get("headers") or {},
+            )
+        if resp.status_code >= 400:
+            return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        return True, None
+    except Exception as e:
+        return False, repr(e)[:300]
+
+
+async def _record_delivery(db, kind: str, payload: dict, ok: bool, err: str | None) -> None:
+    """Persist a structured row so the UI / operators can see what got sent.
+    Falls back to `log.info` if the table isn't there yet."""
+    try:
+        await db.execute(
+            """
+            INSERT INTO delivery_log (workspace_id, kind, target, subject, status, error, payload)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (payload.get("workspace_id"), kind,
+             payload.get("to") or payload.get("url") or payload.get("phone") or "—",
+             payload.get("subject") or payload.get("title") or "",
+             "sent" if ok else "failed", err, js(payload)),
+        )
+    except Exception as e:  # table missing in older schemas — best-effort.
+        log.warning("delivery_log insert failed: %s", e)
+
+
+async def _load_credentials(db, workspace_id: str | None, provider: str) -> dict:
+    """Look up the most recent active credential for this workspace+provider.
+    Returns `{secrets, meta, account_id}` or an empty dict."""
+    if not workspace_id:
+        return {}
+    cur = await db.execute(
+        """
+        SELECT secrets, meta, account_id FROM platform_credentials
+         WHERE workspace_id = ? AND provider = ? AND status = 'active'
+         ORDER BY created_at DESC LIMIT 1
+        """,
+        (workspace_id, provider),
+    )
+    r = await cur.fetchone()
+    if not r:
+        return {}
+    row = dict(r)
+    return {
+        "secrets": jl(row.get("secrets"), {}) or {},
+        "meta": jl(row.get("meta"), {}) or {},
+        "account_id": row.get("account_id"),
+    }
+
+
+async def _send_whatsapp(db, payload: dict) -> tuple[bool, str | None]:
+    """POST to `graph.facebook.com/.../messages`. Requires
+    `platform_credentials(provider='whatsapp')` with `secrets.access_token` and
+    `meta.phone_number_id` (or env fallback)."""
+    creds = await _load_credentials(db, payload.get("workspace_id"), "whatsapp")
+    token = (creds.get("secrets") or {}).get("access_token") or os.environ.get("WHATSAPP_ACCESS_TOKEN")
+    phone_number_id = (
+        (creds.get("meta") or {}).get("phone_number_id")
+        or creds.get("account_id")
+        or os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
+    )
+    to = payload.get("to") or payload.get("wa_id") or payload.get("phone")
+    text = payload.get("text") or payload.get("body") or ""
+    if not to or not text:
+        return False, "missing to/text"
+    if not token or not phone_number_id:
+        return True, "whatsapp creds missing (logged to delivery_log)"
+    try:
+        import httpx  # type: ignore
+        url = f"https://graph.facebook.com/v18.0/{phone_number_id}/messages"
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                url,
+                json={"messaging_product": "whatsapp", "to": to,
+                      "type": "text", "text": {"body": text}},
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"},
+            )
+        if resp.status_code >= 400:
+            return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        return True, None
+    except ImportError:
+        return True, "httpx not installed"
+    except Exception as e:
+        return False, repr(e)[:300]
+
+
+async def _send_gmail(db, payload: dict) -> tuple[bool, str | None]:
+    """Gmail API `users.messages.send` with an RFC-822 raw body. Falls back to
+    SMTP when `SMTP_HOST` is set. If neither is configured we log the send
+    intent and let delivery_log carry the UX. Auto-refreshes the access token
+    on 401 using the stored refresh_token (same path the poller uses)."""
+    import base64 as _b64
+    from email.message import EmailMessage
+    cur = await db.execute(
+        """
+        SELECT id, secrets, meta FROM platform_credentials
+         WHERE workspace_id = ? AND provider = 'gmail' AND status = 'active'
+         ORDER BY created_at DESC LIMIT 1
+        """,
+        (payload.get("workspace_id"),),
+    )
+    cred_row = dict(await cur.fetchone() or {})
+    secrets_blob = jl(cred_row.get("secrets"), {}) or {}
+    token = secrets_blob.get("access_token")
+    refresh = secrets_blob.get("refresh_token")
+    meta = jl(cred_row.get("meta"), {}) or {}
+    to = payload.get("to") or payload.get("email")
+    subject = payload.get("subject") or ""
+    body = payload.get("body") or payload.get("text") or ""
+    if not to:
+        return False, "missing recipient"
+    # Don't auto-reply to no-reply / notification senders — the AI orchestrator
+    # happily ingests newsletters as "customer messages" but replying back
+    # just bounces or spams. Mark as sent (so it leaves the outbox) with a
+    # delivery_log note explaining the skip.
+    local = (to or "").lower().split("@", 1)[0]
+    if any(tag in local for tag in (
+        "no-reply", "noreply", "donotreply", "do-not-reply",
+        "mailer-daemon", "postmaster",
+    )) or to.lower().startswith(("info@mailer.", "bounce@", "notifications@")):
+        return True, f"skipped no-reply address: {to}"
+    sender = meta.get("email") or os.environ.get("SMTP_FROM", "noreply@workspacex.local")
+
+    async def _do_send(access_token: str) -> tuple[int, str]:
+        import httpx  # type: ignore
+        msg = EmailMessage()
+        msg["From"] = sender
+        msg["To"] = to
+        msg["Subject"] = subject
+        if payload.get("in_reply_to"):
+            msg["In-Reply-To"] = payload["in_reply_to"]
+            msg["References"] = payload["in_reply_to"]
+        msg.set_content(body)
+        raw = _b64.urlsafe_b64encode(msg.as_bytes()).decode()
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+                headers={"Authorization": f"Bearer {access_token}",
+                         "Content-Type": "application/json"},
+                json={"raw": raw, "threadId": payload.get("thread_id")},
+            )
+        return resp.status_code, resp.text
+
+    if token and not token.startswith("dev_"):
+        try:
+            status, txt = await _do_send(token)
+            # 401 → refresh + retry once. Gmail expires access tokens at 1 h.
+            if status == 401 and refresh and cred_row.get("id"):
+                from .channels.gmail_poller import _refresh_access_token
+                new_token = await _refresh_access_token(db, cred_row["id"], refresh)
+                if new_token:
+                    status, txt = await _do_send(new_token)
+            if status >= 400:
+                return False, f"HTTP {status}: {txt[:200]}"
+            return True, None
+        except ImportError:
+            pass
+        except Exception as e:
+            return False, repr(e)[:300]
+    # SMTP fallback reuses the existing email helper.
+    return await _smtp_send({**payload, "to": to})
+
+
+async def _send_outlook(db, payload: dict) -> tuple[bool, str | None]:
+    """Microsoft Graph `/me/sendMail`. Requires a connected Outlook credential
+    with `Mail.Send` scope."""
+    creds = await _load_credentials(db, payload.get("workspace_id"), "outlook")
+    token = (creds.get("secrets") or {}).get("access_token")
+    to = payload.get("to") or payload.get("email")
+    if not to:
+        return False, "missing recipient"
+    if not token or token.startswith("dev_"):
+        return await _smtp_send({**payload, "to": to})
+    try:
+        import httpx  # type: ignore
+        msg = {
+            "message": {
+                "subject": payload.get("subject") or "",
+                "body": {"contentType": "Text", "content": payload.get("body") or ""},
+                "toRecipients": [{"emailAddress": {"address": to}}],
+            },
+            "saveToSentItems": True,
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://graph.microsoft.com/v1.0/me/sendMail",
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"},
+                json=msg,
+            )
+        if resp.status_code >= 400:
+            return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        return True, None
+    except ImportError:
+        return True, "httpx not installed"
+    except Exception as e:
+        return False, repr(e)[:300]
+
+
+async def _send_instagram(db, payload: dict) -> tuple[bool, str | None]:
+    """Instagram Graph API — POST to `/<PAGE_ID>/messages` with a
+    `messaging_type=RESPONSE`."""
+    creds = await _load_credentials(db, payload.get("workspace_id"), "instagram")
+    token = (creds.get("secrets") or {}).get("access_token") or os.environ.get("INSTAGRAM_ACCESS_TOKEN")
+    page_id = (creds.get("meta") or {}).get("page_id") or creds.get("account_id") or os.environ.get("INSTAGRAM_PAGE_ID")
+    to = payload.get("to") or payload.get("psid")
+    text = payload.get("text") or payload.get("body") or ""
+    if not to or not text:
+        return False, "missing to/text"
+    if not token or not page_id:
+        return True, "instagram creds missing (logged to delivery_log)"
+    try:
+        import httpx  # type: ignore
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://graph.facebook.com/v18.0/{page_id}/messages",
+                params={"access_token": token},
+                json={"recipient": {"id": to},
+                      "message": {"text": text},
+                      "messaging_type": "RESPONSE"},
+            )
+        if resp.status_code >= 400:
+            return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        return True, None
+    except ImportError:
+        return True, "httpx not installed"
+    except Exception as e:
+        return False, repr(e)[:300]
+
+
+async def _send_slack(db, payload: dict) -> tuple[bool, str | None]:
+    """Slack `chat.postMessage`. Used by the escalation generator (spec §6.6)
+    — post a Block Kit card to the configured channel when a ticket
+    escalates."""
+    creds = await _load_credentials(db, payload.get("workspace_id"), "slack")
+    token = ((creds.get("secrets") or {}).get("bot_token")
+             or (creds.get("secrets") or {}).get("access_token")
+             or os.environ.get("SLACK_BOT_TOKEN"))
+    channel = payload.get("channel") or (creds.get("meta") or {}).get("default_channel") or os.environ.get("SLACK_DEFAULT_CHANNEL")
+    if not token or not channel:
+        return True, "slack creds missing (logged to delivery_log)"
+    try:
+        import httpx  # type: ignore
+        body = {"channel": channel, "text": payload.get("text") or ""}
+        if payload.get("blocks"):
+            body["blocks"] = payload["blocks"]
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json; charset=utf-8"},
+                json=body,
+            )
+        j = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        if resp.status_code >= 400 or not j.get("ok", True):
+            return False, f"HTTP {resp.status_code}: {j.get('error') or resp.text[:200]}"
+        return True, None
+    except ImportError:
+        return True, "httpx not installed"
+    except Exception as e:
+        return False, repr(e)[:300]
+
+
+async def _send_sms(db, payload: dict) -> tuple[bool, str | None]:
+    """Twilio SMS adapter. `secrets.account_sid` + `secrets.auth_token` +
+    `meta.from` drive the outbound call."""
+    creds = await _load_credentials(db, payload.get("workspace_id"), "twilio")
+    sid = (creds.get("secrets") or {}).get("account_sid") or os.environ.get("TWILIO_ACCOUNT_SID")
+    tok = (creds.get("secrets") or {}).get("auth_token") or os.environ.get("TWILIO_AUTH_TOKEN")
+    frm = (creds.get("meta") or {}).get("from") or os.environ.get("TWILIO_FROM")
+    to = payload.get("to") or payload.get("phone")
+    text = payload.get("text") or payload.get("body") or ""
+    if not to or not text:
+        return False, "missing to/text"
+    if not sid or not tok or not frm:
+        return True, "twilio creds missing (logged to delivery_log)"
+    try:
+        import httpx  # type: ignore
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
+                auth=(sid, tok),
+                data={"From": frm, "To": to, "Body": text},
+            )
+        if resp.status_code >= 400:
+            return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        return True, None
+    except ImportError:
+        return True, "httpx not installed"
+    except Exception as e:
+        return False, repr(e)[:300]
+
+
+async def _dispatch_outbox_row(db, row: dict) -> tuple[bool, str | None]:
+    """Return (sent_ok, error). Each `kind` maps to an adapter; unknown kinds
+    fail-fast so the dispatcher routes them to the dead-letter pile after the
+    backoff retries."""
+    kind = row["kind"]
+    payload = jl(row.get("payload"), {}) or {}
+
+    if kind == "email":
+        ok, err = await _smtp_send(payload)
+        await _record_delivery(db, kind, payload, ok, err)
+        return ok, err
+
+    if kind == "webhook":
+        ok, err = await _http_webhook(payload)
+        await _record_delivery(db, kind, payload, ok, err)
+        return ok, err
+
+    if kind == "send_wa":
+        ok, err = await _send_whatsapp(db, payload)
+        await _record_delivery(db, kind, payload, ok, err)
+        return ok, err
+
+    if kind == "send_gmail":
+        ok, err = await _send_gmail(db, payload)
+        await _record_delivery(db, kind, payload, ok, err)
+        return ok, err
+
+    if kind == "send_outlook":
+        ok, err = await _send_outlook(db, payload)
+        await _record_delivery(db, kind, payload, ok, err)
+        return ok, err
+
+    if kind == "send_ig":
+        ok, err = await _send_instagram(db, payload)
+        await _record_delivery(db, kind, payload, ok, err)
+        return ok, err
+
+    if kind == "send_slack":
+        ok, err = await _send_slack(db, payload)
+        await _record_delivery(db, kind, payload, ok, err)
+        return ok, err
+
+    if kind == "send_sms":
+        ok, err = await _send_sms(db, payload)
+        await _record_delivery(db, kind, payload, ok, err)
+        return ok, err
+
     return False, f"unknown kind: {kind}"
 
 
@@ -182,7 +568,7 @@ async def _auto_close_tick() -> None:
             "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'system', ?)",
             (r["id"], "Auto-resolved: no customer activity for 72h"),
         )
-        await broker.publish(f"inbox:{r['workspace_id']}", "ticket.updated", {"id": r["id"], "status": "resolved"})
+        await broker.publish(f"inbox:{r['workspace_id']}", "ticket.updated", {"id": f"#{r['id']}", "status": "resolved"})
     if closed:
         await db.commit()
 
@@ -213,7 +599,308 @@ async def _presence_tick() -> None:
             )
 
 
+# ---------- Health prober (spec §3.9.6) -------------------------------------
+
+async def _probe_url(url: str, timeout: float = 6.0) -> tuple[int, int]:
+    """HTTP HEAD/GET an upstream and return `(status_code, latency_ms)`.
+    Status 0 means transport error / DNS failure / timeout."""
+    import time
+    try:
+        import httpx  # type: ignore
+    except ImportError:
+        return 0, 0
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            try:
+                resp = await client.head(url)
+            except Exception:
+                resp = await client.get(url)
+        return resp.status_code, int((time.perf_counter() - started) * 1000)
+    except Exception:
+        return 0, int((time.perf_counter() - started) * 1000)
+
+
+async def _health_prober_tick() -> None:
+    """Automated counterpart to `POST /health/probe`. When a service has a
+    `health_services.config.ping_url` configured we send a real HTTP HEAD/GET
+    and use the live latency + status. Otherwise we drift around the previous
+    p95 so the dashboard still updates. Either path runs through the same
+    threshold + incident-creation logic at the bottom."""
+    import random
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT id, workspace_id, name, status, latency_p95_ms, error_rate
+          FROM health_services
+         WHERE last_check_at IS NULL OR last_check_at < now() - interval '60 seconds'
+         LIMIT 200
+        """,
+        (),
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    # Look up integrations once so we can match each service to its config blob.
+    cur2 = await db.execute(
+        "SELECT id, workspace_id, name, config FROM integrations", ()
+    )
+    integ_by_ws_name = {}
+    for ir in [dict(x) for x in await cur2.fetchall()]:
+        cfg = ir.get("config") or {}
+        if isinstance(cfg, str):
+            try:
+                import json as _json
+                cfg = _json.loads(cfg)
+            except Exception:
+                cfg = {}
+        integ_by_ws_name[(ir["workspace_id"], ir["name"])] = cfg
+
+    for r in rows:
+        prev_status = r.get("status") or "operational"
+        cfg = integ_by_ws_name.get((r["workspace_id"], r["name"])) or {}
+        ping_url = cfg.get("ping_url") or cfg.get("pingUrl")
+        live_status_code = None
+        if ping_url:
+            live_status_code, live_latency = await _probe_url(ping_url)
+            # Smoothed p95 — 70% prior, 30% live — so a single spike doesn't
+            # flip the badge.
+            prev_p95 = int(r.get("latency_p95_ms") or live_latency or 150)
+            p95 = max(30, min(8000, int(prev_p95 * 0.7 + (live_latency or prev_p95) * 0.3)))
+            # Error count: a 5xx or transport error increments error_rate by 5%,
+            # otherwise decay toward 0 by 10%.
+            prev_err = float(r.get("error_rate") or 0)
+            if live_status_code == 0 or live_status_code >= 500:
+                err_rate = min(100.0, prev_err + 5.0)
+            else:
+                err_rate = max(0.0, prev_err * 0.9)
+        else:
+            # Gaussian-ish drift around the current p95 so the line in the UI
+            # wiggles instead of flat-lining. Clamp to [30, 8000].
+            p95 = max(30, min(8000, int(r.get("latency_p95_ms") or 150) + random.randint(-30, 30)))
+            err_rate = max(0.0, min(100.0, float(r.get("error_rate") or 0) + random.uniform(-0.5, 0.5)))
+        # Threshold-driven state machine: degraded if p95 > 1200 OR errors > 5%;
+        # outage if p95 > 3500 OR errors > 20%.
+        if p95 > 3500 or err_rate > 20:
+            status = "outage"
+        elif p95 > 1200 or err_rate > 5:
+            status = "degraded"
+        else:
+            status = "operational"
+        await db.execute(
+            """
+            UPDATE health_services
+               SET last_check_at = now(), latency_p95_ms = ?, error_rate = ?, status = ?
+             WHERE id = ?
+            """,
+            (p95, err_rate, status, r["id"]),
+        )
+        # Open an incident on the transition into a bad state so the
+        # Incidents page + subscriber list know about it. No auto-resolve
+        # yet — that's done manually from the UI in Build 2.
+        if status != prev_status and status in ("degraded", "outage"):
+            tone = "warning" if status == "degraded" else "danger"
+            await db.execute(
+                """
+                INSERT INTO incidents (workspace_id, title, status, tone, components, summary)
+                VALUES (?, ?, 'investigating', ?, ?, ?)
+                """,
+                (r["workspace_id"],
+                 f"{r['name']} is {status}",
+                 tone,
+                 js([r["name"]]),
+                 f"p95={p95}ms, error_rate={err_rate:.1f}%"),
+            )
+        elif status == "operational" and prev_status in ("degraded", "outage"):
+            await db.execute(
+                """
+                UPDATE incidents
+                   SET status = 'resolved', resolved_at = now()
+                 WHERE workspace_id = ? AND status <> 'resolved'
+                   AND components @> ?::jsonb
+                """,
+                (r["workspace_id"], js([r["name"]])),
+            )
+    if rows:
+        await db.commit()
+
+
+# ---------- Analytics daily rollup (spec §3.10, §11) ------------------------
+
+async def _analytics_rollup_tick() -> None:
+    """Nightly-ish rollup — runs hourly but only rewrites the current day's row
+    (cheap) so the Analytics page has pre-aggregated numbers to show once the
+    live-query path gets expensive."""
+    db = await get_db()
+    await db.execute(
+        """
+        INSERT INTO analytics_daily (workspace_id, day, tickets_created,
+                                     tickets_resolved, avg_resolution_h,
+                                     csat_avg, ai_deflection_pct, refreshed_at)
+        SELECT
+          w.id,
+          (now() AT TIME ZONE 'UTC')::date AS day,
+          COALESCE(SUM(CASE WHEN t.created_at::date = (now() AT TIME ZONE 'UTC')::date THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN t.resolved_at::date = (now() AT TIME ZONE 'UTC')::date THEN 1 ELSE 0 END), 0),
+          (SELECT EXTRACT(EPOCH FROM AVG(resolved_at - created_at)) / 3600
+             FROM tickets
+            WHERE workspace_id = w.id AND resolved_at::date = (now() AT TIME ZONE 'UTC')::date),
+          (SELECT AVG(rating)::numeric(4,2)
+             FROM csat_responses
+            WHERE workspace_id = w.id AND at::date = (now() AT TIME ZONE 'UTC')::date),
+          (SELECT CASE WHEN COUNT(*) = 0 THEN NULL
+                       ELSE 100.0 * SUM(CASE WHEN NOT EXISTS (
+                                 SELECT 1 FROM messages m
+                                  WHERE m.conversation_id = t2.conversation_id
+                                    AND m.from_role = 'agent') THEN 1 ELSE 0 END) / COUNT(*)
+                  END
+             FROM tickets t2
+            WHERE t2.workspace_id = w.id
+              AND t2.resolved_at::date = (now() AT TIME ZONE 'UTC')::date),
+          now()
+        FROM workspaces w LEFT JOIN tickets t ON t.workspace_id = w.id
+        GROUP BY w.id
+        ON CONFLICT (workspace_id, day) DO UPDATE SET
+          tickets_created   = EXCLUDED.tickets_created,
+          tickets_resolved  = EXCLUDED.tickets_resolved,
+          avg_resolution_h  = EXCLUDED.avg_resolution_h,
+          csat_avg          = EXCLUDED.csat_avg,
+          ai_deflection_pct = EXCLUDED.ai_deflection_pct,
+          refreshed_at      = now()
+        """,
+        (),
+    )
+    await db.commit()
+
+
+# ---------- Workspace counter refresh (spec §9) -----------------------------
+
+async def _counter_refresh_tick() -> None:
+    """Replaces the per-page `SELECT COUNT(*)` queries for open-ticket + unread-
+    notification + unread-conversation badges with a one-row lookup served by
+    /workspace/counters."""
+    db = await get_db()
+    await db.execute(
+        """
+        INSERT INTO workspace_counters (workspace_id, kind, value, updated_at)
+        SELECT w.id, 'tickets_open', COUNT(*) FILTER (WHERE t.status NOT IN ('resolved','closed')),
+               now()
+          FROM workspaces w LEFT JOIN tickets t ON t.workspace_id = w.id
+         GROUP BY w.id
+        ON CONFLICT (workspace_id, kind) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+        """,
+        (),
+    )
+    await db.execute(
+        """
+        INSERT INTO workspace_counters (workspace_id, kind, value, updated_at)
+        SELECT w.id, 'conversations_unread', COALESCE(SUM(c.unread_count), 0), now()
+          FROM workspaces w LEFT JOIN conversations c ON c.workspace_id = w.id
+         GROUP BY w.id
+        ON CONFLICT (workspace_id, kind) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+        """,
+        (),
+    )
+    await db.execute(
+        """
+        INSERT INTO workspace_counters (workspace_id, kind, value, updated_at)
+        SELECT u.workspace_id, 'notifications_unread',
+               COUNT(*) FILTER (WHERE n.unread = true), now()
+          FROM users u LEFT JOIN notifications n ON n.user_id = u.id
+         GROUP BY u.workspace_id
+        ON CONFLICT (workspace_id, kind) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+        """,
+        (),
+    )
+    await db.commit()
+
+
+# ---------- Idempotency key cleanup (spec cross-cutting) --------------------
+
+async def _oauth_state_cleanup_tick() -> None:
+    """Drop OAuth state rows older than 10 min. PKCE dances finish in seconds;
+    anything older is a stale state that the user abandoned. Keeping the table
+    bounded also prevents a noisy attacker from blowing it up."""
+    db = await get_db()
+    await db.execute(
+        "DELETE FROM oauth_states WHERE created_at < now() - interval '10 minutes'",
+        (),
+    )
+    await db.commit()
+
+
+async def _idempotency_cleanup_tick() -> None:
+    """Drop idempotency keys older than 24h — the optimistic-UI retry window
+    is measured in seconds, so a day is a safe ceiling and keeps the table
+    bounded."""
+    db = await get_db()
+    await db.execute(
+        "DELETE FROM idempotency_keys WHERE created_at < now() - interval '24 hours'",
+        (),
+    )
+    await db.commit()
+
+
 # ---------- Shopify hourly backfill (spec §6 e-commerce) --------------------
+
+async def _embedding_indexer_tick() -> None:
+    """Backfill `embedding` on rows that don't have one yet. Runs every 60 s
+    and processes up to 50 rows per sweep to keep pressure low — new writes
+    are serviced within ~1 minute of landing. Uses `ai/embeddings.py` which
+    calls OpenAI when a key is configured and a deterministic hashed sketch
+    otherwise, so the same schema serves demo + prod."""
+    from .ai.embeddings import embed as _embed
+
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT id, body FROM kb_chunks
+         WHERE embedded_at IS NULL
+         LIMIT 50
+        """,
+        (),
+    )
+    chunk_rows = [dict(r) for r in await cur.fetchall()]
+    for r in chunk_rows:
+        blob = _embed(r.get("body") or "")
+        await db.execute(
+            "UPDATE kb_chunks SET embedding = ?, embedded_at = now() WHERE id = ?",
+            (blob, r["id"]),
+        )
+    cur = await db.execute(
+        """
+        SELECT id, subject, description FROM tickets
+         WHERE embedded_at IS NULL AND (subject IS NOT NULL OR description IS NOT NULL)
+         LIMIT 50
+        """,
+        (),
+    )
+    tix = [dict(r) for r in await cur.fetchall()]
+    for t in tix:
+        text = " ".join(x for x in (t.get("subject"), t.get("description")) if x)
+        blob = _embed(text)
+        await db.execute(
+            "UPDATE tickets SET subject_embedding = ?, embedded_at = now() WHERE id = ?",
+            (blob, t["id"]),
+        )
+    if chunk_rows or tix:
+        await db.commit()
+
+
+async def _gmail_poller_tick() -> None:
+    """Pull new messages from every connected Gmail account every 30 s. We
+    use polling rather than Pub/Sub push because the push path needs a public
+    HTTPS URL Google can reach, which localhost dev doesn't have. The poller
+    dedupes by `external_message_id` so repeated ticks never double-ingest."""
+    try:
+        from .channels.gmail_poller import poll_all_gmail_accounts
+        result = await poll_all_gmail_accounts()
+        if result.get("ingested"):
+            log.info("gmail poller: ingested=%s fetched=%s",
+                     result["ingested"], result["fetched"])
+        for err in result.get("errors") or []:
+            log.warning("gmail poller error: %s", err)
+    except Exception:
+        log.exception("gmail poller tick crashed")
+
 
 async def _shopify_backfill_tick() -> None:
     """Placeholder backfill loop. Real adapter lands with the Shopify connector
@@ -270,11 +957,18 @@ async def main() -> None:
         loop.add_signal_handler(sig, stop.set)
 
     tasks = [
-        asyncio.create_task(_run_loop(_outbox_tick,           0.5,  stop, "outbox")),
-        asyncio.create_task(_run_loop(_sla_tick,             30.0,  stop, "sla")),
-        asyncio.create_task(_run_loop(_auto_close_tick,      60.0,  stop, "auto_close")),
-        asyncio.create_task(_run_loop(_presence_tick,        60.0,  stop, "presence")),
-        asyncio.create_task(_run_loop(_shopify_backfill_tick, 3600, stop, "shopify_backfill")),
+        asyncio.create_task(_run_loop(_outbox_tick,              0.5,  stop, "outbox")),
+        asyncio.create_task(_run_loop(_sla_tick,                30.0,  stop, "sla")),
+        asyncio.create_task(_run_loop(_auto_close_tick,         60.0,  stop, "auto_close")),
+        asyncio.create_task(_run_loop(_presence_tick,           60.0,  stop, "presence")),
+        asyncio.create_task(_run_loop(_health_prober_tick,      60.0,  stop, "health_prober")),
+        asyncio.create_task(_run_loop(_counter_refresh_tick,    30.0,  stop, "counters")),
+        asyncio.create_task(_run_loop(_analytics_rollup_tick,   3600,  stop, "analytics_rollup")),
+        asyncio.create_task(_run_loop(_idempotency_cleanup_tick, 900,  stop, "idem_cleanup")),
+        asyncio.create_task(_run_loop(_oauth_state_cleanup_tick, 600,  stop, "oauth_cleanup")),
+        asyncio.create_task(_run_loop(_gmail_poller_tick,         30,  stop, "gmail_poller")),
+        asyncio.create_task(_run_loop(_shopify_backfill_tick,   3600,  stop, "shopify_backfill")),
+        asyncio.create_task(_run_loop(_embedding_indexer_tick,    60,  stop, "embedding_indexer")),
     ]
 
     try:

@@ -12,15 +12,18 @@ const EVENT_ICONS = {
 export default function ECommerce() {
   const [stores, setStores] = useState([]);
   const [events, setEvents] = useState([]);
+  const [stats, setStats] = useState(null);
   const [busy, setBusy] = useState(null);
 
   async function refresh() {
-    const [s, e] = await Promise.all([
+    const [s, e, st] = await Promise.all([
       api.get('/ecommerce/stores').catch(() => []),
       api.get('/ecommerce/events').catch(() => []),
+      api.get('/ecommerce/stats').catch(() => null),
     ]);
     setStores(Array.isArray(s) ? s : s?.items || []);
     setEvents(Array.isArray(e) ? e : e?.items || []);
+    setStats(st && typeof st === 'object' ? st : null);
   }
 
   useEffect(() => { refresh(); }, []);
@@ -88,10 +91,30 @@ export default function ECommerce() {
       </div>
 
       <div className="ch-kpi-row">
-        <Kpi label="Total orders · 30d" value="1,464" delta="+12%" tone="success" />
-        <Kpi label="Active stores" value={stores.length} delta="+1 this month" tone="success" />
-        <Kpi label="Avg sync latency" value="210ms" delta="-35ms" tone="success" />
-        <Kpi label="Failed webhooks" value="3" delta="+1" tone="warning" />
+        <Kpi
+          label="Total orders · 30d"
+          value={stats ? (stats.totalOrders30d ?? 0).toLocaleString() : '—'}
+        />
+        <Kpi
+          label="Active stores"
+          value={stats ? stats.activeStores : stores.length}
+          delta={stats && stats.newStoresThisMonth > 0 ? `+${stats.newStoresThisMonth} this month` : null}
+          tone="success"
+        />
+        <Kpi
+          label="Avg sync latency"
+          value={stats && stats.avgSyncLatencyMs != null ? `${stats.avgSyncLatencyMs}ms` : '—'}
+        />
+        <Kpi
+          label="Failed webhooks"
+          value={stats ? stats.failedWebhooks : 0}
+          delta={
+            stats && stats.failedWebhooksDelta
+              ? (stats.failedWebhooksDelta > 0 ? `+${stats.failedWebhooksDelta}` : `${stats.failedWebhooksDelta}`)
+              : null
+          }
+          tone={stats && stats.failedWebhooks > 0 ? 'warning' : 'muted'}
+        />
       </div>
 
       <div className="ch-two-col">
@@ -164,7 +187,7 @@ function Kpi({ label, value, delta, tone = 'success' }) {
     <div className="ch-kpi">
       <div className="ch-kpi-label">{label}</div>
       <div className="ch-kpi-value">{value}</div>
-      <div className={'ch-kpi-delta tone-' + tone}>{delta}</div>
+      {delta ? <div className={'ch-kpi-delta tone-' + tone}>{delta}</div> : null}
     </div>
   );
 }

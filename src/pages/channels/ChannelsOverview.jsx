@@ -58,9 +58,29 @@ export default function ChannelsOverview() {
     });
   }, [items, query, cat]);
 
+  const OAUTH_CHANNELS = { gmail: 'google', outlook: 'outlook' };
+
   const toggle = async (id) => {
     const p = items.find((x) => x.id === id);
     if (!p) return;
+    // OAuth channels: redirect through /auth/oauth/<provider>/start so the
+    // real token exchange happens (Platforms.jsx uses the same flow).
+    if (p.status !== 'connected' && OAUTH_CHANNELS[id]) {
+      // Redirect cross-origin through the OAuth starter. Ship the bearer
+      // token on the URL so the backend can identify which workspace to
+      // bind the channel to (the wx_session cookie is scoped to :5173 and
+      // wouldn't reach :8000).
+      const base = import.meta.env.VITE_API_URL || '/api';
+      let token = '';
+      try {
+        const auth = JSON.parse(localStorage.getItem('workspacex.auth') || '{}');
+        token = auth.token || auth.accessToken || '';
+      } catch {}
+      const returnTo = window.location.origin + window.location.pathname;
+      const qs = new URLSearchParams({ mode: 'connect', return_to: returnTo, token }).toString();
+      window.location.href = `${base}/auth/oauth/${OAUTH_CHANNELS[id]}/start?${qs}`;
+      return;
+    }
     const endpoint = p.status === 'connected' ? 'disconnect' : 'connect';
     try { await api.post(`/platforms/${encodeURIComponent(id)}/${endpoint}`); } catch {}
     setItems((prev) =>

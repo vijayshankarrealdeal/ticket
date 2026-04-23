@@ -37,7 +37,7 @@ async def list_notifs(user: dict = Me) -> list[dict]:
 async def mark_read(nid: int, user: dict = Me) -> dict:
     db = await get_db()
     await db.execute(
-        "UPDATE notifications SET unread = 0 WHERE id = ? AND user_id = ?",
+        "UPDATE notifications SET unread = false WHERE id = ? AND user_id = ?",
         (nid, user["id"]),
     )
     await db.commit()
@@ -48,7 +48,7 @@ async def mark_read(nid: int, user: dict = Me) -> dict:
 async def read_all(user: dict = Me) -> dict:
     db = await get_db()
     await db.execute(
-        "UPDATE notifications SET unread = 0 WHERE user_id = ?", (user["id"],)
+        "UPDATE notifications SET unread = false WHERE user_id = ?", (user["id"],)
     )
     await db.commit()
     return {"ok": True}

@@ -63,9 +63,14 @@ Sign-out: `clearAuth()` removes the localStorage entry and fires `POST /auth/sig
 
 | SPA consumer | Method + path | Server handler |
 |---|---|---|
-| [AuthPage.jsx](src/pages/AuthPage.jsx) | `POST /auth/signin`, `/auth/signup` | [auth.py](backend/app/routers/auth.py) |
+| [AuthPage.jsx](src/pages/AuthPage.jsx) | `POST /auth/signin`, `/auth/signup`, `/auth/forgot-password`, `/auth/reset-password` | [auth.py](backend/app/routers/auth.py) |
 | [UserMenu.jsx](src/components/UserMenu.jsx), [api.js](src/api.js) | `POST /auth/signout`, `GET /auth/me` | [auth.py](backend/app/routers/auth.py) |
-| [Conversations.jsx](src/pages/Conversations.jsx) | `GET /conversations`, `GET /conversations/:id`, `POST /conversations/:id/messages` | [conversations.py](backend/app/routers/conversations.py) |
+| [Settings.jsx](src/pages/Settings.jsx) | `POST /workspace/broadcast`, `GET /workspace/broadcasts`, `GET/POST /workspace/members`, `DELETE /me/oauth/:provider`, `GET /workspace/counters`, `GET/POST/DELETE /workspace/sla-policies`, `GET /workspace/delivery-log`, `GET/POST /me/2fa{/setup\|/verify\|/disable}`, `GET /billing/{plan,usage,invoices}`, `POST /billing/{checkout,portal}` | [me.py](backend/app/routers/me.py), [billing.py](backend/app/routers/billing.py) |
+| [AuthPage.jsx](src/pages/AuthPage.jsx) | `GET /auth/oauth/{google,outlook}/start?mode=signin`, `POST /auth/oauth/session-from-fragment` | [oauth.py](backend/app/routers/oauth.py) |
+| [Platforms.jsx](src/pages/Platforms.jsx) / [ChannelsOverview.jsx](src/pages/channels/ChannelsOverview.jsx) | `GET /auth/oauth/{google,outlook}/start?mode=connect` (OAuth channel connect) | [oauth.py](backend/app/routers/oauth.py) |
+| Provider webhooks (no SPA caller) | `POST /webhooks/{whatsapp,gmail,outlook,instagram,shopify,slack/events,slack/interactions,voice,stripe}` | [webhooks.py](backend/app/routers/webhooks.py) |
+| Embedded chat widget (third-party site) | `GET /widget/bootstrap`, `POST /widget/messages`, `wss:/widget/ws` (unauth, workspace+visitor query params) | [widget.py](backend/app/routers/widget.py) |
+| [Conversations.jsx](src/pages/Conversations.jsx) | `GET /conversations`, `GET /conversations/:id`, `POST /conversations/:id/messages`, `POST /conversations/:id/inbound` (auto-reply streams back on `conv:<id>`) | [conversations.py](backend/app/routers/conversations.py) |
 | [Tickets.jsx](src/pages/Tickets.jsx), [CreateTicketModal.jsx](src/components/CreateTicketModal.jsx) | `GET /tickets`, `GET /tickets/:id`, `POST /tickets`, `PATCH /tickets/:id`, `POST /tickets/similar` | [tickets.py](backend/app/routers/tickets.py) |
 | [Customers.jsx](src/pages/Customers.jsx), [CreateTicketModal.jsx](src/components/CreateTicketModal.jsx) | `GET /customers`, `GET /customers/:id`, `GET /customers/search` | [customers.py](backend/app/routers/customers.py) |
 | [Teams.jsx](src/pages/Teams.jsx), [teamsData.js](src/data/teamsData.js) | `GET /teams/*`, `POST /teams/*`, `/auth/me` | [teams.py](backend/app/routers/teams.py), [auth.py](backend/app/routers/auth.py) |
@@ -141,11 +146,12 @@ Server → client:
 
 | Topic | Events produced | Consumed by |
 |---|---|---|
-| `inbox:<workspace_id>` | `conversation.updated`, `ticket.created`, `ticket.updated` | [Conversations.jsx](src/pages/Conversations.jsx), [Tickets.jsx](src/pages/Tickets.jsx) |
-| `conv:<conversation_id>` | `message.created`, `typing.started`, `typing.stopped` | [Conversations.jsx](src/pages/Conversations.jsx) (only while the thread is open) |
-| `ticket:<ticket_id>` | `ticket.updated`, `ticket.timeline.appended` | [Tickets.jsx](src/pages/Tickets.jsx) (only while the ticket is open) |
-| `teams:<channel_or_dm_id>` | `team.message.created`, `team.typing` | (not yet — see [progress.md](progress.md) Teams item) |
-| `notif:<user_id>` | `notification.created` | [useNotifications.js](src/hooks/useNotifications.js) |
+| `inbox:<workspace_id>` | `conversation.updated`, `ticket.created`, `ticket.updated`, `sla.breach_warning` | [Conversations.jsx](src/pages/Conversations.jsx), [Tickets.jsx](src/pages/Tickets.jsx) |
+| `conv:<conversation_id>` | `message.created` (may carry `streamFinal:true` to close an AI streaming bubble), `typing.started`, `typing.stopped`, `ai.typing.started`, `ai.delta`, `ai.typing.stopped` | [Conversations.jsx](src/pages/Conversations.jsx) (only while the thread is open) |
+| `ticket:<ticket_id>` | `ticket.updated`, `ticket.timeline.appended`, `sla.breach_warning` | [Tickets.jsx](src/pages/Tickets.jsx) (only while the ticket is open) |
+| `teams:<channel_or_dm_id>` | `team.message.created`, `team.typing`, `team.reaction.updated`, `team.channel.mentioned` | [Teams.jsx](src/pages/Teams.jsx) |
+| `workspace:<workspace_id>` | `presence.changed` | [Teams.jsx](src/pages/Teams.jsx) |
+| `notif:<user_id>` | `notification.created` (types: `assign`, `sla`, `reply`, `mention`, `broadcast`, `teammate_joined`) | [useNotifications.js](src/hooks/useNotifications.js) |
 
 ### Client singleton
 

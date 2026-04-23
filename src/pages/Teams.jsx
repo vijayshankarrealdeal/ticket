@@ -3,6 +3,8 @@ import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
 import { useDelayUnmount } from '../hooks/useDelayUnmount.js';
 import { useRealtimeTopic } from '../hooks/useRealtime.js';
+import { api } from '../api.js';
+import { loadAuth } from './AuthPage.jsx';
 import {
   MEMBERS,
   CHANNELS,
@@ -17,6 +19,9 @@ import {
   customerById,
   loadTeamsData,
   loadConversationMessages,
+  refreshTeamsPresence,
+  refreshTeamsUnread,
+  getTeamsUnread,
 } from '../data/teamsData.js';
 import './teams.css';
 
@@ -81,12 +86,29 @@ export default function Teams() {
 
   useEffect(() => {
     let alive = true;
-    loadTeamsData().then(() => {
+    loadTeamsData().then(async () => {
+      if (!alive) return;
+      await Promise.all([refreshTeamsPresence(), refreshTeamsUnread()]);
       if (!alive) return;
       setActiveId((cur) => cur || CHANNELS[0]?.id || DMS[0]?.id || null);
       setDataVersion((v) => v + 1);
     });
     return () => { alive = false; };
+  }, []);
+
+  // Presence heartbeat + periodic refresh so dots don't lie after 2 minutes of
+  // inactivity. The worker reaper flips stale users offline in the background.
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => {
+      if (!alive) return;
+      try { await api.post('/teams/presence/heartbeat', { status: 'online' }); } catch {}
+      try { await refreshTeamsPresence(); } catch {}
+      if (alive) setDataVersion((v) => v + 1);
+    };
+    tick();
+    const id = setInterval(tick, 30000);
+    return () => { alive = false; clearInterval(id); };
   }, []);
   const [query, setQuery] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
@@ -134,6 +156,26 @@ export default function Teams() {
     return () => { alive = false; };
   }, [activeId, dataVersion]);
 
+  // Mark the thread read on activation so the unread badge clears.
+  useEffect(() => {
+    if (!activeId) return;
+    api.post(`/teams/conversations/${encodeURIComponent(activeId)}/read`)
+      .then(() => refreshTeamsUnread())
+      .then(() => setDataVersion((v) => v + 1))
+      .catch(() => {});
+  }, [activeId]);
+
+  // Typing indicator — fire-and-forget every time the composer changes while
+  // there's text. 2.5s debounced-off on the server via the 2.5s decay timer.
+  const typingTimer = useRef(null);
+  useEffect(() => {
+    if (!activeId) return;
+    if (!draft.trim()) return;
+    if (typingTimer.current) return; // already broadcasting within the 2s window
+    api.post(`/teams/typing/${encodeURIComponent(activeId)}`, { on: true }).catch(() => {});
+    typingTimer.current = setTimeout(() => { typingTimer.current = null; }, 2000);
+  }, [draft, activeId]);
+
   const channelMessages = threadsByConv[activeId] || [];
 
   useEffect(() => {
@@ -164,11 +206,28 @@ export default function Teams() {
       if (!evt || evt.topic !== `teams:${activeId}`) return;
       if (evt.type === 'team.message.created' && evt.data) {
         const data = evt.data;
-        if (data.userId && data.userId === CURRENT_USER_ID && data.id?.startsWith('m-')) return;
         setThreadsByConv((prev) => {
           const prior = prev[activeId] || [];
+          // Dedupe against the optimistic bubble we inserted locally.
+          if (data.tempId && prior.some((m) => m.tempId === data.tempId)) {
+            return {
+              ...prev,
+              [activeId]: prior.map((m) => (m.tempId === data.tempId ? { ...data, tempId: m.tempId } : m)),
+            };
+          }
           if (data.id && prior.some((m) => m.id === data.id)) return prev;
           return { ...prev, [activeId]: [...prior, data] };
+        });
+      } else if (evt.type === 'team.reaction.updated' && evt.data) {
+        const { messageId, reactions } = evt.data;
+        if (!messageId) return;
+        setThreadsByConv((prev) => {
+          const prior = prev[activeId] || [];
+          if (!prior.some((m) => m.id === messageId)) return prev;
+          return {
+            ...prev,
+            [activeId]: prior.map((m) => (m.id === messageId ? { ...m, reactions: reactions || [] } : m)),
+          };
         });
       } else if (evt.type === 'team.typing' && evt.data) {
         const who = evt.data.userName;
@@ -179,6 +238,19 @@ export default function Teams() {
     },
   );
 
+  // Presence updates workspace-wide so the left-rail status dots track live.
+  const meWorkspaceId = loadAuth()?.workspaceId;
+  useRealtimeTopic(
+    meWorkspaceId ? `workspace:${meWorkspaceId}` : null,
+    (evt) => {
+      if (evt?.type !== 'presence.changed' || !evt.data) return;
+      const { userId, status } = evt.data;
+      const m = MEMBERS.find((x) => x.id === userId);
+      if (m) m.status = status;
+      setDataVersion((v) => v + 1);
+    },
+  );
+
   const filteredChannels = CHANNELS.filter((c) => c.name.toLowerCase().includes(query.toLowerCase()));
   const filteredDMs = DMS.filter((d) => dmTitle(d).toLowerCase().includes(query.toLowerCase()));
 
@@ -186,24 +258,56 @@ export default function Teams() {
     const text = draft.trim();
     if (!text && !attachDraft) return;
     const blocks = parseDraftToBlocks(draft, draftMentions);
-    const msg = {
-      id: 'm-' + Date.now(),
+    const tempId = 'tmp-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+    const attachments = attachDraft ? [attachDraft] : [];
+    const replyToSnap = replyTo
+      ? { messageId: replyTo.id, userId: replyTo.userId, preview: previewText(replyTo) }
+      : null;
+    const optimistic = {
+      id: tempId,
+      tempId,
       userId: CURRENT_USER_ID,
       at: 'Just now',
       blocks,
       reactions: [],
-      replyTo: replyTo ? { messageId: replyTo.id, userId: replyTo.userId, preview: previewText(replyTo) } : undefined,
-      attachments: attachDraft ? [attachDraft] : undefined,
+      replyTo: replyToSnap || undefined,
+      attachments: attachments.length ? attachments : undefined,
+      _pending: true,
     };
     setThreadsByConv((prev) => ({
       ...prev,
-      [activeId]: [...(prev[activeId] || []), msg],
+      [activeId]: [...(prev[activeId] || []), optimistic],
     }));
     setDraft('');
     setDraftMentions([]);
     setAttachDraft(null);
     setReplyTo(null);
     setShowMentionMenu(false);
+
+    const targetId = activeId;
+    api.post(`/teams/conversations/${encodeURIComponent(targetId)}/messages`, {
+      text: text || '',
+      blocks,
+      attachments,
+      replyTo: replyToSnap ? replyToSnap.messageId : null,
+      tempId,
+    })
+      .then((saved) => {
+        setThreadsByConv((prev) => ({
+          ...prev,
+          [targetId]: (prev[targetId] || []).map((m) =>
+            m.tempId === tempId ? { ...saved, tempId } : m
+          ),
+        }));
+      })
+      .catch(() => {
+        setThreadsByConv((prev) => ({
+          ...prev,
+          [targetId]: (prev[targetId] || []).map((m) =>
+            m.tempId === tempId ? { ...m, _pending: false, _failed: true } : m
+          ),
+        }));
+      });
   };
 
   const onKeyDown = (e) => {
@@ -266,6 +370,9 @@ export default function Teams() {
   };
 
   const toggleReaction = (msgId, emoji) => {
+    // Skip optimistic reactions on pending-send messages (no real id yet).
+    if (typeof msgId === 'string' && msgId.startsWith('tmp-')) return;
+    // Optimistic: mirror the server-side toggle so the picker feels instant.
     setThreadsByConv((prev) => {
       const list = prev[activeId] || [];
       const next = list.map((m) => {
@@ -287,6 +394,10 @@ export default function Teams() {
       return { ...prev, [activeId]: next };
     });
     setShowEmojiPicker(null);
+    // Persist server-side; the `team.reaction.updated` broadcast keeps other
+    // tabs in sync. We ignore the response (the local optimistic update wins).
+    api.post(`/teams/messages/${encodeURIComponent(msgId)}/reactions`, { emoji })
+      .catch(() => {});
   };
 
   const attachImageOrFile = (kind) => {

@@ -10,9 +10,14 @@ const GROUP_LABELS = {
   payments: 'Payments',
 };
 
-// Channels that need OAuth. Connecting these surfaces a modal explaining the
-// OAuth redirect step (stub until the real consent flow ships — see progress.md).
-const OAUTH_CHANNELS = new Set(['gmail', 'outlook', 'instagram', 'messenger']);
+// Channels that drive OAuth when Connect is clicked. `provider` is the
+// backend /auth/oauth/<provider>/start slug — Gmail uses the Google flow, the
+// rest reuse the provider's own start endpoint (not wired today for IG /
+// Messenger, so those still fall through to the stub manage modal).
+const OAUTH_CHANNELS = {
+  gmail: 'google',
+  outlook: 'outlook',
+};
 
 export default function Platforms() {
   const [platforms, setPlatforms] = useState([]);
@@ -31,6 +36,21 @@ export default function Platforms() {
 
   useEffect(() => { refresh(); }, []);
 
+  // OAuth return: the backend sends us back with ?connected=<provider>, so
+  // surface a quick confirmation and scrub the query param.
+  const [flash, setFlash] = useState(null);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const connected = params.get('connected');
+    if (connected) {
+      setFlash(`${connected} connected — new inbound messages will flow into this workspace.`);
+      params.delete('connected');
+      const next = params.toString();
+      window.history.replaceState(null, '', window.location.pathname + (next ? `?${next}` : ''));
+      setTimeout(() => setFlash(null), 6000);
+    }
+  }, []);
+
   const grouped = useMemo(() => {
     const g = new Map();
     platforms.forEach((p) => {
@@ -43,10 +63,21 @@ export default function Platforms() {
 
   async function toggle(p) {
     const connected = p.status === 'connected';
-    if (!connected && OAUTH_CHANNELS.has(p.id)) {
-      // Stub OAuth — surface a manage modal instead so the user is not misled
-      // into thinking a real OAuth round-trip ran.
-      setManage(p);
+    if (!connected && OAUTH_CHANNELS[p.id]) {
+      // Real OAuth round-trip: redirect to the backend starter, which bounces
+      // to the provider and drops us back at /platforms with ?connected=<id>.
+      // We ship the bearer token on the URL because the full-tab navigation
+      // jumps cross-origin (localhost:5173 → localhost:8000) and the
+      // wx_session cookie doesn't tag along.
+      const base = import.meta.env.VITE_API_URL || '/api';
+      let token = '';
+      try {
+        const auth = JSON.parse(localStorage.getItem('workspacex.auth') || '{}');
+        token = auth.token || auth.accessToken || '';
+      } catch {}
+      const returnTo = window.location.origin + window.location.pathname;
+      const qs = new URLSearchParams({ mode: 'connect', return_to: returnTo, token }).toString();
+      window.location.href = `${base}/auth/oauth/${OAUTH_CHANNELS[p.id]}/start?${qs}`;
       return;
     }
     setBusy(p.id);
@@ -84,6 +115,15 @@ export default function Platforms() {
             <div className="page-sub">Connect every channel where your customers reach you.</div>
           </div>
         </div>
+
+        {flash && (
+          <div style={{ background: 'var(--success-soft, #ecfdf5)',
+                        border: '1px solid var(--success, #059669)',
+                        color: 'var(--success, #047857)', padding: '10px 14px',
+                        borderRadius: 10, marginBottom: 14, fontSize: 13 }}>
+            {flash}
+          </div>
+        )}
 
         <div className="stat-row">
           <div className="stat">
@@ -201,7 +241,19 @@ export default function Platforms() {
 
 function ManagePlatformModal({ platform, onClose, onConnect, onDisconnect, busy }) {
   const isConnected = platform.status === 'connected';
-  const isOAuth = OAUTH_CHANNELS.has(platform.id);
+  const isOAuth = Boolean(OAUTH_CHANNELS[platform.id]);
+  const [sync, setSync] = useState(null);
+  const [syncing, setSyncing] = useState(false);
+  const canSync = isConnected && platform.id === 'gmail';
+  const runSync = async () => {
+    setSyncing(true); setSync(null);
+    try {
+      const r = await api.post('/platforms/gmail/sync');
+      setSync(`Pulled ${r?.ingested ?? 0} new / ${r?.fetched ?? 0} unread across ${r?.accounts ?? 0} account(s).`);
+    } catch (e) {
+      setSync(`Sync failed: ${e?.message || e}`);
+    } finally { setSyncing(false); }
+  };
   return (
     <div
       style={{
@@ -231,6 +283,17 @@ function ManagePlatformModal({ platform, onClose, onConnect, onDisconnect, busy 
         {isConnected ? (
           <div style={{ background: 'var(--bg-soft, #f8fafc)', padding: 12, borderRadius: 8, fontSize: 13 }}>
             This channel is connected. New conversations will appear in Conversations as they arrive.
+            {canSync && (
+              <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                <button className="btn secondary sm" disabled={syncing} onClick={runSync}>
+                  {syncing ? 'Syncing…' : 'Sync inbox now'}
+                </button>
+                <span style={{ color: 'var(--muted)', fontSize: 12 }}>
+                  Background poll runs every 30 s.
+                </span>
+                {sync && <div style={{ flexBasis: '100%', color: 'var(--muted)', fontSize: 12 }}>{sync}</div>}
+              </div>
+            )}
           </div>
         ) : isOAuth ? (
           <div style={{ background: 'var(--bg-soft, #f8fafc)', padding: 12, borderRadius: 8, fontSize: 13 }}>

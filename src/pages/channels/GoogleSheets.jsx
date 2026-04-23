@@ -63,6 +63,13 @@ export default function GoogleSheets() {
     );
   };
 
+  const sync = async (id) => {
+    try {
+      const updated = await api.post(`/sheets/${encodeURIComponent(id)}/sync`);
+      setSheets((prev) => prev.map((s) => (s.id === id ? { ...s, ...updated } : s)));
+    } catch { /* ignore */ }
+  };
+
   return (
     <div className="ch-page">
       <div className="ch-page-head">
@@ -182,6 +189,9 @@ export default function GoogleSheets() {
                     <a className="ch-row-action" href={s.url} target="_blank" rel="noreferrer">
                       <Icon.ExternalLink /> Open
                     </a>
+                    <button className="ch-row-action" onClick={() => sync(s.id)}>
+                      Sync now
+                    </button>
                     <button className="ch-row-action" onClick={() => togglePause(s.id)}>
                       {s.status === 'connected' ? 'Pause' : 'Resume'}
                     </button>

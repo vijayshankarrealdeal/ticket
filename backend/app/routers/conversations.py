@@ -10,6 +10,8 @@ Frontend shape (see src/pages/Conversations.jsx):
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 from uuid import uuid4
 from datetime import datetime, timezone
 
@@ -20,8 +22,34 @@ from ..deps import AgentOrAdmin, Me
 from ..idempotency import check_idempotency, save_idempotency
 from ..schemas import MessageIn, NoteIn
 from ..ws import broker
+from .notifications import create_notification
 
+log = logging.getLogger(__name__)
 router = APIRouter(tags=["conversations"])
+
+
+# Rate-limit cache for the opportunistic Gmail pull kicked from
+# `GET /conversations`. Keyed by workspace_id → last-poll timestamp so a
+# page refresh doesn't hammer the Gmail API.
+_LAST_GMAIL_POLL: dict[str, datetime] = {}
+
+
+def _maybe_kick_gmail_poll(workspace_id: str) -> None:
+    """Fire-and-forget Gmail poll, at most once per workspace per 20 s. Lets
+    the inbox refresh itself on page load without requiring the background
+    worker to be running (handy during localhost dev)."""
+    now = datetime.now(timezone.utc)
+    last = _LAST_GMAIL_POLL.get(workspace_id)
+    if last and (now - last).total_seconds() < 20:
+        return
+    _LAST_GMAIL_POLL[workspace_id] = now
+    async def _go() -> None:
+        try:
+            from ..channels.gmail_poller import poll_all_gmail_accounts
+            await poll_all_gmail_accounts(workspace_id=workspace_id)
+        except Exception:
+            log.exception("opportunistic gmail poll failed (ws=%s)", workspace_id)
+    asyncio.create_task(_go())
 
 
 def _now() -> str:
@@ -187,6 +215,13 @@ async def list_conversations(
     q: str | None = Query(None),
     user: dict = Me,
 ) -> list[dict]:
+    # Fire-and-forget Gmail pull so inbound email shows up even if the
+    # background worker isn't running (localhost dev typically runs only
+    # uvicorn). Rate-limited to one poll per workspace per 20 s via the
+    # module-level `_LAST_GMAIL_POLL` cache so refreshing the page doesn't
+    # hammer the Gmail API.
+    _maybe_kick_gmail_poll(user["workspace_id"])
+
     db = await get_db()
     clauses = ["c.workspace_id = ?"]
     params: list = [user["workspace_id"]]
@@ -347,44 +382,144 @@ async def mark_read(message_id: str, user: dict = Me) -> dict:
     return {"ok": True}
 
 
-@router.post("/conversations/{conv_id}/inbound")
-async def post_inbound(
-    conv_id: str,
-    body: dict,
-    user: dict = AgentOrAdmin,
-) -> dict:
-    """Simulates a channel adapter receiving a customer message. Writes the
-    message, runs the Stage-1 intent classifier, and executes the resulting
-    `attach | reopen | create` decision. Real channel connectors (WhatsApp /
-    Gmail / Shopify) will call the same code path.
+async def resolve_or_create_customer(
+    *,
+    workspace_id: str,
+    phone: str | None = None,
+    email: str | None = None,
+    wa_id: str | None = None,
+    psid: str | None = None,
+    shopify_id: str | None = None,
+    name: str | None = None,
+) -> str:
+    """Find-or-create a customer row by whichever channel identifier we have.
+    Webhook routers use this as a thin idempotency layer around inbound
+    messages — repeated hits from the same sender don't spawn duplicates."""
+    db = await get_db()
+    clauses = []
+    params: list = []
+    if phone:
+        clauses.append("phone = ?"); params.append(phone)
+    if email:
+        clauses.append("email = ?"); params.append(email.lower())
+    if wa_id:
+        clauses.append("wa_id = ?"); params.append(wa_id)
+    if psid:
+        clauses.append("psid = ?"); params.append(psid)
+    if shopify_id:
+        clauses.append("shopify_id = ?"); params.append(shopify_id)
+    if clauses:
+        sql = (
+            f"SELECT id FROM customers WHERE workspace_id = ? AND ({' OR '.join(clauses)}) LIMIT 1"
+        )
+        cur = await db.execute(sql, (workspace_id, *params))
+        row = await cur.fetchone()
+        if row:
+            return row[0]
+    cid = str(uuid4())
+    await db.execute(
+        """
+        INSERT INTO customers (id, workspace_id, name, phone, email, wa_id, psid,
+                               shopify_id, kind, since)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'customer', CURRENT_DATE)
+        """,
+        (cid, workspace_id, name or email or phone or wa_id or psid or "Customer",
+         phone, (email or "").lower() or None, wa_id, psid, shopify_id),
+    )
+    await db.commit()
+    return cid
 
-    Body: {text, attachments?, customerPhone?, externalMessageId?}
+
+async def resolve_or_create_conversation(
+    *,
+    workspace_id: str,
+    customer_id: str,
+    channel: str,
+    external_thread_id: str | None = None,
+) -> str:
+    """Find-or-create a conversation row for `(workspace, customer, channel)`.
+    If `external_thread_id` is provided (Gmail thread id, Outlook conversation
+    id), we match on that first so distinct threads with the same customer
+    stay separate."""
+    db = await get_db()
+    if external_thread_id:
+        cur = await db.execute(
+            """
+            SELECT id FROM conversations
+             WHERE workspace_id = ? AND channel = ? AND external_thread_id = ?
+             LIMIT 1
+            """,
+            (workspace_id, channel, external_thread_id),
+        )
+        row = await cur.fetchone()
+        if row:
+            return row[0]
+    cur = await db.execute(
+        """
+        SELECT id FROM conversations
+         WHERE workspace_id = ? AND customer_id = ? AND channel = ?
+           AND status NOT IN ('closed')
+         ORDER BY last_message_at DESC LIMIT 1
+        """,
+        (workspace_id, customer_id, channel),
+    )
+    row = await cur.fetchone()
+    if row:
+        return row[0]
+    cid = str(uuid4())
+    await db.execute(
+        """
+        INSERT INTO conversations (id, workspace_id, customer_id, channel,
+                                   external_thread_id, status)
+        VALUES (?, ?, ?, ?, ?, 'open')
+        """,
+        (cid, workspace_id, customer_id, channel, external_thread_id),
+    )
+    await db.commit()
+    return cid
+
+
+async def ingest_inbound_message(
+    *,
+    workspace_id: str,
+    conversation_id: str,
+    text: str,
+    attachments: list | None = None,
+    from_name: str = "Customer",
+    external_message_id: str | None = None,
+    auto_reply: bool = True,
+    actor_user_id: str | None = None,
+) -> dict:
+    """Shared inbound pipeline — persists a customer message, runs the intent
+    classifier, executes its `attach | reopen | create` decision, fans out the
+    WS events, and (optionally) kicks off the AI auto-reply. Used by
+    `POST /conversations/:id/inbound` **and** every channel webhook (WhatsApp /
+    Gmail / Outlook / Instagram / Shopify / Slack / Voice) so the auth'd
+    simulator and the real channel adapters share one code path.
     """
     db = await get_db()
     cur = await db.execute(
         "SELECT * FROM conversations WHERE id = ? AND workspace_id = ?",
-        (conv_id, user["workspace_id"]),
+        (conversation_id, workspace_id),
     )
-    conv = await cur.fetchone()
-    if not conv:
+    conv_row = await cur.fetchone()
+    if not conv_row:
         raise HTTPException(404, "conversation not found")
-    conv = dict(conv)
+    conv = dict(conv_row)
 
+    attachments = attachments or []
+    text = text or ""
+    preview = text[:160]
     msg_id = str(uuid4())
     now = _now()
-    text = body.get("text") or ""
-    attachments = body.get("attachments") or []
-    preview = text[:160]
     await db.execute(
         """
         INSERT INTO messages (id, workspace_id, conversation_id, from_role, from_name,
                               external_message_id, at, text, attachments)
         VALUES (?,?,?, 'customer', ?, ?, ?, ?, ?)
         """,
-        (msg_id, user["workspace_id"], conv_id,
-         body.get("fromName") or "Customer",
-         body.get("externalMessageId"),
-         now, text, js(attachments)),
+        (msg_id, workspace_id, conversation_id, from_name,
+         external_message_id, now, text, js(attachments)),
     )
     await db.execute(
         """
@@ -393,23 +528,31 @@ async def post_inbound(
                unread_count = unread_count + 1
          WHERE id = ?
         """,
-        (preview, now, now, conv_id),
+        (preview, now, now, conversation_id),
     )
     await db.commit()
 
-    # Ask the intent classifier what to do with this message.
+    # Stage-1 intent classification (tickets.intent_classify can also call
+    # Stage-2 LLM when OPENAI_API_KEY is set and Stage-1 confidence is low).
     from .tickets import intent_classify
+    classifier_user = {"workspace_id": workspace_id, "id": actor_user_id}
     decision = await intent_classify(
-        {"conversationId": conv_id, "text": text}, user
+        {"conversationId": conversation_id, "text": text}, classifier_user,
     )
-
-    # Apply the decision. `attach` appends to an existing ticket's timeline;
-    # `reopen` flips status + appends; `create` spawns a new ticket.
     ticket_id = decision.get("ticketId")
+    # AI leads resolution by default. A human is only looped in when intent
+    # confidence is below `AI_CONFIDENCE_THRESHOLD` (classifier doesn't know
+    # what the customer is asking for) or when auto_reply is explicitly off.
+    # At runtime the AI can still fall back to human via `escalate_to_human`
+    # (→ status='blocked') — that's the other human-touch path.
+    AI_CONFIDENCE_THRESHOLD = 0.5
+    confidence = float(decision.get("confidence") or 0.0)
+    ai_can_handle = auto_reply and confidence >= AI_CONFIDENCE_THRESHOLD
+    new_status = "in_progress" if ai_can_handle else "queued"
     if decision["decision"] == "reopen" and ticket_id:
         await db.execute(
-            "UPDATE tickets SET status = 'queued', updated_at = now() WHERE id = ?",
-            (ticket_id,),
+            "UPDATE tickets SET status = ?, resolved_at = NULL, updated_at = now() WHERE id = ?",
+            (new_status, ticket_id),
         )
         await db.execute(
             "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'customer', ?)",
@@ -417,6 +560,15 @@ async def post_inbound(
         )
         await db.commit()
     elif decision["decision"] == "attach" and ticket_id:
+        # Customer replied on a live ticket — if it was parked waiting on them,
+        # flip back to in_progress so the AI (or assignee) picks it up again.
+        await db.execute(
+            """
+            UPDATE tickets SET status = ?, updated_at = now()
+             WHERE id = ? AND status IN ('waiting_for_customer','queued')
+            """,
+            (new_status, ticket_id),
+        )
         await db.execute(
             "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'customer', ?)",
             (ticket_id, f"Customer replied: {preview}"),
@@ -431,13 +583,13 @@ async def post_inbound(
                                  task, team, priority, subject, description,
                                  tags, custom_fields, status, sla_due_at,
                                  intent_key, intent_confidence, order_ref)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'queued',?, ?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?)
             RETURNING id
             """,
-            (user["workspace_id"], conv["customer_id"], conv_id,
+            (workspace_id, conv["customer_id"], conversation_id,
              conv["channel"], conv["channel"],
              decision["intentKey"], "Support", "normal",
-             preview[:80], text, js([]), js({}), sla_due,
+             preview[:80], text, js([]), js({}), new_status, sla_due,
              decision["intentKey"], decision["confidence"], decision.get("orderRef")),
         )
         ticket_id = cur.lastrowid
@@ -447,35 +599,230 @@ async def post_inbound(
         )
         await db.commit()
         await broker.publish(
-            f"inbox:{user['workspace_id']}", "ticket.created",
+            f"inbox:{workspace_id}", "ticket.created",
             {"id": ticket_id, "subject": preview[:80], "task": decision["intentKey"]},
         )
+        # Notify every agent/admin in the workspace that a new ticket landed.
+        # New tickets are unassigned (status='queued'), so the assignee-only
+        # notify below would never fire — agents would see nothing in the bell.
+        cur = await db.execute(
+            "SELECT id FROM users WHERE workspace_id = ? AND role IN ('admin','agent')",
+            (workspace_id,),
+        )
+        recipients = [r[0] for r in await cur.fetchall()]
+        for uid in recipients:
+            if uid == actor_user_id:
+                continue
+            await create_notification(
+                uid, "ticket",
+                title=f"New ticket #{ticket_id} from {from_name}",
+                body=preview,
+                link=f"/tickets?id={ticket_id}",
+            )
 
-    # Fan out the message to open consumers.
     msg = {
         "id": msg_id,
         "from": "them",
-        "fromName": body.get("fromName") or "Customer",
+        "fromName": from_name,
         "at": _fmt_time(now),
         "text": text,
         "delivered": True,
         "attachments": attachments,
     }
-    await broker.publish(f"conv:{conv_id}", "message.created", msg)
+    await broker.publish(f"conv:{conversation_id}", "message.created", msg)
     await broker.publish(
-        f"inbox:{user['workspace_id']}",
-        "conversation.updated",
-        {"id": conv_id, "preview": preview, "date": _fmt_time(now)},
+        f"inbox:{workspace_id}", "conversation.updated",
+        {"id": conversation_id, "preview": preview, "date": _fmt_time(now)},
     )
     if ticket_id:
         await broker.publish(
             f"ticket:{ticket_id}", "ticket.timeline.appended", {"ticket_id": ticket_id}
         )
+        cur = await db.execute(
+            "SELECT assignee_id FROM tickets WHERE id = ?", (ticket_id,)
+        )
+        trow = await cur.fetchone()
+        if trow and trow["assignee_id"] and trow["assignee_id"] != actor_user_id:
+            await create_notification(
+                trow["assignee_id"], "reply",
+                title=f"{from_name} replied on ticket #{ticket_id}",
+                body=preview,
+                link=f"/conversations?id={conversation_id}",
+            )
+        await db.execute(
+            "UPDATE tickets SET last_customer_at = ? WHERE id = ?",
+            (now, ticket_id),
+        )
+        await db.commit()
+
+    if ai_can_handle:
+        asyncio.create_task(_run_inbound_ai_reply(
+            workspace_id=workspace_id,
+            conversation_id=conversation_id,
+            channel=conv.get("channel"),
+            customer_id=conv.get("customer_id"),
+            actor_user_id=actor_user_id,
+            prompt=text,
+        ))
+    elif auto_reply and ticket_id:
+        # Low-confidence intent: hand off to a human instead of drafting a
+        # reply we can't ground. Leave a trace so agents see why the AI stepped
+        # back.
+        await db.execute(
+            "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'system', ?)",
+            (ticket_id,
+             f"AI held back — intent confidence {confidence:.2f} below {AI_CONFIDENCE_THRESHOLD:.2f}; routed to human"),
+        )
+        await db.commit()
+
+    return {"message": msg, "intent": decision, "ticketId": ticket_id}
+
+
+@router.post("/conversations/{conv_id}/inbound")
+async def post_inbound(
+    conv_id: str,
+    body: dict,
+    user: dict = AgentOrAdmin,
+) -> dict:
+    """Simulates a channel adapter receiving a customer message. Wraps the
+    shared `ingest_inbound_message` pipeline so the auth'd simulator and the
+    real channel webhooks (routers/webhooks.py) agree on behaviour.
+
+    Body: {text, attachments?, fromName?, externalMessageId?, autoReply?}
+    """
+    return await ingest_inbound_message(
+        workspace_id=user["workspace_id"],
+        conversation_id=conv_id,
+        text=body.get("text") or "",
+        attachments=body.get("attachments") or [],
+        from_name=body.get("fromName") or "Customer",
+        external_message_id=body.get("externalMessageId"),
+        auto_reply=bool(body.get("autoReply", True)),
+        actor_user_id=user["id"],
+    )
+
+
+async def _run_inbound_ai_reply(*, workspace_id: str, conversation_id: str,
+                                channel: str | None, customer_id: str | None,
+                                actor_user_id: str | None, prompt: str) -> None:
+    """Background helper: select the workspace's preferred agent, then stream
+    its reply into the live conversation. Swallows exceptions so a broken
+    agent never poisons the inbound POST response."""
+    from ..ai.orchestrator import AgentCtx, select_inbound_agent, stream_inbound_reply
+    import uuid as _uuid
+
+    try:
+        agent = await select_inbound_agent(workspace_id)
+        ctx = AgentCtx(
+            workspace_id=workspace_id,
+            conversation_id=conversation_id,
+            customer_id=customer_id,
+            channel=channel,
+            actor_user_id=actor_user_id,
+            trace_id=f"trc_{_uuid.uuid4().hex[:12]}",
+            agent_id=agent.get("id"),
+            agent_name=agent.get("name"),
+        )
+        await stream_inbound_reply(ctx, prompt, model=agent.get("model") or "gpt-4.1-mini")
+    except Exception:
+        log.exception("inbound AI reply failed (conv=%s)", conversation_id)
+
+
+@router.delete("/conversations/{conv_id}")
+async def delete_conversation(conv_id: str, user: dict = AgentOrAdmin) -> dict:
+    """Remove a conversation, its tickets (walking both parent and child links),
+    and the underlying thread at the source channel (Gmail trash, Outlook
+    delete — WhatsApp/IG/Slack have no per-thread delete). Source deletion is
+    best-effort: a revoked token or offline provider must not strand the local
+    rows. Messages, notes, timeline and ticket_child entries are removed by
+    the schema's ON DELETE CASCADE."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM conversations WHERE id = ? AND workspace_id = ?",
+        (conv_id, user["workspace_id"]),
+    )
+    conv = await cur.fetchone()
+    if not conv:
+        raise HTTPException(404, "conversation not found")
+    conv = dict(conv)
+
+    # Gather all tickets reachable from this conversation along parent_ticket_id
+    # and child (inverse) edges. Both directions are fused into a single
+    # recursive term (OR-join) — Postgres only permits one recursive branch per
+    # WITH RECURSIVE, and splitting parent/child walks across two UNIONs makes
+    # the middle branch an illegal forward self-reference (InvalidRecursionError).
+    cur = await db.execute(
+        """
+        WITH RECURSIVE related AS (
+            SELECT id, parent_ticket_id
+              FROM tickets
+             WHERE conversation_id = ? AND workspace_id = ?
+            UNION
+            SELECT t.id, t.parent_ticket_id
+              FROM tickets t JOIN related r
+                ON t.id = r.parent_ticket_id OR t.parent_ticket_id = r.id
+             WHERE t.workspace_id = ?
+        )
+        SELECT DISTINCT id FROM related
+        """,
+        (conv_id, user["workspace_id"], user["workspace_id"]),
+    )
+    ticket_ids = [r[0] for r in await cur.fetchall()]
+
+    # Collect the external message ids so per-channel deletion (Outlook) can
+    # target individual messages — Gmail uses the thread id directly.
+    cur = await db.execute(
+        "SELECT external_message_id FROM messages WHERE conversation_id = ? AND external_message_id IS NOT NULL",
+        (conv_id,),
+    )
+    ext_msg_ids = [r[0] for r in await cur.fetchall()]
+
+    source_result = None
+    try:
+        from ..channels.source_delete import delete_conversation_at_source
+        source_result = await delete_conversation_at_source(
+            workspace_id=user["workspace_id"],
+            channel=conv.get("channel"),
+            external_thread_id=conv.get("external_thread_id"),
+            external_message_ids=ext_msg_ids,
+        )
+    except Exception:
+        log.exception("source-side delete failed (conv=%s)", conv_id)
+
+    # Break any parent_ticket_id links from tickets outside our set so the
+    # FK doesn't block the delete when a parent lives elsewhere (shouldn't
+    # happen since the CTE walks up, but be defensive).
+    if ticket_ids:
+        placeholders = ",".join(["?"] * len(ticket_ids))
+        await db.execute(
+            f"UPDATE tickets SET parent_ticket_id = NULL WHERE parent_ticket_id IN ({placeholders})",
+            tuple(ticket_ids),
+        )
+        await db.execute(
+            f"DELETE FROM tickets WHERE id IN ({placeholders})",
+            tuple(ticket_ids),
+        )
+        await db.commit()
+
+    # Conversation delete cascades to messages + conversation_notes via schema FKs.
+    await db.execute(
+        "DELETE FROM conversations WHERE id = ? AND workspace_id = ?",
+        (conv_id, user["workspace_id"]),
+    )
+    await db.commit()
+
+    await broker.publish(
+        f"inbox:{user['workspace_id']}", "conversation.deleted", {"id": conv_id},
+    )
+    await broker.publish(f"conv:{conv_id}", "conversation.deleted", {"id": conv_id})
+    for tid in ticket_ids:
+        await broker.publish(f"ticket:{tid}", "ticket.deleted", {"id": tid})
 
     return {
-        "message": msg,
-        "intent": decision,
-        "ticketId": ticket_id,
+        "ok": True,
+        "conversationId": conv_id,
+        "deletedTicketIds": ticket_ids,
+        "source": source_result,
     }
 
 

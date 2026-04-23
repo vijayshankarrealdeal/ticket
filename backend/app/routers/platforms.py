@@ -335,3 +335,14 @@ async def connect(pid: str, user: dict = Me) -> dict:
 async def disconnect(pid: str, user: dict = Me) -> dict:
     await _set_status(user["workspace_id"], pid, "disconnected")
     return {"ok": True, "status": "disconnected"}
+
+
+@router.post("/platforms/gmail/sync")
+async def gmail_sync(user: dict = Me) -> dict:
+    """Force a Gmail pull right now. The background poller in worker.py runs
+    every 30 s so this is mostly a UX affordance — lets the user click
+    "Sync inbox" and see inbound emails show up immediately instead of
+    waiting for the next tick."""
+    from ..channels.gmail_poller import poll_all_gmail_accounts
+    result = await poll_all_gmail_accounts(workspace_id=user["workspace_id"])
+    return result
