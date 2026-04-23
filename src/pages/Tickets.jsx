@@ -4,6 +4,9 @@ import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
 import { useGlobalSearch } from '../hooks/useGlobalSearch.jsx';
 import CreateTicketModal from '../components/CreateTicketModal.jsx';
+import { api } from '../api.js';
+import { useRealtimeTopic } from '../hooks/useRealtime.js';
+import { loadAuth } from './AuthPage.jsx';
 
 const SORT_OPTIONS = [
   { key: 'newest', label: 'Newest first' },
@@ -29,131 +32,6 @@ const slaHours = (sla) => {
   return (d ? parseInt(d[1], 10) : 0) * 24 + (h ? parseInt(h[1], 10) : 0);
 };
 
-const tickets = [
-  {
-    id: '#3770',
-    ago: '6d',
-    customer: 'rajendra .',
-    channel: 'WhatsApp',
-    task: 'not_delivered_agent_handoff',
-    assignee: 'Aniket Singh',
-    status: 'assigned',
-    sla: '5d 8h',
-    source: 'WhatsApp',
-    team: 'CRM L1',
-    orderStatus: 'Picked up by Customer',
-    customerDetails: {
-      since: 'Apr 2026',
-      phone: '919870231100',
-      email: 'ashwini2186@gmail.com',
-      address: 'Floor-Ground Floor, ANDHERI J b nagar metro station, MUMBAI Maharashtra 400059 India',
-      orders: 1,
-      returns: 0,
-    },
-    timeline: [
-      { at: 'Apr 21, 2026, 2:47 PM', text: 'Ticket assigned to Aniket Singh' },
-      { at: 'Apr 21, 2026, 2:47 PM · Aniket Singh', text: 'Status changed to Assigned' },
-      { at: 'Apr 16, 2026, 6:32 PM · bharat.m@thesleepcompany.in', text: 'Ticket tag updated to "CRM L1" and unassigned' },
-      { at: 'Apr 16, 2026, 6:31 PM · bharat.m@thesleepcompany.in', text: 'Ticket tag updated to "Logistics" and unassigned' },
-      { at: 'Apr 16, 2026, 6:31 PM · Aniket Singh', text: 'Ticket assigned to Aniket Singh' },
-      { at: 'Apr 16, 2026, 6:30 PM', text: 'Ticket created with status as queued' },
-    ],
-    order: {
-      id: '20466915',
-      price: 1899,
-      placedOn: 'Aug 4, 2025',
-      items: [
-        { name: 'Wedge Cushion', sku: 'TSCWC1', qty: 1, price: 1899 },
-      ],
-    },
-    notes: [
-      { author: 'bharat.m@thesleepcompany.in', at: 'Apr 16, 2026, 6:30 PM', text: 'Customer pillow has been sagged within 8 months time period, which is very disappointing.' },
-    ],
-    customFields: {
-      'Active Return/Replacement Request': false,
-      'Delivered Orders': [],
-      'Is Delivered': false,
-      'Is Mattress': false,
-      'Is Selected Item Delivered': false,
-      'Line Items': 'Wedge Cushion (Qty: 1)',
-    },
-  },
-  {
-    id: '#3765',
-    ago: 'Apr 14',
-    customer: 'Dixit Shah',
-    channel: 'Call',
-    task: 'refund_pending',
-    status: 'queued',
-    sla: '7d 13h',
-    source: 'Call',
-    team: 'CRM L2',
-    orderStatus: 'Refund initiated',
-    customerDetails: { since: 'Feb 2026', phone: '9123123123', email: 'dixit@example.com', address: 'Bangalore, KA', orders: 3, returns: 1 },
-    timeline: [{ at: 'Apr 14, 2026', text: 'Ticket created' }],
-    order: {
-      id: '20466820',
-      price: 45999,
-      placedOn: 'Apr 10, 2026',
-      items: [{ name: 'SmartGRID Mattress', sku: 'TSMG-Q', qty: 1, price: 45999 }],
-    },
-    notes: [],
-    customFields: { 'Refund Amount': '₹45,999', 'Refund Mode': 'Bank transfer' },
-  },
-  {
-    id: '#3764',
-    ago: 'Apr 14',
-    customer: 'Dixit Shah',
-    channel: 'Call',
-    task: 'delivery_followup',
-    status: 'queued',
-    sla: '7d 14h',
-    source: 'Call',
-    team: 'CRM L1',
-    orderStatus: 'In transit',
-    customerDetails: { since: 'Feb 2026', phone: '9123123123', email: 'dixit@example.com', address: 'Bangalore, KA', orders: 3, returns: 1 },
-    timeline: [{ at: 'Apr 14, 2026', text: 'Ticket created' }],
-    order: {
-      id: '20466719',
-      price: 9999,
-      placedOn: 'Apr 12, 2026',
-      items: [{ name: 'Ortho Pillow', sku: 'TSOP-STD', qty: 2, price: 4999.5 }],
-    },
-    notes: [],
-    customFields: { 'Carrier': 'BlueDart', 'Tracking ID': 'BD0098234' },
-  },
-  {
-    id: '#3759',
-    ago: 'Apr 10',
-    customer: 'aftab sayyed',
-    channel: 'WhatsApp',
-    task: 'delay_delivery',
-    status: 'blocked',
-    sla: '11d 4h',
-    source: 'WhatsApp',
-    team: 'CRM L1',
-    pendingChild: {
-      assigneeEmail: 'aftab.sayyed@thesleepcompany.in',
-      team: 'Logistics',
-      prompt: 'Check the status of the delayed shipment and select the reason for the delay from the provided list. Provide the revised estimated time of arrival (ETA) to the customer.',
-    },
-    orderPlacedOn: '2 April 2026',
-    customerDetails: { since: 'Mar 2026', phone: '919600012345', email: 'lionafsay@gmail.com', address: 'Hyderabad, TG', orders: 1, returns: 0 },
-    timeline: [
-      { at: 'Apr 11, 2026 · system', text: 'Interaction ticket #69d9703… created due to customer mood' },
-      { at: 'Apr 10, 2026 · system', text: 'Ticket blocked waiting for objective: logistics_status' },
-      { at: 'Apr 10, 2026 · system', text: 'Ticket created with status as in_progress' },
-    ],
-    order: {
-      id: '20661337',
-      price: 205782,
-      placedOn: 'Apr 2, 2026',
-      items: [{ name: 'Luxe Pro Massager Recliner Sofa', sku: 'TSLP-REC', qty: 1, price: 205782 }],
-    },
-    notes: [],
-    customFields: { 'Promised ETA': 'Apr 8, 2026', 'Current ETA': 'Apr 18, 2026', 'Delay Reason': 'Awaiting logistics confirmation' },
-  },
-];
 
 const statusMeta = {
   assigned: { label: 'Assigned', tone: 'info' },
@@ -172,13 +50,37 @@ const channelAvatar = (channel) => {
 
 export default function Tickets() {
   const [params, setParams] = useSearchParams();
-  const initialId = (() => {
+  const [tickets, setTickets] = useState([]);
+  const [selectedId, setSelectedId] = useState(() => {
     const raw = params.get('id');
-    if (!raw) return tickets[0].id;
-    const normalized = raw.startsWith('#') ? raw : `#${raw}`;
-    return tickets.find((t) => t.id === normalized) ? normalized : tickets[0].id;
-  })();
-  const [selectedId, setSelectedId] = useState(initialId);
+    if (!raw) return null;
+    return raw.startsWith('#') ? raw : `#${raw}`;
+  });
+
+  useEffect(() => {
+    let alive = true;
+    api.get('/tickets')
+      .then((res) => {
+        if (!alive) return;
+        const items = Array.isArray(res) ? res : res?.items || [];
+        setTickets(items);
+        setSelectedId((cur) => cur ?? items[0]?.id ?? null);
+      })
+      .catch(() => { if (alive) setTickets([]); });
+    return () => { alive = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    let alive = true;
+    api.get(`/tickets/${encodeURIComponent(selectedId)}`)
+      .then((detail) => {
+        if (!alive || !detail) return;
+        setTickets((prev) => prev.map((t) => t.id === selectedId ? { ...t, ...detail } : t));
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [selectedId]);
   const [tab, setTab] = useState('info');
   const { query: search } = useGlobalSearch();
   const [sort, setSort] = useState('newest');
@@ -212,6 +114,30 @@ export default function Tickets() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params]);
 
+  // Realtime — push updates for the inbox (list) + the open ticket.
+  const workspaceId = loadAuth()?.workspaceId;
+  useRealtimeTopic(workspaceId ? `inbox:${workspaceId}` : null, (evt) => {
+    if (evt.type === 'ticket.updated') {
+      setTickets((prev) => prev.map((t) => t.id === evt.data.id ? { ...t, ...evt.data } : t));
+    } else if (evt.type === 'ticket.created') {
+      setTickets((prev) => prev.some((t) => t.id === evt.data.id) ? prev : [evt.data, ...prev]);
+    }
+  });
+  useRealtimeTopic(
+    selectedId ? `ticket:${selectedId.replace(/^#/, '')}` : null,
+    (evt) => {
+      if (evt.type === 'ticket.updated') {
+        setTickets((prev) => prev.map((t) => t.id === selectedId ? { ...t, ...evt.data } : t));
+      } else if (evt.type === 'ticket.timeline.appended') {
+        // refetch the detail to pick up the appended timeline entry
+        api.get(`/tickets/${encodeURIComponent(selectedId)}`).then((detail) => {
+          if (!detail) return;
+          setTickets((prev) => prev.map((t) => t.id === selectedId ? { ...t, ...detail } : t));
+        }).catch(() => {});
+      }
+    }
+  );
+
   const selected = tickets.find((t) => t.id === selectedId);
 
   // close dropdowns on outside click
@@ -241,7 +167,7 @@ export default function Tickets() {
     const out = {};
     for (const f of FILTERS) out[f.key] = tickets.filter(f.match).length;
     return out;
-  }, []);
+  }, [tickets]);
 
   const visibleTickets = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -377,7 +303,7 @@ export default function Tickets() {
               {[
                 { k: 'info', label: 'Info' },
                 { k: 'convo', label: 'Conversation', icon: <Icon.Inbox /> },
-                { k: 'notes', label: 'Notes', pill: 1 },
+                { k: 'notes', label: 'Notes', pill: selected?.notes?.length || 0 },
                 { k: 'customer', label: 'Customer', icon: <Icon.User /> },
               ].map((x) => (
                 <button

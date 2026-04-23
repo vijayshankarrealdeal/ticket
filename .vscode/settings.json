@@ -1,0 +1,7 @@
+{
+  // Use conda base — do NOT auto-create or prefer a local .venv.
+  "python.defaultInterpreterPath": "/home/verti/miniconda3/bin/python",
+  "python.terminal.activateEnvironment": false,
+  "python.venvFolders": [],
+  "python.analysis.extraPaths": ["${workspaceFolder}/backend"]
+}

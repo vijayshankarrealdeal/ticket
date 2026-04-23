@@ -14,6 +14,8 @@ import {
   memberById,
   ticketById,
   customerById,
+  loadTeamsData,
+  loadConversationMessages,
 } from '../data/teamsData.js';
 import './teams.css';
 
@@ -73,7 +75,18 @@ function renderBlocks(blocks = []) {
 const LEFT_COLLAPSED_KEY = 'teams-left-collapsed';
 
 export default function Teams() {
-  const [activeId, setActiveId] = useState('c-support');
+  const [dataVersion, setDataVersion] = useState(0);
+  const [activeId, setActiveId] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    loadTeamsData().then(() => {
+      if (!alive) return;
+      setActiveId((cur) => cur || CHANNELS[0]?.id || DMS[0]?.id || null);
+      setDataVersion((v) => v + 1);
+    });
+    return () => { alive = false; };
+  }, []);
   const [query, setQuery] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
   const searchMount = useDelayUnmount(searchOpen, 220);
@@ -84,7 +97,7 @@ export default function Teams() {
   useEffect(() => {
     try { localStorage.setItem(LEFT_COLLAPSED_KEY, String(leftCollapsed)); } catch {}
   }, [leftCollapsed]);
-  const [threadsByConv, setThreadsByConv] = useState(SEED_MESSAGES);
+  const [threadsByConv, setThreadsByConv] = useState({});
   const [showInfo, setShowInfo] = useState(true);
   const [replyTo, setReplyTo] = useState(null);
   const [draft, setDraft] = useState('');
@@ -107,7 +120,18 @@ export default function Teams() {
     const dm = DMS.find((d) => d.id === activeId);
     if (dm) return { kind: 'dm', dm };
     return null;
-  }, [activeId]);
+  }, [activeId, dataVersion]);
+
+  useEffect(() => {
+    if (!activeId) return;
+    if (threadsByConv[activeId]) return;
+    let alive = true;
+    loadConversationMessages(activeId).then((msgs) => {
+      if (!alive) return;
+      setThreadsByConv((prev) => ({ ...prev, [activeId]: msgs }));
+    });
+    return () => { alive = false; };
+  }, [activeId, dataVersion]);
 
   const channelMessages = threadsByConv[activeId] || [];
 
@@ -127,12 +151,8 @@ export default function Teams() {
     return () => document.removeEventListener('keydown', onKey);
   }, [searchOpen, searchMount.state]);
 
-  // Simulated typing flicker — just a touch of life.
   useEffect(() => {
-    if (!active || active.kind !== 'channel') { setTypingNames([]); return; }
-    const t = setTimeout(() => setTypingNames([memberById('u-aniket').name]), 1800);
-    const t2 = setTimeout(() => setTypingNames([]), 6200);
-    return () => { clearTimeout(t); clearTimeout(t2); };
+    setTypingNames([]);
   }, [activeId, active]);
 
   const filteredChannels = CHANNELS.filter((c) => c.name.toLowerCase().includes(query.toLowerCase()));

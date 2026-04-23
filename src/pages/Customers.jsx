@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
 import { useGlobalSearch } from '../hooks/useGlobalSearch.jsx';
+import { api } from '../api.js';
 
 const avatarColors = ['#1e40af', '#0ea5e9', '#16a34a', '#f97316', '#ec4899', '#64748b', '#dc2626', '#0891b2'];
 const initials = (name) =>
@@ -23,253 +24,58 @@ const FILTERS = [
   { key: 'with-returns', label: 'With returns', match: (c) => (c.returns ?? 0) > 0 },
 ];
 
-const customers = [
-  {
-    id: 'c-aftab',
-    name: 'aftab sayyed',
-    phone: '918898400709',
-    phoneDisplay: '+91 88 9840 0709',
-    email: 'lionafsay@gmail.com',
-    since: 'Mar 2026',
-    lastActive: 'Apr 22, 2026',
-    channel: 'WhatsApp',
-    orders: 2,
-    returns: 0,
-    address: 'Floor-Ground Floor, test, test, THANE, Maharashtra, 400608, India',
-    otherAddresses: [
-      'Floor-1, 102 JEEVAN SAPNA APARTMENT JUHU, VERSOVA LINK ROAD ANDHERI WEST NEAR BANANA LEAF RESTAURENT, MUMBAI, Maharashtra, 400053, India',
-    ],
-    recentOrders: [
-      {
-        id: '20640127',
-        time: '6:00 PM, Mar 9, 26',
-        status: 'Cancellation Rejected on 11 April 2026',
-        statusTone: 'success',
-        total: 11500,
-        itemsCount: 2,
-        items: [
-          { name: 'Test Chair', qty: 1, price: 8000 },
-          { name: 'Test Custom Mattress', qty: 1, price: 3500 },
-        ],
-      },
-      {
-        id: '20635479',
-        time: '4:33 PM, Mar 4, 26',
-        status: 'Delivered on 4 March 2026',
-        statusTone: 'success',
-        total: 24999,
-        itemsCount: 1,
-        items: [{ name: 'SmartGRID Mattress', qty: 1, price: 24999 }],
-      },
-    ],
-    tickets: [
-      { id: '#3777', status: 'In Progress', statusTone: 'info', source: 'WhatsApp', task: 'product_issue_report', team: 'CRM L1', updated: 'Apr 22' },
-      { id: '#3759', status: 'Blocked', statusTone: 'danger', source: 'WhatsApp', task: 'delay_delivery', team: 'CRM L1', updated: 'Apr 10' },
-    ],
-  },
-  {
-    id: 'c-rajendra',
-    name: 'rajendra .',
-    phone: '919870231100',
-    phoneDisplay: '+91 98 7023 1100',
-    email: 'rajendra@example.com',
-    since: 'Apr 2026',
-    lastActive: 'Apr 14, 2026',
-    channel: 'WhatsApp',
-    orders: 1,
-    returns: 0,
-    address: 'Floor-Ground Floor, ANDHERI J b nagar metro station, MUMBAI, Maharashtra, 400059, India',
-    otherAddresses: [],
-    recentOrders: [
-      {
-        id: '20466915',
-        time: 'Aug 4, 2025',
-        status: 'Picked up by Customer',
-        statusTone: 'info',
-        total: 1899,
-        itemsCount: 1,
-        items: [{ name: 'Wedge Cushion', qty: 1, price: 1899 }],
-      },
-    ],
-    tickets: [
-      { id: '#3770', status: 'In Progress', statusTone: 'info', source: 'WhatsApp', task: 'not_delivered_agent_handoff', team: 'CRM L1', updated: 'Apr 21' },
-    ],
-  },
-  {
-    id: 'c-miloni',
-    name: 'Miloni Boricha',
-    phone: '919167534112',
-    phoneDisplay: '+91 91 6753 4112',
-    email: 'miloni.b@example.com',
-    since: 'Jan 2026',
-    lastActive: 'Apr 22, 2026',
-    channel: 'WhatsApp',
-    orders: 0,
-    returns: 0,
-    address: null,
-    otherAddresses: [],
-    recentOrders: [],
-    tickets: [],
-  },
-  {
-    id: 'c-dixit',
-    name: 'Dixit Shah',
-    phone: '919123123123',
-    phoneDisplay: '+91 91 2312 3123',
-    email: 'dixit@example.com',
-    since: 'Feb 2026',
-    lastActive: 'Apr 14, 2026',
-    channel: 'Call',
-    orders: 3,
-    returns: 1,
-    address: 'HSR Layout, Bangalore, Karnataka, 560102, India',
-    otherAddresses: [],
-    recentOrders: [
-      {
-        id: '20466820',
-        time: 'Apr 10, 2026',
-        status: 'Refund initiated',
-        statusTone: 'warning',
-        total: 45999,
-        itemsCount: 1,
-        items: [{ name: 'SmartGRID Mattress', qty: 1, price: 45999 }],
-      },
-      {
-        id: '20466719',
-        time: 'Apr 12, 2026',
-        status: 'In transit',
-        statusTone: 'info',
-        total: 9999,
-        itemsCount: 2,
-        items: [{ name: 'Ortho Pillow', qty: 2, price: 4999.5 }],
-      },
-    ],
-    tickets: [
-      { id: '#3765', status: 'Queued', statusTone: 'warning', source: 'Call', task: 'refund_pending', team: 'CRM L2', updated: 'Apr 14' },
-      { id: '#3764', status: 'Queued', statusTone: 'warning', source: 'Call', task: 'delivery_followup', team: 'CRM L1', updated: 'Apr 14' },
-    ],
-  },
-  {
-    id: 'c-ashwini',
-    name: 'Ashwini Sawant',
-    phone: '919820345612',
-    phoneDisplay: '+91 98 2034 5612',
-    email: 'ashwini2186@gmail.com',
-    since: 'Dec 2025',
-    lastActive: 'Apr 12, 2026',
-    channel: 'WhatsApp',
-    orders: 4,
-    returns: 2,
-    address: 'Flat 203, Sunrise Heights, Pune, Maharashtra, 411001, India',
-    otherAddresses: [],
-    recentOrders: [
-      {
-        id: '20401234',
-        time: 'Feb 18, 2026',
-        status: 'Delivered on 22 February 2026',
-        statusTone: 'success',
-        total: 6499,
-        itemsCount: 1,
-        items: [{ name: 'Cloud Pillow', qty: 1, price: 6499 }],
-      },
-    ],
-    tickets: [],
-  },
-  {
-    id: 'c-shaurya',
-    name: 'SHAURYA SINGH',
-    phone: '917678123456',
-    phoneDisplay: '+91 76 7812 3456',
-    email: 'shaurya@example.com',
-    since: 'Apr 2026',
-    lastActive: 'Apr 10, 2026',
-    channel: 'WhatsApp',
-    orders: 1,
-    returns: 0,
-    address: 'Sector 21, Noida, Uttar Pradesh, 201301, India',
-    otherAddresses: [],
-    recentOrders: [
-      {
-        id: '20598712',
-        time: 'Apr 8, 2026',
-        status: 'Out for delivery',
-        statusTone: 'info',
-        total: 18999,
-        itemsCount: 1,
-        items: [{ name: 'SensAI Sleep Analyzer Pillow', qty: 1, price: 18999 }],
-      },
-    ],
-    tickets: [
-      { id: '#3754', status: 'In Progress', statusTone: 'info', source: 'WhatsApp', task: 'delivery_followup', team: 'CRM L1', updated: 'Apr 10' },
-    ],
-  },
-  {
-    id: 'c-hamzah',
-    name: 'Hamzah',
-    phone: '919812345678',
-    phoneDisplay: '+91 98 1234 5678',
-    email: 'hamzah@example.com',
-    since: 'Nov 2025',
-    lastActive: 'Apr 20, 2026',
-    channel: 'WhatsApp',
-    orders: 2,
-    returns: 0,
-    address: 'Juhu, Mumbai, Maharashtra, 400049, India',
-    otherAddresses: [],
-    recentOrders: [
-      {
-        id: '20512345',
-        time: 'Mar 15, 2026',
-        status: 'Delivered on 18 March 2026',
-        statusTone: 'success',
-        total: 2499,
-        itemsCount: 1,
-        items: [{ name: 'Travel Neck Pillow', qty: 1, price: 2499 }],
-      },
-    ],
-    tickets: [],
-  },
-  {
-    id: 'c-fiona',
-    name: 'Fiona puthur',
-    phone: '919090807060',
-    phoneDisplay: '+91 90 9080 7060',
-    email: 'fiona.p@example.com',
-    since: 'Oct 2025',
-    lastActive: 'Apr 15, 2026',
-    channel: 'WhatsApp',
-    orders: 0,
-    returns: 0,
-    address: null,
-    otherAddresses: [],
-    recentOrders: [],
-    tickets: [],
-  },
-];
 
 export default function Customers() {
   const [params, setParams] = useSearchParams();
-  const findByParams = () => {
+  const [customers, setCustomers] = useState([]);
+
+  const findByParams = (list = customers) => {
     const id = params.get('id');
     if (id) {
-      const hit = customers.find((c) => c.id === id);
+      const hit = list.find((c) => c.id === id);
       if (hit) return hit.id;
     }
     const phone = params.get('phone');
     if (phone) {
-      const hit = customers.find((c) => c.phone === phone);
+      const hit = list.find((c) => c.phone === phone);
       if (hit) return hit.id;
     }
     const name = params.get('name');
     if (name) {
       const lower = name.toLowerCase();
-      const hit = customers.find((c) => c.name.toLowerCase() === lower);
+      const hit = list.find((c) => (c.name || '').toLowerCase() === lower);
       if (hit) return hit.id;
     }
     return null;
   };
 
-  const [selectedId, setSelectedId] = useState(() => findByParams() || customers[0].id);
+  const [selectedId, setSelectedId] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    api.get('/customers')
+      .then((res) => {
+        if (!alive) return;
+        const items = Array.isArray(res) ? res : res?.items || [];
+        setCustomers(items);
+        setSelectedId((cur) => cur ?? findByParams(items) ?? items[0]?.id ?? null);
+      })
+      .catch(() => { if (alive) setCustomers([]); });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    let alive = true;
+    api.get(`/customers/${encodeURIComponent(selectedId)}`)
+      .then((detail) => {
+        if (!alive || !detail) return;
+        setCustomers((prev) => prev.map((c) => c.id === selectedId ? { ...c, ...detail } : c));
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [selectedId]);
   const { query: search } = useGlobalSearch();
   const [sort, setSort] = useState('recent');
   const [sortOpen, setSortOpen] = useState(false);
@@ -306,7 +112,7 @@ export default function Customers() {
     const out = {};
     for (const f of FILTERS) out[f.key] = customers.filter(f.match).length;
     return out;
-  }, []);
+  }, [customers]);
 
   const visible = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -314,7 +120,7 @@ export default function Customers() {
     let out = customers.filter(filterFn).filter((c) => {
       if (!q) return true;
       return (
-        c.name.toLowerCase().includes(q) ||
+        (c.name || '').toLowerCase().includes(q) ||
         (c.phone || '').toLowerCase().includes(q) ||
         (c.email || '').toLowerCase().includes(q)
       );

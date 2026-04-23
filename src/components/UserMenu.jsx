@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { Icon } from './Icons.jsx';
 import { useDelayUnmount } from '../hooks/useDelayUnmount.js';
 import { clearAuth, loadAuth } from '../pages/AuthPage.jsx';
+import { closeRealtime } from '../hooks/useRealtime.js';
 
 const AVATAR_PALETTE = [
   { bg: '#eef2ff', fg: '#4338ca' },
@@ -71,6 +72,7 @@ export default function UserMenu({
       if (e.key === 'Escape') setConfirming(false);
       else if (e.key === 'Enter') {
         e.preventDefault();
+        closeRealtime();
         clearAuth();
         window.location.reload();
       }

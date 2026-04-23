@@ -1,24 +1,6 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Icon } from '../../components/Icons.jsx';
-
-const initialApis = [
-  { id: 1, name: 'luxury_sofa_store_availability', method: 'GET', integration: 'sleep_company_pos_stores', calls24h: 248, p95: '310ms', lastUsed: '3m ago', description: 'Check in-store availability for luxury SKUs by pincode.' },
-  { id: 2, name: 'Lead_capture_api', method: 'POST', integration: 'lead_capture_integration', calls24h: 92, p95: '180ms', lastUsed: '12m ago', description: 'Persist website lead with source & UTM attribution.' },
-  { id: 3, name: 'get_product_list', method: 'GET', integration: 'Shopify Integration', calls24h: 512, p95: '220ms', lastUsed: '1m ago', description: 'Catalog fetch with filters and pagination.' },
-  { id: 4, name: 'topper_complete_booking', method: 'POST', integration: 'return_replace_cancel', calls24h: 24, p95: '420ms', lastUsed: '2h ago', description: 'Finalize mattress topper booking post-verification.' },
-  { id: 5, name: 'verify_replace_return_eligibility', method: 'POST', integration: 'replace_return_eligibility', calls24h: 41, p95: '260ms', lastUsed: '28m ago', description: 'Check policy window + SKU eligibility in one call.' },
-  { id: 6, name: 'create_final_order', method: 'POST', integration: 'Shopify Integration', calls24h: 137, p95: '390ms', lastUsed: '6m ago', description: 'Create a draft order with discount codes applied.' },
-  { id: 7, name: 'validate_amount_replacement_order', method: 'POST', integration: 'return_replace_cancel', calls24h: 8, p95: '205ms', lastUsed: '4h ago', description: 'Validate diff amount charge/credit before replacement.' },
-];
-
-const initialIntegrations = [
-  { id: 'pos', name: 'sleep_company_pos_stores', apis: 1, desc: '—', health: 'good' },
-  { id: 'lead_fetch', name: 'lead_fetch_integration', apis: 0, desc: 'Customer pincode to fetch nearby store details', health: 'good' },
-  { id: 'lead_capture', name: 'lead_capture_integration', apis: 1, desc: '—', health: 'good' },
-  { id: 'shopify', name: 'Shopify Integration', apis: 1, desc: 'Integration to make shopify graphql api calls', health: 'good' },
-  { id: 'replace', name: 'replace_return_eligibility', apis: 1, desc: '—', health: 'warn' },
-  { id: 'return', name: 'return_replace_cancel', apis: 3, desc: '—', health: 'good' },
-];
+import { api as apiClient } from '../../api.js';
 
 const METHODS = ['ALL', 'GET', 'POST', 'PUT', 'DELETE'];
 
@@ -27,8 +9,21 @@ export default function ApiLibrary() {
   const [query, setQuery] = useState('');
   const [method, setMethod] = useState('ALL');
   const [integration, setIntegration] = useState('ALL');
-  const [apis, setApis] = useState(initialApis);
-  const [integrations, setIntegrations] = useState(initialIntegrations);
+  const [apis, setApis] = useState([]);
+  const [integrations, setIntegrations] = useState([]);
+
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      apiClient.get('/apis').catch(() => []),
+      apiClient.get('/integrations').catch(() => []),
+    ]).then(([a, i]) => {
+      if (!alive) return;
+      setApis(Array.isArray(a) ? a : a?.items || []);
+      setIntegrations(Array.isArray(i) ? i : i?.items || []);
+    });
+    return () => { alive = false; };
+  }, []);
 
   const integrationOptions = useMemo(
     () => ['ALL', ...Array.from(new Set(apis.map((a) => a.integration)))],
@@ -42,9 +37,9 @@ export default function ApiLibrary() {
       if (integration !== 'ALL' && a.integration !== integration) return false;
       if (!q) return true;
       return (
-        a.name.toLowerCase().includes(q) ||
-        a.description.toLowerCase().includes(q) ||
-        a.integration.toLowerCase().includes(q)
+        (a.name || '').toLowerCase().includes(q) ||
+        (a.description || '').toLowerCase().includes(q) ||
+        (a.integration || '').toLowerCase().includes(q)
       );
     });
   }, [apis, query, method, integration]);
@@ -53,19 +48,33 @@ export default function ApiLibrary() {
     const q = query.trim().toLowerCase();
     if (!q) return integrations;
     return integrations.filter(
-      (i) => i.name.toLowerCase().includes(q) || i.desc.toLowerCase().includes(q),
+      (i) => (i.name || '').toLowerCase().includes(q) || (i.desc || '').toLowerCase().includes(q),
     );
   }, [integrations, query]);
 
-  const deleteApi = (id) => setApis((prev) => prev.filter((a) => a.id !== id));
-  const cloneApi = (id) =>
+  const deleteApi = async (id) => {
+    try { await apiClient.del(`/apis/${encodeURIComponent(id)}`); } catch {}
+    setApis((prev) => prev.filter((a) => a.id !== id));
+  };
+  const cloneApi = async (id) => {
+    try {
+      const copy = await apiClient.post(`/apis/${encodeURIComponent(id)}/clone`);
+      if (copy) {
+        setApis((prev) => [copy, ...prev]);
+        return;
+      }
+    } catch {}
     setApis((prev) => {
       const base = prev.find((a) => a.id === id);
       if (!base) return prev;
       const copy = { ...base, id: Date.now(), name: base.name + '_copy', calls24h: 0, lastUsed: '—' };
       return [copy, ...prev];
     });
-  const deleteIntegration = (id) => setIntegrations((prev) => prev.filter((i) => i.id !== id));
+  };
+  const deleteIntegration = async (id) => {
+    try { await apiClient.del(`/integrations/${encodeURIComponent(id)}`); } catch {}
+    setIntegrations((prev) => prev.filter((i) => i.id !== id));
+  };
 
   return (
     <div className="ch-page">

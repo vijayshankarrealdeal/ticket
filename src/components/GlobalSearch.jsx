@@ -5,6 +5,8 @@ import { useDelayUnmount } from '../hooks/useDelayUnmount.js';
 import { useGlobalSearch } from '../hooks/useGlobalSearch.jsx';
 import { runGlobalSearch } from '../data/globalSearchData.js';
 
+const EMPTY_RESULTS = { conversations: [], tickets: [], contacts: [], total: 0 };
+
 const TYPE_META = {
   conversation: { label: 'Conversations', icon: Icon.Inbox,  tone: 'info'    },
   ticket:       { label: 'Tickets',       icon: Icon.Ticket, tone: 'primary' },
@@ -20,7 +22,16 @@ export default function GlobalSearch() {
   const navigate = useNavigate();
   const panel = useDelayUnmount(open && query.trim().length > 0, 160);
 
-  const results = useMemo(() => runGlobalSearch(query), [query]);
+  const [results, setResults] = useState(EMPTY_RESULTS);
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) { setResults(EMPTY_RESULTS); return; }
+    const ctrl = new AbortController();
+    const t = setTimeout(() => {
+      runGlobalSearch(q, 8, { signal: ctrl.signal }).then(setResults).catch(() => {});
+    }, 120);
+    return () => { clearTimeout(t); ctrl.abort(); };
+  }, [query]);
 
   const flat = useMemo(() => {
     return [

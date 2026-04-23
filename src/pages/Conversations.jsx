@@ -4,145 +4,16 @@ import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
 import { useDelayUnmount } from '../hooks/useDelayUnmount.js';
 import { useGlobalSearch } from '../hooks/useGlobalSearch.jsx';
+import { api } from '../api.js';
+import { useRealtimeTopic } from '../hooks/useRealtime.js';
+import { loadAuth } from './AuthPage.jsx';
 
 const CHANNELS = ['All', 'WhatsApp', 'Instagram', 'Live Chat', 'Mails'];
 
 const avatarColors = ['#1e40af', '#0ea5e9', '#16a34a', '#f97316', '#ec4899', '#64748b', '#dc2626', '#0891b2'];
 const initials = (name) =>
-  name.split(' ').filter(Boolean).map((w) => w[0]).slice(0, 2).join('').toUpperCase();
-const colorFor = (seed) => avatarColors[seed.charCodeAt(0) % avatarColors.length];
-
-const threads = [
-  {
-    id: 1,
-    name: '+91 88 7931 7596',
-    isPhone: true,
-    channel: 'WhatsApp',
-    date: 'Apr 22',
-    preview: "Hey! I'd love t...",
-    phone: '918879317596',
-    messages: [
-      { from: 'them', at: '12:38 PM, 22 Apr', text: 'Hello, I need help with my WaveX foot massager. There is a defect. One leg of the product doesn\'t seem to work.' },
-      { from: 'system', at: '12:39 PM, 22 Apr', text: 'Product Issue Report task started' },
-      { from: 'me', at: '12:39 PM, 22 Apr', text: 'Hi there! To assist you with the issue in your foot massager, could you please confirm the order ID or provide details of the order linked to your phone number? This will help me check the specific order and guide you further.', delivered: true },
-      { from: 'them', at: '12:42 PM, 22 Apr', text: 'Hi, I actually want to know more about the product. I wanted to recommend it to my friend. Can you help me with the use cases' },
-      { from: 'me', at: '12:42 PM, 22 Apr', text: "Hey! I'd love to help you with the use cases of the WaveX Foot Massager. To provide you with the best information, could you please confirm the order ID or select the order containing this product? This will help me give you accurate details.", delivered: true },
-    ],
-  },
-  {
-    id: 2,
-    name: 'Miloni Boricha',
-    channel: 'WhatsApp',
-    date: 'Apr 22',
-    preview: 'For a hotel-lik...',
-    phone: '919167534112',
-    messages: [
-      { from: 'them', at: '12:24 PM, 22 Apr', text: 'Hi, I am looking for pillows for a hotel-like sleep experience at home. Any recommendations?' },
-      { from: 'me', at: '12:31 PM, 22 Apr', delivered: true, text: `Hey! Here are our top picks from The Sleep Company:
-
-1. Cloud Pillow – Ultra soft memory foam for premium hotel feel. Price: ₹2,499
-https://thesleepcompany.in/products/cloud-pillow
-
-2. Smart Thin Pillow – Contoured shape for neck support and cool comfort. Price: ₹1,999
-https://thesleepcompany.in/products/smart-thin-pillow
-
-3. SensAI Sleep Analyzer Pillow – Combines comfort with advanced sleep tracking technology. Price: ₹8,500
-https://thesleepcompany.in/products/sensai-sleep-analyzer-pillow
-
-4. Travel Neck Pillow – Soft and supportive, available in Black and Navy Blue. Price: ₹1,499
-https://thesleepcompany.in/products/travel-neck-pillow
-
-Would you like help with ordering any of these?` },
-    ],
-  },
-  { id: 3, name: 'Hamzah', channel: 'WhatsApp', date: 'Apr 20', preview: 'I understand yo...' },
-  { id: 4, name: 'VINAY M', channel: 'Live Chat', date: 'Apr 20', preview: 'Waiting for callback' },
-  { id: 5, name: 'Soumya Kundena', channel: 'WhatsApp', date: 'Apr 19', preview: 'Thanks, will check' },
-  { id: 6, name: 'rajendra .', channel: 'WhatsApp', date: 'Apr 14', preview: 'Order not received', assignee: 'Aniket ..', unread: 1 },
-  { id: 7, name: 'Ashwini Sawant', channel: 'WhatsApp', date: 'Apr 12', preview: 'Please call back' },
-  {
-    id: 8,
-    name: 'aftab sayyed',
-    channel: 'Mails',
-    date: 'Apr 10',
-    preview: 'Please i wantt to return th...',
-    assignee: 'aftab.s..',
-    unread: 3,
-    email: 'lionafsay@gmail.com',
-    phone: '918898400709',
-    orderId: '20652643',
-    notes: [],
-    recordings: [],
-    attachments: [
-      { id: '20650760', date: 'Mar 30, 2026 12:09 AM' },
-      { id: '20643718', title: '20643718 what is the delivery status', date: 'Mar 24, 2026 4:03 PM' },
-    ],
-    customer: {
-      name: 'aftab sayyed',
-      phone: '918898400709',
-      email: 'lionafsay@gmail.com',
-      orders: 2,
-      returns: 0,
-      address: 'Floor-Ground Floor, test, test, THANE, Maharashtra, 400608, India',
-      otherAddresses: [
-        'Floor-1, 102 JEEVAN SAPNA APARTMENT JUHU, VERSOVA LINK ROAD ANDHERI WEST NEAR BANANA LEAF RESTAURENT, MUMBAI, Maharashtra, 400053, India',
-      ],
-      recentOrders: [
-        {
-          id: '20640127',
-          time: '6:00 PM, Mar 9, 26',
-          status: 'Cancellation Rejected on 11 April 2026',
-          statusTone: 'success',
-          total: 11500,
-          itemsCount: 2,
-          items: [
-            { name: 'Test Chair', qty: 1, price: 8000 },
-            { name: 'Test Custom Mattress', qty: 1, price: 3500 },
-          ],
-        },
-        {
-          id: '20635479',
-          time: '4:33 PM, Mar 4, 26',
-          status: 'Delivered on 4 March 2026',
-          statusTone: 'success',
-          total: 24999,
-          itemsCount: 1,
-          items: [{ name: 'SmartGRID Mattress', qty: 1, price: 24999 }],
-        },
-      ],
-    },
-    messages: [
-      { from: 'them', at: 'Apr 2, 4:32 PM', text: 'Please i wantt to return thee mattress', fromName: 'Aftab Sayyed', to: 'Crm_Test' },
-      { from: 'system', at: '4:45 PM, 2 Apr', text: 'Product Issue Report task started' },
-    ],
-    tickets: [
-      {
-        id: '#3759',
-        status: 'Blocked',
-        statusClass: 'danger',
-        source: 'WhatsApp',
-        task: 'delay_delivery',
-        team: 'CRM L1',
-        orderPlacedOn: '2 April 2026',
-        pendingChild: {
-          assigneeEmail: 'aftab.sayyed@thesleepcompany.in',
-          team: 'Logistics',
-          objective: 'logistics_status',
-          prompt:
-            'Check the status of the delayed shipment and select the reason for the delay from the provided list. Provide the revised estimated time of arrival (ETA) to the customer.',
-          resolution:
-            'delivered, lost in transit, Stuck at hub, Blocked at warehouse, Delayed dispatch, Missing item, Shipment damage, Courier delay, CX Not reachable, CX denied delivery, Others',
-        },
-      },
-    ],
-  },
-  { id: 9, name: 'Fiona puthur', channel: 'WhatsApp', date: 'Apr 15', preview: 'Let me check fo...' },
-  { id: 10, name: 'Anudeep Baidya', channel: 'WhatsApp', date: 'Apr 10', preview: 'For neck pain, ...' },
-  { id: 11, name: 'SHAURYA SINGH', channel: 'WhatsApp', date: 'Apr 10', preview: 'Hi there! Your ...', assignee: 'Aniket ..', unread: 1 },
-  { id: 12, name: 'Naveen K', channel: 'Instagram', date: 'Apr 9', preview: 'DM about recliner' },
-  { id: 13, name: 'Akshay Mukim', channel: 'Live Chat', date: 'Apr 9', preview: 'Chat escalation' },
-  { id: 14, name: 'Harish', channel: 'WhatsApp', date: 'Apr 10', preview: 'Hi there! I see...' },
-];
+  (name || '').split(' ').filter(Boolean).map((w) => w[0]).slice(0, 2).join('').toUpperCase();
+const colorFor = (seed) => avatarColors[((seed || ' ').charCodeAt(0) || 0) % avatarColors.length];
 
 export default function Conversations() {
   const [params, setParams] = useSearchParams();
@@ -150,27 +21,81 @@ export default function Conversations() {
 
   const [tab, setTab] = useState('all');
   const [channelOpen, setChannelOpen] = useState(false);
-  const initialId = (() => {
+  const [selectedId, setSelectedId] = useState(() => {
     const raw = params.get('id');
     const n = raw ? Number(raw) : NaN;
-    return Number.isFinite(n) && threads.some((t) => t.id === n) ? n : 8;
-  })();
-  const [selectedId, setSelectedId] = useState(initialId);
+    return Number.isFinite(n) ? n : null;
+  });
+  const [draft, setDraft] = useState('');
+  const [list, setList] = useState([]);
+
+  useEffect(() => {
+    let alive = true;
+    api.get('/conversations')
+      .then((res) => {
+        if (!alive) return;
+        const items = Array.isArray(res) ? res : res?.items || [];
+        setList(items);
+        setSelectedId((cur) => cur ?? items[0]?.id ?? null);
+      })
+      .catch(() => { if (alive) setList([]); });
+    return () => { alive = false; };
+  }, []);
+
+  useEffect(() => {
+    if (selectedId == null) return;
+    let alive = true;
+    api.get(`/conversations/${encodeURIComponent(selectedId)}`)
+      .then((detail) => {
+        if (!alive || !detail) return;
+        setList((prev) => prev.map((t) => t.id === selectedId ? { ...t, ...detail } : t));
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [selectedId]);
 
   useEffect(() => {
     const raw = params.get('id');
     if (!raw) return;
     const n = Number(raw);
-    if (Number.isFinite(n) && threads.some((t) => t.id === n)) {
+    if (Number.isFinite(n) && list.some((t) => t.id === n)) {
       setSelectedId(n);
+      const next = new URLSearchParams(params);
+      next.delete('id');
+      setParams(next, { replace: true });
     }
-    const next = new URLSearchParams(params);
-    next.delete('id');
-    setParams(next, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params]);
-  const [draft, setDraft] = useState('');
-  const [list, setList] = useState(threads);
+  }, [params, list]);
+
+  // Realtime — inbox list updates for this workspace.
+  const workspaceId = loadAuth()?.workspaceId;
+  useRealtimeTopic(workspaceId ? `inbox:${workspaceId}` : null, (evt) => {
+    if (evt.type === 'conversation.updated') {
+      setList((prev) => prev.map((c) => c.id === evt.data.id ? { ...c, ...evt.data } : c));
+    } else if (evt.type === 'ticket.created' || evt.type === 'ticket.updated') {
+      // a ticket change may affect the right-rail ticket list on the selected thread
+      setList((prev) => prev.map((c) =>
+        evt.data?.conversation_id && c.id === evt.data.conversation_id
+          ? { ...c, tickets: [evt.data, ...(c.tickets || []).filter((t) => t.id !== evt.data.id)] }
+          : c
+      ));
+    }
+  });
+
+  // Realtime — messages for the currently open thread.
+  useRealtimeTopic(selectedId ? `conv:${selectedId}` : null, (evt) => {
+    if (evt.type !== 'message.created') return;
+    setList((prev) => prev.map((c) => {
+      if (c.id !== selectedId) return c;
+      const existing = c.messages || [];
+      // De-dupe vs the optimistic bubble (matched on tempId → id).
+      const tempId = evt.data?.tempId;
+      const withoutTemp = tempId ? existing.filter((m) => m.id !== tempId && m.tempId !== tempId) : existing;
+      // Guard against double-inserts when the server also returns the message from POST.
+      if (evt.data?.id && withoutTemp.some((m) => m.id === evt.data.id)) return c;
+      return { ...c, messages: [...withoutTemp, evt.data], preview: evt.data.text || c.preview };
+    }));
+  });
   const [rightPanel, setRightPanel] = useState('ticket');
   const [viewChannel, setViewChannel] = useState(null);
   const { query: search } = useGlobalSearch();
@@ -224,12 +149,10 @@ export default function Conversations() {
     (filters.unreadOnly ? 1 : 0) +
     (filters.withAttachments ? 1 : 0);
 
-  const visible = useMemo(() => {
+  const scoped = useMemo(() => {
     const q = search.trim().toLowerCase();
     return list.filter((t) => {
       if (channel !== 'All' && t.channel !== channel) return false;
-      if (tab === 'pending' && t.assignee) return false;
-      if (tab === 'unassigned' && t.assignee) return false;
       if (filters.assignment === 'assigned' && !t.assignee) return false;
       if (filters.assignment === 'unassigned' && t.assignee) return false;
       if (filters.unreadOnly && !t.unread) return false;
@@ -240,7 +163,19 @@ export default function Conversations() {
       }
       return true;
     });
-  }, [list, channel, tab, filters, search]);
+  }, [list, channel, filters, search]);
+
+  const counts = useMemo(() => ({
+    all: scoped.length,
+    pending: scoped.filter((t) => (t.status || '').toLowerCase() === 'pending').length,
+    unassigned: scoped.filter((t) => !t.assignee).length,
+  }), [scoped]);
+
+  const visible = useMemo(() => scoped.filter((t) => {
+    if (tab === 'pending' && (t.status || '').toLowerCase() !== 'pending') return false;
+    if (tab === 'unassigned' && t.assignee) return false;
+    return true;
+  }), [scoped, tab]);
 
   const setChannel = (c) => {
     const next = new URLSearchParams(params);
@@ -254,12 +189,29 @@ export default function Conversations() {
     const targetId = activeThread.id;
     const msgAttachments = pending.map(({ id, kind, name, size, mime, url }) => ({ id, kind, name, size, mime, url }));
     const replyTo = replyingTo && replyingTo.threadId === targetId ? replyingTo.ref : null;
+    const tempId = `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const text = draft;
+
+    // Optimistic insert — the WS `message.created` arriving later will replace this by tempId.
     setList((prev) => prev.map((t) => t.id === targetId
-      ? { ...t, messages: [...(t.messages || []), { from: 'me', at: 'now', text: draft, delivered: true, attachments: msgAttachments.length ? msgAttachments : undefined, replyTo: replyTo || undefined }] }
+      ? { ...t, messages: [...(t.messages || []), { id: tempId, tempId, from: 'me', at: 'now', text, delivered: false, attachments: msgAttachments.length ? msgAttachments : undefined, replyTo: replyTo || undefined }] }
       : t));
     setDraft('');
     setPending([]);
     setReplyingTo(null);
+
+    api.post(`/conversations/${encodeURIComponent(targetId)}/messages`, {
+      text, attachments: msgAttachments, replyTo, tempId,
+    }).then((saved) => {
+      setList((prev) => prev.map((t) => t.id === targetId
+        ? { ...t, messages: (t.messages || []).map((m) => m.tempId === tempId ? { ...saved, tempId } : m) }
+        : t));
+    }).catch(() => {
+      // Mark as failed — keep optimistic bubble, flag it
+      setList((prev) => prev.map((t) => t.id === targetId
+        ? { ...t, messages: (t.messages || []).map((m) => m.tempId === tempId ? { ...m, failed: true, delivered: false } : m) }
+        : t));
+    });
   };
 
   const startReply = (m) => {
@@ -498,13 +450,13 @@ export default function Conversations() {
               </div>
               <div className="tabs">
                 <button className={'tab' + (tab === 'all' ? ' active' : '')} onClick={() => setTab('all')}>
-                  All <span className={'count ' + (tab === 'all' ? '' : 'gray')}>{list.length}</span>
+                  All <span className={'count ' + (tab === 'all' ? '' : 'gray')}>{counts.all}</span>
                 </button>
                 <button className={'tab' + (tab === 'pending' ? ' active' : '')} onClick={() => setTab('pending')}>
-                  Pending <span className={'count ' + (tab === 'pending' ? '' : 'red')}>263</span>
+                  Pending <span className={'count ' + (tab === 'pending' ? '' : 'red')}>{counts.pending}</span>
                 </button>
                 <button className={'tab' + (tab === 'unassigned' ? ' active' : '')} onClick={() => setTab('unassigned')}>
-                  Unassigned <span className={'count ' + (tab === 'unassigned' ? '' : 'gray')}>49</span>
+                  Unassigned <span className={'count ' + (tab === 'unassigned' ? '' : 'gray')}>{counts.unassigned}</span>
                 </button>
               </div>
             </div>

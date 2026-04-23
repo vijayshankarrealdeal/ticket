@@ -1,36 +1,12 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Icon } from '../../components/Icons.jsx';
-
-function makeLogs() {
-  const names = ['get_product_list', 'create_final_order', 'Lead_capture_api', 'verify_replace_return_eligibility', 'luxury_sofa_store_availability', 'topper_complete_booking'];
-  const actions = ['fetch_catalog', 'draft_order', 'capture', 'check_eligibility', 'availability', 'book_topper'];
-  const statuses = ['200', '200', '200', '200', '200', '400', '500', '200', '429', '200'];
-  const out = [];
-  for (let i = 0; i < 48; i++) {
-    const minutesAgo = i * 3 + (i % 4);
-    const n = i % names.length;
-    const s = statuses[i % statuses.length];
-    out.push({
-      id: 'log-' + i,
-      time: minutesAgo < 60 ? `${minutesAgo || 1}m ago` : `${Math.floor(minutesAgo / 60)}h ${minutesAgo % 60}m ago`,
-      timestamp: new Date(Date.now() - minutesAgo * 60000),
-      apiName: names[n],
-      executeAction: actions[n],
-      customerId: 'CUST-' + (10000 + ((i * 7) % 9000)),
-      status: s,
-      latency: 120 + ((i * 37) % 520),
-    });
-  }
-  return out;
-}
-
-const ALL_LOGS = makeLogs();
+import { api } from '../../api.js';
 
 const STATUS_FILTERS = [
   { key: 'all', label: 'All', match: () => true },
-  { key: 'success', label: 'Success', match: (s) => s.startsWith('2') },
-  { key: 'client', label: '4xx errors', match: (s) => s.startsWith('4') },
-  { key: 'server', label: '5xx errors', match: (s) => s.startsWith('5') },
+  { key: 'success', label: 'Success', match: (s) => String(s).startsWith('2') },
+  { key: 'client', label: '4xx errors', match: (s) => String(s).startsWith('4') },
+  { key: 'server', label: '5xx errors', match: (s) => String(s).startsWith('5') },
 ];
 
 export default function ApiLogs() {
@@ -38,34 +14,55 @@ export default function ApiLogs() {
   const [status, setStatus] = useState('all');
   const [apiFilter, setApiFilter] = useState('ALL');
   const [selected, setSelected] = useState(null);
+  const [logs, setLogs] = useState([]);
+  const [stats, setStats] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      api.get('/api-logs').catch(() => []),
+      api.get('/api-logs/stats').catch(() => null),
+    ]).then(([l, s]) => {
+      if (!alive) return;
+      setLogs(Array.isArray(l) ? l : l?.items || []);
+      setStats(s || null);
+    });
+    return () => { alive = false; };
+  }, []);
 
   const apiOptions = useMemo(
-    () => ['ALL', ...Array.from(new Set(ALL_LOGS.map((l) => l.apiName)))],
-    [],
+    () => ['ALL', ...Array.from(new Set(logs.map((l) => l.apiName).filter(Boolean)))],
+    [logs],
   );
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     const filter = STATUS_FILTERS.find((f) => f.key === status).match;
-    return ALL_LOGS.filter((l) => {
+    return logs.filter((l) => {
       if (!filter(l.status)) return false;
       if (apiFilter !== 'ALL' && l.apiName !== apiFilter) return false;
       if (!q) return true;
       return (
-        l.apiName.toLowerCase().includes(q) ||
-        l.customerId.toLowerCase().includes(q) ||
-        l.executeAction.toLowerCase().includes(q)
+        (l.apiName || '').toLowerCase().includes(q) ||
+        (l.customerId || '').toLowerCase().includes(q) ||
+        (l.executeAction || '').toLowerCase().includes(q)
       );
     });
-  }, [query, status, apiFilter]);
+  }, [query, status, apiFilter, logs]);
 
   const counts = useMemo(() => {
-    const total = ALL_LOGS.length;
-    const success = ALL_LOGS.filter((l) => l.status.startsWith('2')).length;
-    const err4 = ALL_LOGS.filter((l) => l.status.startsWith('4')).length;
-    const err5 = ALL_LOGS.filter((l) => l.status.startsWith('5')).length;
+    if (stats) return {
+      total: stats.total ?? logs.length,
+      success: stats.success ?? 0,
+      err4: stats.err4 ?? 0,
+      err5: stats.err5 ?? 0,
+    };
+    const total = logs.length;
+    const success = logs.filter((l) => String(l.status).startsWith('2')).length;
+    const err4 = logs.filter((l) => String(l.status).startsWith('4')).length;
+    const err5 = logs.filter((l) => String(l.status).startsWith('5')).length;
     return { total, success, err4, err5 };
-  }, []);
+  }, [logs, stats]);
 
   return (
     <div className="ch-page">

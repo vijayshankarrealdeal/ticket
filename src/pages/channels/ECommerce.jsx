@@ -1,57 +1,35 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Icon } from '../../components/Icons.jsx';
+import { api } from '../../api.js';
 
-const initialStores = [
-  {
-    id: 'store-1',
-    name: 'thesleepcompany.in',
-    platform: 'Shopify',
-    accent: '#95bf47',
-    letter: 'S',
-    status: 'connected',
-    plan: 'Shopify Plus',
-    lastSync: '2 minutes ago',
-    orders30d: 1284,
-    health: 98,
-  },
-  {
-    id: 'store-2',
-    name: 'thesleepcompany.ae',
-    platform: 'Shopify',
-    accent: '#95bf47',
-    letter: 'S',
-    status: 'syncing',
-    plan: 'Shopify',
-    lastSync: 'Syncing…',
-    orders30d: 142,
-    health: 92,
-  },
-  {
-    id: 'store-3',
-    name: 'wholesale portal',
-    platform: 'Unicommerce',
-    accent: '#9ab04a',
-    letter: 'U',
-    status: 'attention',
-    plan: 'Enterprise',
-    lastSync: '42 minutes ago · webhook delayed',
-    orders30d: 38,
-    health: 74,
-  },
-];
-
-const recentEvents = [
-  { id: 1, type: 'order', icon: Icon.ShoppingBag, tone: 'primary', title: 'Order #SC-18472', sub: 'Shopify · Mumbai', time: '2m ago' },
-  { id: 2, type: 'sync', icon: Icon.Refresh, tone: 'info', title: 'Inventory synced', sub: '1,204 SKUs updated from Unicommerce', time: '14m ago' },
-  { id: 3, type: 'issue', icon: Icon.AlertTriangle, tone: 'warning', title: 'Webhook retried', sub: 'orders/updated · Shopify AE · success on 2nd try', time: '1h ago' },
-  { id: 4, type: 'order', icon: Icon.ShoppingBag, tone: 'primary', title: 'Order #SC-18469', sub: 'Shopify · Bengaluru', time: '1h ago' },
-  { id: 5, type: 'refund', icon: Icon.Refresh, tone: 'danger', title: 'Refund processed', sub: '#SC-18202 · returned to original method', time: '3h ago' },
-];
+const EVENT_ICONS = {
+  order: { icon: Icon.ShoppingBag, tone: 'primary' },
+  sync: { icon: Icon.Refresh, tone: 'info' },
+  issue: { icon: Icon.AlertTriangle, tone: 'warning' },
+  refund: { icon: Icon.Refresh, tone: 'danger' },
+};
 
 export default function ECommerce() {
-  const [stores, setStores] = useState(initialStores);
+  const [stores, setStores] = useState([]);
+  const [events, setEvents] = useState([]);
 
-  const disconnect = (id) => setStores((prev) => prev.filter((s) => s.id !== id));
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      api.get('/ecommerce/stores').catch(() => []),
+      api.get('/ecommerce/events').catch(() => []),
+    ]).then(([s, e]) => {
+      if (!alive) return;
+      setStores(Array.isArray(s) ? s : s?.items || []);
+      setEvents(Array.isArray(e) ? e : e?.items || []);
+    });
+    return () => { alive = false; };
+  }, []);
+
+  const disconnect = async (id) => {
+    try { await api.del(`/ecommerce/stores/${encodeURIComponent(id)}`); } catch {}
+    setStores((prev) => prev.filter((s) => s.id !== id));
+  };
 
   return (
     <div className="ch-page">
@@ -110,11 +88,12 @@ export default function ECommerce() {
             <button className="ch-link">View all</button>
           </div>
           <div className="ch-activity-list">
-            {recentEvents.map((e) => {
-              const I = e.icon;
+            {events.map((e) => {
+              const meta = EVENT_ICONS[e.type] || { icon: Icon.Activity, tone: 'muted' };
+              const I = meta.icon;
               return (
                 <div key={e.id} className="ch-activity-item">
-                  <div className={'ch-activity-icon tone-' + e.tone}>
+                  <div className={'ch-activity-icon tone-' + (e.tone || meta.tone)}>
                     <I />
                   </div>
                   <div className="ch-activity-body">

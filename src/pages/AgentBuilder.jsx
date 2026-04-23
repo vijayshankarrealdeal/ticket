@@ -1,25 +1,36 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
-
-const defaultTools = [
-  { key: 'kb_search', label: 'Knowledge Base Search', desc: 'Search help articles & FAQs', on: true },
-  { key: 'order_lookup', label: 'Order Lookup', desc: 'Fetch order details by ID or phone', on: true },
-  { key: 'refund', label: 'Issue Refund', desc: 'Trigger refund up to ₹10,000', on: false },
-  { key: 'escalate', label: 'Escalate to Human', desc: 'Hand off conversation to an agent', on: true },
-  { key: 'web_search', label: 'Web Search', desc: 'Look up public info', on: false },
-  { key: 'shipping_status', label: 'Shipping Status', desc: 'Track parcels via courier APIs', on: true },
-];
+import { api } from '../api.js';
 
 export default function AgentBuilder() {
-  const [name, setName] = useState('Support Agent v1');
+  const [agentId, setAgentId] = useState(null);
+  const [name, setName] = useState('');
   const [model, setModel] = useState('claude-opus-4-7');
-  const [persona, setPersona] = useState('Friendly, concise, solutions-first.');
-  const [instructions, setInstructions] = useState(
-    'You are a customer support agent for The Sleep Company. Always greet the user, verify the issue, consult the knowledge base, and escalate to a human when unsure.',
-  );
-  const [tools, setTools] = useState(defaultTools);
+  const [persona, setPersona] = useState('');
+  const [instructions, setInstructions] = useState('');
+  const [tools, setTools] = useState([]);
   const [temperature, setTemperature] = useState(0.3);
+
+  useEffect(() => {
+    let alive = true;
+    api.get('/agents')
+      .then((res) => {
+        if (!alive) return;
+        const items = Array.isArray(res) ? res : res?.items || [];
+        const first = items[0];
+        if (!first) return;
+        setAgentId(first.id || null);
+        setName(first.name || '');
+        if (first.model) setModel(first.model);
+        setPersona(first.persona || '');
+        setInstructions(first.instructions || '');
+        setTools(Array.isArray(first.tools) ? first.tools : []);
+        if (typeof first.temperature === 'number') setTemperature(first.temperature);
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
 
   const toggleTool = (key) =>
     setTools((prev) => prev.map((t) => (t.key === key ? { ...t, on: !t.on } : t)));
@@ -30,7 +41,7 @@ export default function AgentBuilder() {
       <div className="page-scroll">
         <div className="page-header">
           <div>
-            <div className="page-title">Support Agent v1</div>
+            <div className="page-title">{name || 'New agent'}</div>
             <div className="page-sub">Design how your AI handles incoming tickets.</div>
           </div>
           <div style={{ display: 'flex', gap: 10 }}>

@@ -1,0 +1,129 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Brings up db / redis / minio / langflow via docker compose, then exits.
+      // Use this when you only want the infra and plan to run the api/web
+      // locally with hot-reload.
+      "name": "Stack: Infra only (db, redis, minio, langflow)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "docker compose up -d db redis minio langflow && docker compose ps",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      // Full containerized stack — mirrors prod. Rebuilds images on change.
+      "name": "Stack: Full (docker compose up --build)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "docker compose up --build",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      // FastAPI with uvicorn --reload. Runs against the infra started by
+      // "Stack: Infra only". DB/Redis/MinIO point at localhost-exposed ports.
+      "name": "Backend: FastAPI (uvicorn --reload)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "/home/verti/miniconda3/bin/python",
+      "module": "uvicorn",
+      "args": [
+        "app.main:app",
+        "--reload",
+        "--host", "0.0.0.0",
+        "--port", "8000"
+      ],
+      "cwd": "${workspaceFolder}/backend",
+      // --reload forks a worker; track & kill it with the parent.
+      "subProcess": true,
+      "console": "integratedTerminal",
+      "env": {
+        "APP_ROLE": "api",
+        "PORT": "8000",
+        "DATABASE_URL": "postgresql://workspacex:workspacex@localhost:5432/workspacex",
+        "REDIS_URL": "redis://localhost:6379",
+        "S3_ENDPOINT": "http://localhost:9000",
+        "S3_PUBLIC_URL": "http://localhost:9000",
+        "S3_BUCKET": "workspacex",
+        "S3_ACCESS_KEY": "workspacex",
+        "S3_SECRET_KEY": "workspacex-secret",
+        "LANGFLOW_URL": "http://localhost:7860",
+        "AUTO_MIGRATE": "1",
+        "AUTO_SEED": "1",
+        "CORS_ORIGINS": "http://localhost:3000,http://localhost:5173",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "justMyCode": false,
+      "preLaunchTask": "backend: prelaunch",
+      "postDebugTask": "port: free 8000"
+    },
+    {
+      // Worker process (AI responder, SLA engine, outbox dispatcher stubs).
+      "name": "Backend: Worker (app.worker)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "/home/verti/miniconda3/bin/python",
+      "module": "app.worker",
+      "cwd": "${workspaceFolder}/backend",
+      "env": {
+        "APP_ROLE": "worker",
+        "DATABASE_URL": "postgresql://workspacex:workspacex@localhost:5432/workspacex",
+        "REDIS_URL": "redis://localhost:6379",
+        "S3_ENDPOINT": "http://localhost:9000",
+        "LANGFLOW_URL": "http://localhost:7860",
+        "AUTO_MIGRATE": "0",
+        "AUTO_SEED": "0",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "justMyCode": false,
+      "preLaunchTask": "stack: up (infra only)"
+    },
+    {
+      // Vite dev server with HMR on :5173. VITE_API_URL points the SPA at the
+      // locally-running FastAPI (rather than the nginx-fronted /api path).
+      "name": "Frontend: Vite dev (npm run dev)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run dev",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "VITE_API_URL": "http://localhost:8000"
+      },
+      "preLaunchTask": "port: free 5173"
+    },
+    {
+      // Opens Chrome against the Vite dev server for DOM/JS debugging.
+      // Pair with "Frontend: Vite dev" via the compound below.
+      "name": "Frontend: Chrome attach (localhost:5173)",
+      "type": "chrome",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/src",
+      "sourceMaps": true
+    }
+  ],
+  "compounds": [
+    {
+      // One-click dev: infra containers + FastAPI (debugger) + Vite (terminal).
+      "name": "Dev: Full Stack (infra + backend + frontend)",
+      "configurations": [
+        "Backend: FastAPI (uvicorn --reload)",
+        "Frontend: Vite dev (npm run dev)"
+      ],
+      "stopAll": true,
+      "presentation": {
+        "hidden": false,
+        "group": "dev",
+        "order": 1
+      }
+    },
+    {
+      "name": "Dev: Backend + Worker",
+      "configurations": [
+        "Backend: FastAPI (uvicorn --reload)",
+        "Backend: Worker (app.worker)"
+      ],
+      "stopAll": true
+    }
+  ]
+}

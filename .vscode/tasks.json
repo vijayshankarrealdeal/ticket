@@ -1,0 +1,80 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // Invoked by the Backend launch configs before debugpy starts.
+      // Idempotent: if containers are already up, docker compose is a no-op.
+      "label": "stack: up (infra only)",
+      "type": "shell",
+      "command": "docker compose up -d db redis minio langflow",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared",
+        "clear": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "stack: up (full)",
+      "type": "shell",
+      "command": "docker compose up -d --build",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+    {
+      "label": "stack: down",
+      "type": "shell",
+      "command": "docker compose down",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+    {
+      "label": "stack: logs (follow)",
+      "type": "shell",
+      "command": "docker compose logs -f",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
+      "label": "stack: nuke volumes",
+      "type": "shell",
+      "command": "docker compose down -v",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+    {
+      // Frees :8000 before/after a debug session. uvicorn --reload spawns a
+      // child worker that debugpy sometimes orphans on stop, leaving the port
+      // bound with "Address already in use" on the next launch. This nukes
+      // every pid holding 8000. `|| true` so missing/clean ports don't fail.
+      "label": "port: free 8000",
+      "type": "shell",
+      "command": "fuser -k -n tcp 8000 2>/dev/null || lsof -ti tcp:8000 | xargs -r kill -9 || true",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "silent", "panel": "shared", "clear": false },
+      "problemMatcher": []
+    },
+    {
+      // Frees :5173 (Vite dev). Same rationale as 8000.
+      "label": "port: free 5173",
+      "type": "shell",
+      "command": "fuser -k -n tcp 5173 2>/dev/null || lsof -ti tcp:5173 | xargs -r kill -9 || true",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "silent", "panel": "shared", "clear": false },
+      "problemMatcher": []
+    },
+    {
+      // Runs both preLaunch steps in order: kill stale :8000, then bring
+      // infra up. Used as the single preLaunchTask for the backend configs.
+      "label": "backend: prelaunch",
+      "dependsOrder": "sequence",
+      "dependsOn": ["port: free 8000", "stack: up (infra only)"],
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,143 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Icon } from './Icons.jsx';
-
-/* -----------------------------------------------------------------
-   Mock data — in a real app these come from the backend.
-   Customers are found by phone/email/shopify ID; the similar-ticket
-   suggestions are produced server-side via embedding cosine similarity
-   on the subject/description.
-   ----------------------------------------------------------------- */
-
-const MOCK_CUSTOMERS = [
-  {
-    id: 'c1',
-    name: 'Vijay real deal',
-    phone: '918696810062',
-    email: 'ayush.test123455@gmail.com',
-    shopifyId: '5420001',
-    since: 'Apr 2026',
-    orders: 1,
-    returns: 0,
-    address: 'Floor-Ground Floor, test, test, MUMBAI, Maharashtra, 400608, India',
-    recentOrders: [
-      {
-        id: '20665339',
-        placedAt: '10:30 PM, Apr 6, 26',
-        total: 41369,
-        items: [
-          { name: 'Test Chair', qty: 1 },
-          { name: 'Test Custom Mattress', qty: 2 },
-          { name: 'Test Standard Mattress', qty: 2 },
-        ],
-      },
-    ],
-  },
-  {
-    id: 'c2',
-    name: 'rajendra .',
-    phone: '919870231100',
-    email: 'ashwini2186@gmail.com',
-    shopifyId: '5420002',
-    since: 'Apr 2026',
-    orders: 1,
-    returns: 0,
-    address: 'ANDHERI, J B Nagar metro station, Mumbai, Maharashtra, 400059, India',
-    recentOrders: [
-      { id: '20466915', placedAt: 'Aug 4, 2025', total: 1899, items: [{ name: 'Wedge Cushion', qty: 1 }] },
-    ],
-  },
-  {
-    id: 'c3',
-    name: 'Dixit Shah',
-    phone: '919123123123',
-    email: 'dixit@example.com',
-    shopifyId: '5420003',
-    since: 'Feb 2026',
-    orders: 3,
-    returns: 1,
-    address: 'Bangalore, Karnataka, India',
-    recentOrders: [
-      { id: '20466820', placedAt: 'Apr 10, 2026', total: 45999, items: [{ name: 'SmartGRID Mattress', qty: 1 }] },
-      { id: '20466719', placedAt: 'Apr 12, 2026', total: 9999, items: [{ name: 'Ortho Pillow', qty: 2 }] },
-    ],
-  },
-];
-
-/* Existing tickets that the semantic search (embedding vectors) would return. */
-const EXISTING_TICKETS = [
-  {
-    id: '#3687',
-    customer: 'Vijay real deal',
-    customerId: 'c1',
-    subject: 'Delivery status enquiry for my order',
-    status: 'blocked',
-    task: 'delivery_status_enquiry',
-    team: 'CRM L1',
-    channel: 'Email',
-    ago: '2d',
-    keywords: ['delivery', 'status', 'order', 'shipped', 'tracking', 'where', 'package', 'courier'],
-  },
-  {
-    id: '#3765',
-    customer: 'Dixit Shah',
-    customerId: 'c3',
-    subject: 'Refund not received after 10 days',
-    status: 'queued',
-    task: 'refund_pending',
-    team: 'CRM L2',
-    channel: 'Call',
-    ago: '8d',
-    keywords: ['refund', 'money', 'back', 'cancelled', 'not', 'received', 'pending', 'bank'],
-  },
-  {
-    id: '#3764',
-    customer: 'Dixit Shah',
-    customerId: 'c3',
-    subject: 'Where is my in-transit delivery',
-    status: 'queued',
-    task: 'delivery_followup',
-    team: 'CRM L1',
-    channel: 'Call',
-    ago: '8d',
-    keywords: ['delivery', 'transit', 'tracking', 'where', 'carrier', 'shipment', 'arrive'],
-  },
-  {
-    id: '#3759',
-    customer: 'aftab sayyed',
-    customerId: 'cx',
-    subject: 'Delay in my sofa delivery — ETA slipped',
-    status: 'blocked',
-    task: 'delay_delivery',
-    team: 'CRM L1',
-    channel: 'WhatsApp',
-    ago: '12d',
-    keywords: ['delay', 'delivery', 'eta', 'late', 'sofa', 'not', 'arrived'],
-  },
-  {
-    id: '#3701',
-    customer: 'Neha Gupta',
-    customerId: 'cy',
-    subject: 'Mattress sagged within 6 months of use',
-    status: 'assigned',
-    task: 'product_quality',
-    team: 'Quality',
-    channel: 'Email',
-    ago: '18d',
-    keywords: ['mattress', 'sag', 'quality', 'defect', 'warranty', 'months'],
-  },
-  {
-    id: '#3688',
-    customer: 'Vijay real deal',
-    customerId: 'c1',
-    subject: 'Request to change delivery address',
-    status: 'resolved',
-    task: 'address_change',
-    team: 'CRM L1',
-    channel: 'Chat Widget',
-    ago: '25d',
-    keywords: ['address', 'change', 'delivery', 'relocation', 'update'],
-  },
-];
+import { api, qs } from '../api.js';
 
 const CHANNELS = [
   { key: 'whatsapp',  label: 'WhatsApp',    icon: <Icon.WhatsApp />,                       color: 'var(--whatsapp)', hint: 'Requires phone' },
@@ -154,60 +17,6 @@ const PRIORITIES = [
   { key: 'urgent', label: 'Urgent', tone: 'danger' },
 ];
 
-/* -----------------------------------------------------------------
-   Simulated embedding similarity.
-   In production the backend returns ranked matches with a score; here
-   we fake it using keyword overlap + character n-gram Jaccard so the
-   UI can be demoed without infra.
-   ----------------------------------------------------------------- */
-
-const tokenize = (s) =>
-  s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
-
-const ngrams = (s, n = 3) => {
-  const cleaned = s.toLowerCase().replace(/\s+/g, ' ').trim();
-  if (cleaned.length < n) return new Set([cleaned]);
-  const out = new Set();
-  for (let i = 0; i <= cleaned.length - n; i++) out.add(cleaned.slice(i, i + n));
-  return out;
-};
-
-const jaccard = (a, b) => {
-  if (!a.size || !b.size) return 0;
-  let inter = 0;
-  for (const x of a) if (b.has(x)) inter++;
-  return inter / (a.size + b.size - inter);
-};
-
-function similarTickets(query, scope) {
-  const q = query.trim();
-  if (q.length < 4) return [];
-  const qTokens = new Set(tokenize(q));
-  const qNgrams = ngrams(q, 3);
-  const scored = scope.map((t) => {
-    const blob = `${t.subject} ${t.task} ${t.keywords.join(' ')}`;
-    const tTokens = new Set(tokenize(blob));
-    const tNgrams = ngrams(t.subject, 3);
-    // keyword overlap
-    let tokHit = 0;
-    for (const w of qTokens) if (tTokens.has(w)) tokHit++;
-    const tokScore = qTokens.size ? tokHit / qTokens.size : 0;
-    // character n-gram similarity for fuzzy (typos, partial words)
-    const charScore = jaccard(qNgrams, tNgrams);
-    // blend to simulate a learned embedding
-    const score = 0.65 * tokScore + 0.35 * charScore;
-    return { t, score };
-  });
-  return scored
-    .filter((x) => x.score >= 0.18)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 4);
-}
-
-/* -----------------------------------------------------------------
-   Customer lookup
-   ----------------------------------------------------------------- */
-
 function detectLookupField(query) {
   const q = query.trim();
   if (!q) return null;
@@ -215,17 +24,6 @@ function detectLookupField(query) {
   if (/\S+@\S+\.\S+/.test(q)) return 'email';
   if (/^\d{5,}$/.test(q)) return 'shopify';
   return 'name';
-}
-
-function searchCustomers(query) {
-  const q = query.trim().toLowerCase();
-  if (!q) return [];
-  return MOCK_CUSTOMERS.filter((c) =>
-    c.name.toLowerCase().includes(q) ||
-    c.phone.includes(q.replace(/\D/g, '')) ||
-    c.email.toLowerCase().includes(q) ||
-    c.shopifyId.includes(q)
-  ).slice(0, 5);
 }
 
 const statusTone = {
@@ -278,32 +76,61 @@ export default function CreateTicketModal({ onClose, onCreated }) {
     }
   }, [customer]);
 
-  const lookupHits = useMemo(() => searchCustomers(lookup), [lookup]);
+  const [lookupHits, setLookupHits] = useState([]);
   const lookupKind = useMemo(() => detectLookupField(lookup), [lookup]);
 
-  // similarity suggestions scoped to customer if chosen, else global
-  const similar = useMemo(() => {
-    const scope = customer
-      ? EXISTING_TICKETS // keep global scope but we'll visually highlight same-customer
-      : EXISTING_TICKETS;
-    return similarTickets(subject + ' ' + description, scope);
+  useEffect(() => {
+    const q = lookup.trim();
+    if (!q) { setLookupHits([]); return; }
+    const ctrl = new AbortController();
+    const t = setTimeout(() => {
+      api.get(`/customers/search${qs({ q, limit: 5 })}`, { signal: ctrl.signal })
+        .then((res) => {
+          const items = Array.isArray(res) ? res : res?.items || [];
+          setLookupHits(items);
+        })
+        .catch(() => setLookupHits([]));
+    }, 180);
+    return () => { clearTimeout(t); ctrl.abort(); };
+  }, [lookup]);
+
+  const [similar, setSimilar] = useState([]);
+  useEffect(() => {
+    const text = `${subject} ${description}`.trim();
+    if (text.length < 4) { setSimilar([]); return; }
+    const ctrl = new AbortController();
+    const t = setTimeout(() => {
+      api.post('/tickets/similar', { text, customerId: customer?.id }, { signal: ctrl.signal })
+        .then((res) => {
+          const items = Array.isArray(res) ? res : res?.items || [];
+          setSimilar(items);
+        })
+        .catch(() => setSimilar([]));
+    }, 220);
+    return () => { clearTimeout(t); ctrl.abort(); };
   }, [subject, description, customer]);
 
   const canSubmit = customer && subject.trim().length >= 4 && channel;
 
   function submit() {
     if (!canSubmit) return;
-    onCreated?.({
-      customer,
+    const payload = {
+      customerId: customer?.id,
+      customer: customer?.name,
       subject: subject.trim(),
       description: description.trim(),
+      source: channel,
       channel,
       priority,
       orderId,
       tags,
       shareWithCustomer,
-    });
-    onClose?.();
+      task: 'general_enquiry',
+      team: 'Support',
+    };
+    api.post('/tickets', payload)
+      .then((created) => { onCreated?.(created); onClose?.(); })
+      .catch(() => { onCreated?.(payload); onClose?.(); });
   }
 
   function addTag(raw) {

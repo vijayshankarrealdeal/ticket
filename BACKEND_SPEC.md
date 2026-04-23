@@ -303,6 +303,218 @@ Backend:
 - Order picker (link optional order to ticket); channel picker (WhatsApp/Chat Widget/Instagram/Email/Voice Call — disabled if no phone); priority; tags; "share initial response with customer" toggle.
   - [ ] `POST /tickets` body: `{ customerId, subject, description, channel, priority, orderId?, tags[], shareWithCustomer }`.
 
+#### 3.4.1 Intent-based ticket creation (the "one conversation, many tickets" problem)
+
+The naive rule *"create a ticket on the first inbound message"* breaks the moment a customer comes back later with an unrelated question. Example:
+
+```
+T+0         Customer:  "What's the status of order 20466915?"
+T+2 min     AI reply,  ticket T1 opens  (task=delivery_status_enquiry)
+T+30 min    (silence)
+T+3 days    Customer:  "What pillows do you have for neck pain?"
+            → this is a NEW intent; must create T2, not extend T1
+T+5 days    Customer:  "Did my pillow order arrive?"
+            → delivery intent again — but for a different order; still T3
+```
+
+Each of T1 / T2 / T3 should own only the messages that belong to it. The conversation thread stays continuous in the UI, but the ticket view on the right rail changes as you scroll.
+
+##### Data-model change: messages point at tickets
+
+```sql
+ALTER TABLE messages
+  ADD COLUMN ticket_id bigint REFERENCES tickets(id);
+CREATE INDEX messages_ticket_idx ON messages (ticket_id) WHERE ticket_id IS NOT NULL;
+
+ALTER TABLE tickets
+  ADD COLUMN intent_key        text,                -- same vocab as task enum
+  ADD COLUMN intent_confidence numeric(3,2),
+  ADD COLUMN first_message_id  uuid REFERENCES messages(id),
+  ADD COLUMN last_message_id   uuid REFERENCES messages(id),
+  ADD COLUMN last_customer_at  timestamptz,         -- drives auto-close worker
+  ADD COLUMN auto_close_at     timestamptz,
+  ADD COLUMN order_ref         text;                -- scope key for reopen decisions
+```
+
+`conversations` stays 1:N with `tickets` (already supported — `tickets.conversation_id` is nullable for manual tickets, set for inbound). Query a ticket's messages with `SELECT * FROM messages WHERE ticket_id = $1 ORDER BY at` — cheap because of the partial index.
+
+##### The intent classifier — runs on every inbound customer message
+
+Input: the new message + last 5 messages + list of this conversation's **candidate tickets** (every open ticket + every ticket resolved in the last 7 days).
+
+Output:
+```
+{ decision: 'attach' | 'reopen' | 'create',
+  ticket_id: <existing-or-new>,
+  intent_key: 'delivery_status_enquiry' | 'refund_pending' | ...,
+  order_ref: '20466915' | null,
+  confidence: 0..1,
+  reason: 'short human-readable rationale for the timeline' }
+```
+
+**Two-stage pipeline for speed + cost**:
+
+1. **Stage 1 — cheap deterministic router** (runs on 100% of messages, <10 ms):
+   - Extract order ids from the message body (regex `\b\d{7,}\b` matching your Shopify id format).
+   - Keyword → task map: `refund|money back → refund_pending`, `where is|status|tracking → delivery_status_enquiry`, `return → return_request`, etc.
+   - **Hard decisions** it can make alone:
+     - No open/recent tickets at all → `decision=create`.
+     - One open ticket AND message came within `conversation.idle_threshold` (default 4 h) AND the extracted order_ref matches the ticket's `order_ref` → `decision=attach`, `ticket_id=<that>`.
+     - Explicit "new issue" marker (`"new question"`, `"separate question"`) → `decision=create`.
+
+2. **Stage 2 — LLM classifier** (runs only when Stage 1 is ambiguous):
+   - Small `gpt-4.1-mini` call (~100 tokens in, 30 out) using OpenAI **structured outputs** (`response_format={"type": "json_schema", ...}`) so the decision is typed:
+     ```python
+     class IntentDecision(BaseModel):
+         decision: Literal['attach','reopen','create']
+         ticket_id: int | None
+         intent_key: str
+         order_ref: str | None
+         confidence: float
+         reason: str
+     ```
+   - Prompt context: new message + last 5 turns + JSON summary of candidate tickets `{id, task, order_ref, subject, resolved_at?}`.
+   - Cost per inbound: ~₹0.005 on `gpt-4.1-mini`; drops further with OpenAI's automatic prompt caching on the stable system+schema preamble.
+
+   If `confidence < 0.6` → default to `create` (safer to split than to merge the wrong thread).
+
+3. **Backup — embedding fallback** when the LLM times out:
+   - Embed new message, compare cosine against each candidate ticket's `subject_embedding`.
+   - Above 0.82 and within 24h → `attach`.
+   - Above 0.82 and within 7 days resolved → `reopen`.
+   - Otherwise → `create`.
+
+##### Decision rules, written out
+
+| Situation | Decision |
+|---|---|
+| No open ticket on this conversation | `create` |
+| Open ticket + same intent + gap ≤ 4h + order_ref match (or both null) | `attach` |
+| Open ticket + **different** intent OR different order_ref | **Close the open ticket (auto)** + `create` |
+| Gap > 4h AND open ticket is `waiting_for_customer` | `attach` (reopen that ticket) |
+| Resolved ticket within 7 days + same intent + same order_ref | `reopen` (set `status='in_progress'`, append) |
+| Resolved ticket within 7 days + same intent + **different** order_ref | `create` |
+| Any case where confidence < 0.6 | `create` (fail-safe towards splitting) |
+
+Thresholds live in `workspace.intent_rules jsonb` so admins can tune without a deploy.
+
+##### What happens on each decision
+
+**`create`**:
+```sql
+INSERT INTO tickets (workspace_id, customer_id, conversation_id, status,
+                     source, channel, task, intent_key, order_ref,
+                     first_message_id, last_message_id,
+                     intent_confidence, auto_close_at)
+VALUES ($ws, $cust, $conv, 'queued',
+        $ch, $ch, $intent, $intent, $order,
+        $msgId, $msgId,
+        $conf, now() + interval '24 hours');
+
+UPDATE messages SET ticket_id = $newId WHERE id = $msgId;
+INSERT INTO ticket_timeline (ticket_id, actor, text)
+  VALUES ($newId, 'system', 'Ticket created — intent: ' || $intent || ' (' || $reason || ')');
+```
+Fan out `ticket.created` over WebSocket.
+
+**`attach`**:
+```sql
+UPDATE messages SET ticket_id = $existingId WHERE id = $msgId;
+UPDATE tickets
+  SET last_message_id = $msgId,
+      last_customer_at = now(),
+      auto_close_at = now() + interval '24 hours'
+  WHERE id = $existingId;
+```
+No timeline entry needed for simple attaches, unless the classifier flipped an implicit state (e.g. `waiting_for_customer → in_progress`).
+
+**`reopen`**:
+```sql
+UPDATE tickets
+  SET status = 'in_progress',
+      resolved_at = NULL,
+      last_message_id = $msgId,
+      last_customer_at = now(),
+      auto_close_at = now() + interval '24 hours'
+  WHERE id = $resolvedId;
+UPDATE messages SET ticket_id = $resolvedId WHERE id = $msgId;
+INSERT INTO ticket_timeline (ticket_id, actor, text)
+  VALUES ($resolvedId, 'system', 'Ticket reopened — customer returned with: ' || $reason);
+```
+
+**Auto-close of the previous ticket** (when a new intent arrives while the old one was still open):
+```sql
+UPDATE tickets
+  SET status = 'resolved',
+      voc = COALESCE(voc, 'auto_closed_intent_shift'),
+      resolution_notes = 'Auto-closed: customer moved to a new topic',
+      resolved_at = now()
+  WHERE id = $oldId AND status NOT IN ('resolved','closed');
+INSERT INTO ticket_timeline (ticket_id, actor, text)
+  VALUES ($oldId, 'system', 'Auto-closed on intent change → new ticket #' || $newId);
+```
+
+##### Auto-close worker (supports the reopen window)
+
+Runs every minute:
+```sql
+UPDATE tickets
+  SET status = 'waiting_for_customer'
+  WHERE status IN ('assigned','in_progress')
+    AND last_customer_at < now() - interval '24 hours'
+    AND auto_close_at < now();
+
+UPDATE tickets
+  SET status = 'resolved',
+      resolved_at = now(),
+      resolution_notes = COALESCE(resolution_notes, 'Auto-resolved: no customer activity for 72h')
+  WHERE status = 'waiting_for_customer'
+    AND last_customer_at < now() - interval '72 hours';
+```
+
+This is what makes *"3 days later, new question → new ticket"* work cleanly — the old ticket has already quietly resolved itself, so the classifier isn't torn between attach vs create.
+
+##### Message-range linking in the UI
+
+The data model above gives you two views for free:
+
+- **Conversation pane** (`GET /conversations/:id/messages`) — returns every message, with `message.ticket_id` on each. The frontend can render visual separators between message groups whose `ticket_id` differs ("— Ticket #3770 · delivery_status_enquiry —" divider lines).
+- **Ticket pane** (`GET /tickets/:id/messages`) — returns only `WHERE ticket_id = $1 ORDER BY at`. The Conversation tab inside the Tickets page ([src/pages/Tickets.jsx](src/pages/Tickets.jsx), currently a placeholder) can finally be implemented from this.
+
+Right-rail "Tickets" panel on [src/pages/Conversations.jsx](src/pages/Conversations.jsx) already supports an array of tickets per conversation — that was already in the mock data. The backend just needs to return them all, not just one.
+
+##### Where this runs in the pipeline
+
+The classifier is step **1.5** in the §10 pipeline — between *context assembly* and *agent selection*:
+
+```
+inbound message
+  → upsert customer + conversation
+  → 1.5 classify intent → attach | reopen | create ticket
+  → update messages.ticket_id
+  → now the AI agent sees:
+      current_ticket = <the one we just resolved to>
+      customer_history = all their past tickets
+  → agent replies → ticket gets updated (timeline, status, etc.)
+```
+
+The AI agent's `create_ticket` tool (§3.11.H) is a **fallback** for cases where the classifier said `create` but the agent wants to override (e.g. merge two intents it now realizes are actually one). In steady-state, 95%+ of tickets come from the classifier, not the tool.
+
+##### Endpoints to add
+
+- [ ] `POST /internal/intent/classify` — server-internal, called by the inbound pipeline. Body: `{ conversation_id, message_id }`. Returns the `IntentDecision` above + the decision applied.
+- [ ] `POST /tickets/:id/attach-message { message_id }` — manual override from the UI, in case an agent spots a misclassification.
+- [ ] `POST /tickets/:id/split { from_message_id }` — split a ticket in two starting at a given message. Rewrites `messages.ticket_id` for the tail and creates a new ticket with the original's metadata.
+
+##### What to keep simple in Build 1
+
+For the spine demo, skip the LLM classifier and ship **Stage 1 only**:
+- Deterministic keyword/order-ref routing.
+- `create` on ambiguity.
+- Auto-close worker running.
+
+That's already enough to correctly split the 3-message scenario at the top of this section (order enquiry → pillow question → different-order delivery question), because each message mentions different keywords and/or different order refs. Upgrade to the LLM stage in Build 2 once the AI pipeline is wired anyway.
+
 ---
 
 ### 3.5 Customers — [src/pages/Customers.jsx](src/pages/Customers.jsx)
@@ -408,6 +620,8 @@ Backend:
 ---
 
 ### 3.11 Agent Builder — [src/pages/AgentBuilder.jsx](src/pages/AgentBuilder.jsx)
+
+> **Primary model provider: OpenAI.** All AI runs — built-in orchestrator, Langflow flows, intent classifier, embeddings — default to OpenAI. Defaults: `gpt-4.1` for reasoning/agent runs, `gpt-4.1-mini` for the cheap-path intent classifier, `text-embedding-3-small` (1536-dim) for vectors. Anthropic / Gemini can be picked per-agent as overrides, but OpenAI is the out-of-the-box path everywhere in this doc. The frontend's existing Claude model dropdown in [src/pages/AgentBuilder.jsx](src/pages/AgentBuilder.jsx) should be replaced with: *GPT-4.1* / *GPT-4.1 mini* / *GPT-4o* / *o4-mini*.
 
 **UI contract**: one **"Create Agent"** button on this page. Click → a new tab opens the **self-hosted Langflow** (already authenticated as the current user — no extra login). The user designs their flow there and hits **Publish**. On publish, Langflow pings our backend; the agent appears in the list on `/agent-builder` and is immediately usable by the AI reply pipeline. That's the whole user-facing surface.
 
@@ -640,13 +854,13 @@ Authorization: Bearer <service_token_for_workspace>
 A published Langflow flow can itself be enabled as a tool for another agent:
 1. In API Library, pick *Add API → From Langflow agent* → select the published agent.
 2. We create an `apis` row with `spec = { kind: 'langflow_flow', agent_id, input_schema, output_schema }`.
-3. When any other agent enables this tool, its `input_schema` becomes the Anthropic tool schema. The executor calls the flow when the tool is invoked.
+3. When any other agent enables this tool, its `input_schema` becomes the OpenAI (or provider-matched) tool schema. The executor calls the flow when the tool is invoked.
 
 Non-engineers can now visually assemble a "detect-fraud-and-refund" sub-agent, publish it, and have the main support agent call it during conversations — no code.
 
 #### F. Secrets, versioning, cost
 
-- **Secrets**: seed Langflow's variable store from Vault at boot (`POST /api/v1/variables` with `$ANTHROPIC_API_KEY`, etc.). Flow JSON exports never carry them.
+- **Secrets**: seed Langflow's variable store from Vault at boot (`POST /api/v1/variables` with `$OPENAI_API_KEY` as the primary and `$ANTHROPIC_API_KEY` / `$GEMINI_API_KEY` as optional overrides). Flow JSON exports never carry them. Every Langflow template we ship defaults its LLM node to `gpt-4.1`.
 - **Versioning**: every publish writes a new `agent_flow_snapshots` row; `agents.active_version` points at the live one. A future *Rollback* button just flips the pointer.
 - **Cost/rate caps**: per-workspace daily ceiling enforced in the runner; when exceeded, auto-escalate to a human via the existing `escalate` tool instead of erroring the customer.
 - **Tenant isolation**: every Langflow API call is sanity-checked — `flow.folder_id == session.workspace.langflow_folder_id`. Same check on the reverse proxy for `/flow/**` requests.
@@ -729,7 +943,7 @@ class AgentCtx:
     trace_id: str
 
 orchestrator = Agent(
-    model='anthropic:claude-opus-4-7',          # overridable per workspace
+    model='openai:gpt-4.1',                     # primary; overridable per workspace
     deps_type=AgentCtx,
     retries=2,
     system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -840,7 +1054,7 @@ ALTER TABLE workspaces
 
 - Same Python process as the FastAPI app — `pydantic-ai` is lightweight, no separate service needed.
 - For Go/Node backends: run the orchestrator as a thin Python sidecar on the same host, exposed over gRPC or HTTP with an internal-only port. One container, minimal latency.
-- `pip install pydantic-ai[anthropic]` plus `ANTHROPIC_API_KEY` from Vault; that's the whole install footprint.
+- `pip install pydantic-ai[openai]` plus `OPENAI_API_KEY` from Vault; that's the whole install footprint. Add `pydantic-ai[anthropic]` only if a workspace opts into Claude as an override.
 
 ##### Why a hard-coded default matters
 
@@ -1588,7 +1802,7 @@ CREATE TABLE agents (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   name          text NOT NULL,
-  model         text NOT NULL,              -- 'claude-opus-4-7' etc
+  model         text NOT NULL DEFAULT 'gpt-4.1',   -- primary. Overrides: 'gpt-4.1-mini','gpt-4o','o4-mini','claude-*','gemini-*'
   persona       text NOT NULL,
   instructions  text NOT NULL,
   temperature   numeric(3,2) NOT NULL DEFAULT 0.3,
@@ -1748,9 +1962,9 @@ When a new inbound `message.created` lands in a conversation that has no active 
    2. Active published Langflow agent (`SELECT … FROM agents WHERE status='published' ORDER BY last_published_at DESC LIMIT 1`) → run that (§3.11.D).
    3. Otherwise → **built-in `default-orchestrator`**.
    The built-in agent is always the fallback — the pipeline is never "no agent".
-3. **Run**:
-   - **Langflow path**: `POST /api/v1/run/<flow_id>?stream=true` with `session_id = conversation_id`. Tool calls go out via the WorkspaceX custom component → our `/internal/apis/:name` endpoints.
-   - **Default path**: `pydantic-ai` `orchestrator.run_stream(user_message, deps=ctx)`. Tools are Python functions with Pydantic-validated args/returns; the tool loop is handled by the library.
+3. **Run** — **default provider is OpenAI** (`gpt-4.1` for reasoning, `gpt-4.1-mini` for the classifier, `text-embedding-3-small` for vectors). Anthropic / Gemini are per-agent overrides.
+   - **Langflow path**: `POST /api/v1/run/<flow_id>?stream=true` with `session_id = conversation_id`. The flow's LLM node is pre-seeded to OpenAI when the template is dropped in; admins can swap providers inside the canvas. Tool calls go out via the WorkspaceX custom component → our `/internal/apis/:name` endpoints.
+   - **Default path**: `pydantic-ai` `orchestrator.run_stream(user_message, deps=ctx)` with `model='openai:gpt-4.1'`. Tools are Python functions with Pydantic-validated args/returns; the tool loop is handled by the library. Under the hood this calls OpenAI's Responses/Chat Completions API with `tools=[...]` and streams `response.output_text.delta` events.
 4. **Streaming**: every text delta and tool event SSE-streams into the WS fan-out → `conv:<id>` subscribers see the AI response type out live.
 5. **Confidence routing**:
    - Agent called `send_reply` → delivered on the channel adapter (via `outbox.kind='send_xxx'`).
@@ -1764,9 +1978,9 @@ When a new inbound `message.created` lands in a conversation that has no active 
    - Consecutive-error guard (3 tool errors → escalate).
 7. **Record**: one `agent_runs` row with `version` (0 = built-in, N = Langflow snapshot), `trace jsonb`, tokens, cost. Every tool call also writes an `api_logs` row.
 
-**Embedding worker**: whenever a ticket is created or its subject changes, enqueue an embedding job → update `tickets.subject_embedding` with Voyage/OpenAI embeddings (1536-dim). Same for KB chunks. Powers the similar-ticket panel and the `kb_search` / `similar_tickets` tools.
+**Embedding worker**: whenever a ticket is created or its subject changes, enqueue an embedding job → call `openai.embeddings.create(model='text-embedding-3-small', input=<subject + description>)` → update `tickets.subject_embedding` (1536-dim, matches the pgvector column). Same model powers `kb_chunks.embedding` for the `kb_search` / `similar_tickets` tools. `text-embedding-3-large` (3072-dim) is available as a higher-accuracy override; if you switch, bump the `vector(1536)` column to `vector(3072)` and reindex.
 
-**Prompt caching**: the system prompt + tool schema are stable for both agent paths — use Anthropic **prompt caching** to cut cost ~80%. Re-cache when the admin saves the agent (Langflow) or when the service deploys (built-in).
+**Prompt caching**: the system prompt + tool schema are stable for both agent paths — OpenAI applies **automatic prompt caching** for prefixes ≥ 1024 tokens (~50% discount on cached input). Keep the system prompt + tool schema at the top of the request so they hit the cache. Re-deploy invalidates the cache; normal agent edits don't.
 
 ---
 

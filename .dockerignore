@@ -1,0 +1,14 @@
+node_modules
+dist
+.git
+.gitignore
+.env
+.env.local
+.vite
+*.log
+.DS_Store
+progress.md
+BACKEND_SPEC.md
+README.md
+backend/node_modules
+backend/dist

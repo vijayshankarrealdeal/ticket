@@ -1,0 +1,163 @@
+# WorkspaceX local stack.
+# Maps to BACKEND_SPEC.md §13 (Deployment / infra sketch):
+#   - Postgres 16 + pgvector      -> db
+#   - Redis 7 (cache + pubsub)    -> redis
+#   - S3-style object storage     -> minio
+#   - API + workers (same binary) -> api, worker
+#   - Langflow (self-hosted AI)   -> langflow
+#   - React SPA via nginx         -> web
+
+name: workspacex
+
+services:
+  db:
+    # pgvector/pgvector:pg16 = Postgres 16 with the pgvector extension
+    # preinstalled (needed for tickets.subject_embedding, kb_chunks.embedding).
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: workspacex
+      POSTGRES_PASSWORD: workspacex
+      POSTGRES_DB: workspacex
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workspacex -d workspacex"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    # Redis 7 - oauth:<state> keys, WS fan-out, rate limits, unread counters.
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    # S3-compatible object storage for POST /uploads presigned URLs (spec §2).
+    # Swap for AWS S3 / GCS in prod.
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: workspacex
+      MINIO_ROOT_PASSWORD: workspacex-secret
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  langflow:
+    # Self-hosted Langflow for the Agent Builder (spec §3.11.A).
+    image: langflowai/langflow:latest
+    restart: unless-stopped
+    environment:
+      LANGFLOW_DATABASE_URL: postgresql://workspacex:workspacex@db:5432/langflow
+      LANGFLOW_AUTO_LOGIN: "false"
+      LANGFLOW_SUPERUSER: admin
+      LANGFLOW_SUPERUSER_PASSWORD: admin
+    ports:
+      - "7860:7860"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    # FastAPI + Uvicorn. On boot, app/db.py:
+    #   1. waits for Postgres to accept connections (retry loop),
+    #   2. applies app/schema.sql (IF NOT EXISTS — idempotent), and
+    #   3. seeds the demo workspace when the DB is empty.
+    # Then app/s3.py ensures the MinIO bucket exists.
+    build:
+      context: ./backend
+    restart: unless-stopped
+    environment:
+      APP_ROLE: api
+      PORT: 8000
+      # config.py normalizes both `postgresql://` and `postgresql+asyncpg://`.
+      DATABASE_URL: postgresql://workspacex:workspacex@db:5432/workspacex
+      REDIS_URL: redis://redis:6379
+      # S3_ENDPOINT is the URL the api container uses to talk to MinIO.
+      # S3_PUBLIC_URL is what we rewrite into presigned URLs so a browser on
+      # the host network (http://localhost:3000) can PUT to the same object.
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_URL: http://localhost:9000
+      S3_BUCKET: workspacex
+      S3_ACCESS_KEY: workspacex
+      S3_SECRET_KEY: workspacex-secret
+      LANGFLOW_URL: http://langflow:7860
+      AUTO_MIGRATE: "1"
+      AUTO_SEED: "1"
+      CORS_ORIGINS: http://localhost:3000,http://localhost:5173
+      # Secrets — override via .env, never commit real values.
+      AZURE_OPEN_AI_KEY: ${AZURE_OPEN_AI_KEY:-}
+      AZURE_ENDPOINT: ${AZURE_ENDPOINT:-}
+      GOOGLE_CLIENT_ID: ${Client_ID:-}
+      GOOGLE_CLIENT_SECRET: ${Client_Secret:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  worker:
+    # Same image as api. Build 1: a stub that heartbeats every 60s (see
+    # backend/app/worker.py). Wire real jobs (AI responder, SLA engine,
+    # outbox dispatcher, health prober) per spec §11 as Build 2/3 ships.
+    build:
+      context: ./backend
+    restart: unless-stopped
+    environment:
+      APP_ROLE: worker
+      DATABASE_URL: postgresql://workspacex:workspacex@db:5432/workspacex
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      LANGFLOW_URL: http://langflow:7860
+      # Workers share schema apply/seed with the api — safe because both steps
+      # are idempotent (IF NOT EXISTS + "zero users?" guard).
+      AUTO_MIGRATE: "1"
+      AUTO_SEED: "0"
+      AZURE_OPEN_AI_KEY: ${AZURE_OPEN_AI_KEY:-}
+      AZURE_ENDPOINT: ${AZURE_ENDPOINT:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      args:
+        VITE_API_URL: /api
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+
+volumes:
+  db_data:
+  redis_data:
+  minio_data:

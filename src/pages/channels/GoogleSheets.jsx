@@ -1,86 +1,67 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Icon } from '../../components/Icons.jsx';
-
-const SERVICE_EMAIL = 'local-255@ai-chat-1c879.iam.gserviceaccount.com';
-
-const initialSheets = [
-  {
-    id: 'sh1',
-    name: 'Customer FAQ knowledge base',
-    tabs: ['FAQs', 'Macros'],
-    rows: 842,
-    lastSync: '8 minutes ago',
-    url: 'https://docs.google.com/spreadsheets/d/1abc',
-    status: 'connected',
-  },
-  {
-    id: 'sh2',
-    name: 'Product catalog overrides',
-    tabs: ['Products', 'Offers'],
-    rows: 2104,
-    lastSync: '1 hour ago',
-    url: 'https://docs.google.com/spreadsheets/d/2def',
-    status: 'connected',
-  },
-  {
-    id: 'sh3',
-    name: 'Pincode-to-store mapping',
-    tabs: ['Pincodes'],
-    rows: 19437,
-    lastSync: 'Paused',
-    url: 'https://docs.google.com/spreadsheets/d/3ghi',
-    status: 'paused',
-  },
-];
+import { api } from '../../api.js';
 
 export default function GoogleSheets() {
-  const [sheets, setSheets] = useState(initialSheets);
+  const [sheets, setSheets] = useState([]);
+  const [serviceEmail, setServiceEmail] = useState('');
   const [url, setUrl] = useState('');
   const [validating, setValidating] = useState(false);
   const [copyFlash, setCopyFlash] = useState(false);
 
+  useEffect(() => {
+    let alive = true;
+    api.get('/sheets')
+      .then((res) => {
+        if (!alive) return;
+        const items = Array.isArray(res) ? res : res?.items || [];
+        setSheets(items);
+        if (res?.serviceEmail) setServiceEmail(res.serviceEmail);
+      })
+      .catch(() => { if (alive) setSheets([]); });
+    return () => { alive = false; };
+  }, []);
+
   const copyEmail = async () => {
+    if (!serviceEmail) return;
     try {
-      await navigator.clipboard.writeText(SERVICE_EMAIL);
+      await navigator.clipboard.writeText(serviceEmail);
       setCopyFlash(true);
       setTimeout(() => setCopyFlash(false), 1200);
-    } catch {
-      /* ignore */
-    }
+    } catch { /* ignore */ }
   };
 
-  const onValidate = (e) => {
+  const onValidate = async (e) => {
     e.preventDefault();
     if (!url.trim()) return;
     setValidating(true);
-    setTimeout(() => {
-      const id = 'sh-' + Date.now();
-      setSheets((prev) => [
-        {
-          id,
-          name: 'Imported sheet',
-          tabs: ['Sheet1'],
-          rows: 0,
-          lastSync: 'Just now',
-          url: url.trim(),
-          status: 'connected',
-        },
-        ...prev,
-      ]);
-      setUrl('');
-      setValidating(false);
-    }, 900);
+    try {
+      const validated = await api.post('/sheets/validate', { url: url.trim() });
+      const created = await api.post('/sheets', validated || { url: url.trim() });
+      if (created) setSheets((prev) => [created, ...prev]);
+    } catch { /* ignore */ }
+    setUrl('');
+    setValidating(false);
   };
 
-  const remove = (id) => setSheets((prev) => prev.filter((s) => s.id !== id));
-  const togglePause = (id) =>
+  const remove = async (id) => {
+    try { await api.del(`/sheets/${encodeURIComponent(id)}`); } catch {}
+    setSheets((prev) => prev.filter((s) => s.id !== id));
+  };
+
+  const togglePause = async (id) => {
+    const sheet = sheets.find((s) => s.id === id);
+    if (!sheet) return;
+    const nextStatus = sheet.status === 'paused' ? 'connected' : 'paused';
+    try { await api.patch(`/sheets/${encodeURIComponent(id)}`, { status: nextStatus }); } catch {}
     setSheets((prev) =>
       prev.map((s) =>
         s.id === id
-          ? { ...s, status: s.status === 'paused' ? 'connected' : 'paused', lastSync: s.status === 'paused' ? 'Just now' : 'Paused' }
+          ? { ...s, status: nextStatus, lastSync: nextStatus === 'paused' ? 'Paused' : 'Just now' }
           : s,
       ),
     );
+  };
 
   return (
     <div className="ch-page">
@@ -116,7 +97,7 @@ export default function GoogleSheets() {
             Grant <b>read &amp; edit</b> access to the address below before validating a sheet URL.
           </div>
           <div className={'ch-copy-field' + (copyFlash ? ' flash' : '')}>
-            <code>{SERVICE_EMAIL}</code>
+            <code>{serviceEmail || '—'}</code>
             <button className="ch-copy-btn" onClick={copyEmail}>
               {copyFlash ? (
                 <>

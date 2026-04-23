@@ -1,189 +1,6 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Icon } from '../../components/Icons.jsx';
-
-const messaging = [
-  {
-    id: 'whatsapp',
-    name: 'WhatsApp Business',
-    category: 'Messaging',
-    desc: 'Two-way chats, notifications and broadcasts via the WhatsApp Business API.',
-    status: 'connected',
-    accent: '#25d366',
-    letter: 'W',
-    stats: { orders: '142 tickets / 30d', latency: 'Reply < 2m' },
-  },
-  {
-    id: 'email',
-    name: 'Email',
-    category: 'Messaging',
-    desc: 'Turn support emails into tickets with threading and auto-routing.',
-    status: 'connected',
-    accent: '#3b82f6',
-    letter: 'E',
-    stats: { orders: '87 tickets / 30d', latency: 'Reply < 4m' },
-  },
-  {
-    id: 'instagram',
-    name: 'Instagram DM',
-    category: 'Messaging',
-    desc: 'Direct messages, story replies and mentions from Instagram.',
-    status: 'pending',
-    accent: '#e1306c',
-    letter: 'IG',
-  },
-  {
-    id: 'web',
-    name: 'Web Widget',
-    category: 'Messaging',
-    desc: 'Embeddable live-chat widget with proactive prompts.',
-    status: 'connected',
-    accent: '#0ea5e9',
-    letter: 'LC',
-    stats: { orders: '211 tickets / 30d', latency: 'Reply < 1m' },
-  },
-  {
-    id: 'slack',
-    name: 'Slack',
-    category: 'Messaging',
-    desc: 'Internal team escalations and channel-based alerts.',
-    status: 'connected',
-    accent: '#4a154b',
-    letter: 'SL',
-  },
-  {
-    id: 'telegram',
-    name: 'Telegram',
-    category: 'Messaging',
-    desc: 'Bot-based ticket creation and customer conversations.',
-    status: 'available',
-    accent: '#229ed9',
-    letter: 'TG',
-  },
-  {
-    id: 'messenger',
-    name: 'Messenger',
-    category: 'Messaging',
-    desc: 'Facebook Messenger inbox, saved replies and handoff.',
-    status: 'available',
-    accent: '#006aff',
-    letter: 'FB',
-  },
-  {
-    id: 'sms',
-    name: 'SMS',
-    category: 'Messaging',
-    desc: 'Transactional SMS and two-way promotional campaigns.',
-    status: 'available',
-    accent: '#f59e0b',
-    letter: 'SMS',
-  },
-];
-
-const ecommerce = [
-  {
-    id: 'shopify',
-    name: 'Shopify',
-    category: 'E-commerce platform',
-    desc: 'Sync orders, products and refunds in real time.',
-    status: 'connected',
-    accent: '#95bf47',
-    letter: 'S',
-    stats: { orders: '1,284 orders / 30d', latency: '210ms avg' },
-  },
-  {
-    id: 'unicommerce',
-    name: 'Unicommerce',
-    category: 'OMS',
-    desc: 'Inventory, warehouse and order management sync.',
-    status: 'available',
-    accent: '#9ab04a',
-    letter: 'U',
-  },
-  {
-    id: 'clickpost',
-    name: 'Clickpost',
-    category: 'Logistics aggregator',
-    desc: 'Unified shipment tracking across carriers.',
-    status: 'available',
-    accent: '#1670f0',
-    letter: 'C',
-  },
-  {
-    id: 'woocommerce',
-    name: 'WooCommerce',
-    category: 'E-commerce platform',
-    desc: 'WordPress store orders, products and customers.',
-    status: 'available',
-    accent: '#7f54b3',
-    letter: 'W',
-  },
-  {
-    id: 'magento',
-    name: 'Magento',
-    category: 'E-commerce platform',
-    desc: 'Adobe Commerce catalog and checkout events.',
-    status: 'available',
-    accent: '#ee672f',
-    letter: 'M',
-  },
-];
-
-const shipping = [
-  {
-    id: 'shiprocket',
-    name: 'Shiprocket',
-    category: 'Shipping aggregator',
-    desc: 'Book shipments with 17+ courier partners.',
-    status: 'available',
-    accent: '#7c3aed',
-    letter: 'SR',
-  },
-  {
-    id: 'delhivery',
-    name: 'Delhivery',
-    category: 'Carrier',
-    desc: 'Pan-India express and surface logistics.',
-    status: 'available',
-    accent: '#111827',
-    letter: 'D',
-  },
-  {
-    id: 'shadowfax',
-    name: 'Shadowfax',
-    category: 'Carrier',
-    desc: 'Same-day and hyperlocal delivery network.',
-    status: 'available',
-    accent: '#f59e0b',
-    letter: 'SF',
-  },
-  {
-    id: 'openleaf',
-    name: 'OpenLeaf',
-    category: 'Carrier',
-    desc: 'Reverse logistics and eco-friendly delivery.',
-    status: 'available',
-    accent: '#6d28d9',
-    letter: 'OL',
-  },
-  {
-    id: 'xpressbees',
-    name: 'XpressBees',
-    category: 'Carrier',
-    desc: 'E-commerce focused surface network.',
-    status: 'available',
-    accent: '#f97316',
-    letter: 'XB',
-  },
-  {
-    id: 'bluedart',
-    name: 'Blue Dart',
-    category: 'Carrier',
-    desc: 'Premium express with DHL network reach.',
-    status: 'available',
-    accent: '#1d4ed8',
-    letter: 'BD',
-  },
-];
+import { api } from '../../api.js';
 
 const CATEGORIES = [
   { key: 'all', label: 'All channels' },
@@ -196,11 +13,23 @@ const CATEGORIES = [
 export default function ChannelsOverview() {
   const [query, setQuery] = useState('');
   const [cat, setCat] = useState('all');
-  const [items, setItems] = useState(() => [
-    ...messaging.map((p) => ({ ...p, _group: 'messaging' })),
-    ...ecommerce.map((p) => ({ ...p, _group: 'ecommerce' })),
-    ...shipping.map((p) => ({ ...p, _group: 'shipping' })),
-  ]);
+  const [items, setItems] = useState([]);
+
+  useEffect(() => {
+    let alive = true;
+    api.get('/platforms?include=all')
+      .then((res) => {
+        if (!alive) return;
+        const rows = Array.isArray(res) ? res : res?.items || [];
+        const normalized = rows.map((r) => ({
+          ...r,
+          _group: r._group || r.group || (r.category?.toLowerCase().includes('ship') ? 'shipping' : r.category?.toLowerCase().includes('commerce') || r.category?.toLowerCase().includes('oms') ? 'ecommerce' : 'messaging'),
+        }));
+        setItems(normalized);
+      })
+      .catch(() => { if (alive) setItems([]); });
+    return () => { alive = false; };
+  }, []);
 
   const counts = useMemo(() => {
     const connected = items.filter((i) => i.status === 'connected').length;
@@ -222,19 +51,23 @@ export default function ChannelsOverview() {
       if (cat === 'connected' && i.status !== 'connected') return false;
       if (!q) return true;
       return (
-        i.name.toLowerCase().includes(q) ||
-        i.category.toLowerCase().includes(q) ||
-        i.desc.toLowerCase().includes(q)
+        (i.name || '').toLowerCase().includes(q) ||
+        (i.category || '').toLowerCase().includes(q) ||
+        (i.desc || '').toLowerCase().includes(q)
       );
     });
   }, [items, query, cat]);
 
-  const toggle = (id) => {
+  const toggle = async (id) => {
+    const p = items.find((x) => x.id === id);
+    if (!p) return;
+    const endpoint = p.status === 'connected' ? 'disconnect' : 'connect';
+    try { await api.post(`/platforms/${encodeURIComponent(id)}/${endpoint}`); } catch {}
     setItems((prev) =>
-      prev.map((p) =>
-        p.id === id
-          ? { ...p, status: p.status === 'connected' ? 'available' : 'connected' }
-          : p,
+      prev.map((q) =>
+        q.id === id
+          ? { ...q, status: q.status === 'connected' ? 'available' : 'connected' }
+          : q,
       ),
     );
   };

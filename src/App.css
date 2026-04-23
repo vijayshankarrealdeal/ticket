@@ -4937,6 +4937,11 @@
   font-size: 13px;
   line-height: 1.4;
 }
+.auth-banner.is-error {
+  background: var(--danger-50);
+  color: var(--danger);
+  border-color: var(--danger);
+}
 
 /* ---- Floating-label fields ---- */
 .auth-form {
@@ -5113,10 +5118,6 @@
 .auth-spinner.light {
   border-color: rgba(255, 255, 255, 0.35);
   border-top-color: #fff;
-}
-[data-theme="dark"] .auth-spinner.light {
-  border-color: rgba(15, 23, 42, 0.25);
-  border-top-color: #0f172a;
 }
 
 .auth-foot {

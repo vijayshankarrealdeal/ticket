@@ -1,0 +1,31 @@
+# Conda environment for local dev without Docker.
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate workspacex
+#   uvicorn app.main:app --reload --port 8000
+#
+# Point DATABASE_URL at a running Postgres (e.g. from `docker compose up db`):
+#   export DATABASE_URL=postgresql://workspacex:workspacex@localhost:5432/workspacex
+#   export S3_ENDPOINT=http://localhost:9000
+#
+# On first boot the API auto-applies schema.sql and seeds the demo workspace.
+
+name: workspacex
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - fastapi==0.115.6
+      - uvicorn[standard]==0.32.1
+      - pydantic[email]==2.10.3
+      - pydantic-settings==2.7.0
+      - email-validator==2.2.0
+      - asyncpg==0.30.0
+      - passlib[argon2]==1.7.4
+      - argon2-cffi==23.1.0
+      - python-multipart==0.0.18
+      - httpx==0.28.1
+      - boto3==1.35.77

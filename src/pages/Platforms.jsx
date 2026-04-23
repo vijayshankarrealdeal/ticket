@@ -1,29 +1,45 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
-
-const initialPlatforms = [
-  { id: 'whatsapp', name: 'WhatsApp', icon: 'W', cls: 'whatsapp', desc: 'Route chats from WhatsApp Business API', status: 'connected', tickets: 142 },
-  { id: 'email', name: 'Email', icon: '✉', cls: 'mail', desc: 'Turn support emails into tickets', status: 'connected', tickets: 87 },
-  { id: 'instagram', name: 'Instagram DM', icon: 'IG', cls: 'instagram', desc: 'Direct messages from Instagram', status: 'pending', tickets: 0 },
-  { id: 'web', name: 'Web Widget', icon: '🌐', cls: 'web', desc: 'Embeddable chat widget on your site', status: 'connected', tickets: 211 },
-  { id: 'slack', name: 'Slack', icon: '#', cls: 'slack', desc: 'Internal team channel escalations', status: 'connected', tickets: 34 },
-  { id: 'telegram', name: 'Telegram', icon: '✈', cls: 'telegram', desc: 'Bot-based ticket creation', status: 'pending', tickets: 0 },
-  { id: 'messenger', name: 'Messenger', icon: 'M', cls: 'messenger', desc: 'Facebook Messenger inbox', status: 'disconnected', tickets: 0 },
-  { id: 'discord', name: 'Discord', icon: 'D', cls: 'discord', desc: 'Community server support', status: 'disconnected', tickets: 0 },
-];
+import { api } from '../api.js';
 
 export default function Platforms() {
-  const [platforms, setPlatforms] = useState(initialPlatforms);
+  const [platforms, setPlatforms] = useState([]);
+  const [stats, setStats] = useState(null);
 
-  const toggle = (id) =>
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      api.get('/platforms').catch(() => []),
+      api.get('/platforms/stats').catch(() => null),
+    ]).then(([list, s]) => {
+      if (!alive) return;
+      setPlatforms(Array.isArray(list) ? list : list?.items || []);
+      setStats(s || null);
+    });
+    return () => { alive = false; };
+  }, []);
+
+  const toggle = async (id) => {
+    const p = platforms.find((x) => x.id === id);
+    if (!p) return;
+    const endpoint = p.status === 'connected' ? 'disconnect' : 'connect';
+    try {
+      await api.post(`/platforms/${encodeURIComponent(id)}/${endpoint}`);
+    } catch { /* no-op */ }
     setPlatforms((prev) =>
-      prev.map((p) =>
-        p.id === id
-          ? { ...p, status: p.status === 'connected' ? 'disconnected' : 'connected' }
-          : p,
+      prev.map((q) =>
+        q.id === id
+          ? { ...q, status: q.status === 'connected' ? 'disconnected' : 'connected' }
+          : q,
       ),
     );
+  };
+
+  const connectedCount = stats?.connected ?? platforms.filter((p) => p.status === 'connected').length;
+  const ticketsToday = stats?.ticketsToday ?? platforms.reduce((s, p) => s + (p.tickets || 0), 0);
+  const pendingCount = stats?.pending ?? platforms.filter((p) => p.status === 'pending').length;
+  const avgResponse = stats?.avgResponse ?? '—';
 
   return (
     <>
@@ -40,22 +56,24 @@ export default function Platforms() {
         <div className="stat-row">
           <div className="stat">
             <div className="label">Connected</div>
-            <div className="value">{platforms.filter((p) => p.status === 'connected').length}</div>
-            <div className="trend">+2 this month</div>
+            <div className="value">{connectedCount}</div>
+            {stats?.connectedTrend && <div className="trend">{stats.connectedTrend}</div>}
           </div>
           <div className="stat">
             <div className="label">Tickets today</div>
-            <div className="value">{platforms.reduce((s, p) => s + p.tickets, 0)}</div>
-            <div className="trend">+12% vs yesterday</div>
+            <div className="value">{ticketsToday}</div>
+            {stats?.ticketsTrend && <div className="trend">{stats.ticketsTrend}</div>}
           </div>
           <div className="stat">
             <div className="label">Pending setup</div>
-            <div className="value">{platforms.filter((p) => p.status === 'pending').length}</div>
+            <div className="value">{pendingCount}</div>
           </div>
           <div className="stat">
             <div className="label">Avg response</div>
-            <div className="value">2m 14s</div>
-            <div className="trend" style={{ color: 'var(--success)' }}>-18s</div>
+            <div className="value">{avgResponse}</div>
+            {stats?.avgResponseTrend && (
+              <div className="trend" style={{ color: 'var(--success)' }}>{stats.avgResponseTrend}</div>
+            )}
           </div>
         </div>
 
@@ -63,7 +81,7 @@ export default function Platforms() {
           {platforms.map((p) => (
             <div key={p.id} className="card">
               <div className="platform-head">
-                <div className={'platform-icon ' + p.cls}>{p.icon}</div>
+                <div className={'platform-icon ' + (p.cls || '')}>{p.icon}</div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontWeight: 600, fontSize: 15 }}>{p.name}</div>
                   <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 2 }}>{p.desc}</div>
@@ -79,7 +97,7 @@ export default function Platforms() {
                   ● {p.status === 'connected' ? 'Connected' : p.status === 'pending' ? 'Pending' : 'Disconnected'}
                 </span>
                 <span style={{ color: 'var(--muted)', fontSize: 12, fontWeight: 500 }}>
-                  {p.tickets} tickets
+                  {p.tickets ?? 0} tickets
                 </span>
               </div>
 

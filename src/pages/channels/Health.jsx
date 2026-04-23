@@ -1,113 +1,6 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Icon } from '../../components/Icons.jsx';
-
-const services = [
-  {
-    id: 'shopify',
-    name: 'Shopify',
-    category: 'E-commerce',
-    status: 'operational',
-    uptime30d: 99.98,
-    latencyP95: 210,
-    errorRate: 0.01,
-    lastCheck: '12s ago',
-    accent: '#95bf47',
-    letter: 'S',
-  },
-  {
-    id: 'unicommerce',
-    name: 'Unicommerce',
-    category: 'OMS',
-    status: 'degraded',
-    uptime30d: 98.4,
-    latencyP95: 1240,
-    errorRate: 1.3,
-    lastCheck: '7s ago',
-    accent: '#9ab04a',
-    letter: 'U',
-  },
-  {
-    id: 'shiprocket',
-    name: 'Shiprocket',
-    category: 'Shipping',
-    status: 'operational',
-    uptime30d: 99.92,
-    latencyP95: 420,
-    errorRate: 0.05,
-    lastCheck: '4s ago',
-    accent: '#7c3aed',
-    letter: 'SR',
-  },
-  {
-    id: 'delhivery',
-    name: 'Delhivery webhook',
-    category: 'Shipping',
-    status: 'operational',
-    uptime30d: 99.88,
-    latencyP95: 310,
-    errorRate: 0.04,
-    lastCheck: '9s ago',
-    accent: '#111827',
-    letter: 'D',
-  },
-  {
-    id: 'api',
-    name: 'Agent runtime API',
-    category: 'Internal',
-    status: 'operational',
-    uptime30d: 100,
-    latencyP95: 180,
-    errorRate: 0,
-    lastCheck: '3s ago',
-    accent: '#1e40af',
-    letter: 'AR',
-  },
-  {
-    id: 'sheets',
-    name: 'Google Sheets sync',
-    category: 'Data source',
-    status: 'operational',
-    uptime30d: 99.6,
-    latencyP95: 780,
-    errorRate: 0.2,
-    lastCheck: '18s ago',
-    accent: '#16a34a',
-    letter: 'GS',
-  },
-];
-
-const incidents = [
-  {
-    id: 'inc-102',
-    title: 'Unicommerce webhook retries elevated',
-    status: 'monitoring',
-    tone: 'warning',
-    started: '26 minutes ago',
-    components: ['Unicommerce'],
-    summary:
-      'We are seeing a 1.3% error rate on inbound inventory webhooks. Retries are succeeding on the second attempt.',
-  },
-  {
-    id: 'inc-101',
-    title: 'Shopify rate limit briefly exceeded',
-    status: 'resolved',
-    tone: 'success',
-    started: 'Yesterday at 4:22 PM',
-    components: ['Shopify'],
-    summary:
-      'GraphQL calls hit the throttle bucket during a bulk price update. Mitigation: exponential backoff was applied automatically.',
-  },
-  {
-    id: 'inc-100',
-    title: 'Shiprocket tracking delay',
-    status: 'resolved',
-    tone: 'success',
-    started: '2 days ago',
-    components: ['Shiprocket'],
-    summary:
-      'Upstream tracking events were delayed by 12 minutes. Automatically caught up after the carrier feed recovered.',
-  },
-];
+import { api } from '../../api.js';
 
 const COMPONENT_FILTERS = [
   { key: 'all', label: 'All components' },
@@ -121,11 +14,26 @@ const WINDOWS = ['24h', '7d', '30d', '90d'];
 export default function Health() {
   const [filter, setFilter] = useState('all');
   const [window, setWindow] = useState('30d');
+  const [services, setServices] = useState([]);
+  const [incidents, setIncidents] = useState([]);
+
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      api.get('/health/services').catch(() => []),
+      api.get('/incidents').catch(() => []),
+    ]).then(([s, i]) => {
+      if (!alive) return;
+      setServices(Array.isArray(s) ? s : s?.items || []);
+      setIncidents(Array.isArray(i) ? i : i?.items || []);
+    });
+    return () => { alive = false; };
+  }, []);
 
   const filtered = useMemo(() => {
     if (filter === 'all') return services;
     return services.filter((s) => s.status === filter);
-  }, [filter]);
+  }, [filter, services]);
 
   const counts = useMemo(() => {
     return {
@@ -134,7 +42,7 @@ export default function Health() {
       degraded: services.filter((s) => s.status === 'degraded').length,
       outage: services.filter((s) => s.status === 'outage').length,
     };
-  }, []);
+  }, [services]);
 
   const overall =
     counts.outage > 0
@@ -143,10 +51,12 @@ export default function Health() {
       ? { label: 'Degraded performance', tone: 'warning' }
       : { label: 'All systems operational', tone: 'success' };
 
-  const avgUptime =
-    services.reduce((s, x) => s + x.uptime30d, 0) / services.length;
-  const avgLatency =
-    services.reduce((s, x) => s + x.latencyP95, 0) / services.length;
+  const avgUptime = services.length
+    ? services.reduce((s, x) => s + (x.uptime30d || 0), 0) / services.length
+    : 0;
+  const avgLatency = services.length
+    ? services.reduce((s, x) => s + (x.latencyP95 || 0), 0) / services.length
+    : 0;
 
   return (
     <div className="ch-page">

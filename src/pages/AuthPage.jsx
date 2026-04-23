@@ -3,8 +3,10 @@ import { Icon } from '../components/Icons.jsx';
 import { BrandMark } from '../components/Sidebar.jsx';
 import { PRODUCT_NAME } from '../config.js';
 import { useTheme } from '../hooks/useTheme.js';
+import { api } from '../api.js';
 
-const AUTH_KEY = 'workspacex-auth';
+// Must match the key read by api.js — otherwise every request goes out unauthenticated.
+const AUTH_KEY = 'workspacex.auth';
 const HERO_IMAGE =
   'https://images.pexels.com/photos/30770668/pexels-photo-30770668.jpeg';
 
@@ -27,6 +29,8 @@ export function clearAuth() {
   try {
     localStorage.removeItem(AUTH_KEY);
   } catch {}
+  // Best-effort server signout; ignore errors (offline / already expired)
+  api.post('/auth/signout').catch(() => {});
 }
 
 export default function AuthPage({ onAuthenticated }) {
@@ -95,17 +99,37 @@ export default function AuthPage({ onAuthenticated }) {
     setBanner(null);
     if (!validate()) return;
     setSubmitting(true);
-    await new Promise((r) => setTimeout(r, 650));
-    setSubmitting(false);
     const name =
       values.name.trim() ||
       values.email.split('@')[0].replace(/[._-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-    onAuthenticated({
-      name,
-      email: values.email.trim(),
-      provider: 'password',
-      signedInAt: new Date().toISOString(),
-    });
+    try {
+      const path = isSignUp ? '/auth/signup' : '/auth/signin';
+      const body = isSignUp
+        ? { name, email: values.email.trim(), password: values.password }
+        : { email: values.email.trim(), password: values.password };
+      const res = await api.post(path, body);
+      const user = res?.user || {};
+      onAuthenticated({
+        ...user,
+        name: user.name || name,
+        email: user.email || values.email.trim(),
+        provider: user.provider || 'password',
+        token: res?.token || res?.accessToken,
+        accessToken: res?.accessToken || res?.token,
+        signedInAt: user.signedInAt || new Date().toISOString(),
+      });
+    } catch (err) {
+      const message = err?.status === 401
+        ? 'Credentials do not match. Please check your email and password.'
+        : err?.status === 409
+          ? 'That email is already registered — try signing in.'
+          : err?.status
+            ? `Unable to sign ${isSignUp ? 'up' : 'in'} (error ${err.status}).`
+            : 'Network error — unable to reach the server. Please try again.';
+      setBanner({ kind: 'error', message });
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const handleSso = (provider) => async () => {
@@ -157,7 +181,11 @@ export default function AuthPage({ onAuthenticated }) {
           </div>
 
           <div className="auth-form-scroll">
-            {banner && <div className="auth-banner">{banner}</div>}
+            {banner && (
+              <div className={'auth-banner' + (typeof banner === 'object' && banner.kind === 'error' ? ' is-error' : '')} role="alert">
+                {typeof banner === 'string' ? banner : banner.message}
+              </div>
+            )}
 
             <form className="auth-form" onSubmit={handleSubmit} noValidate>
               {isSignUp && (
