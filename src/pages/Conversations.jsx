@@ -887,10 +887,15 @@ export default function Conversations() {
                         </div>
                       )}
                     </div>
+                    {activeThread && (
+                      <span className="ai-draft-chip inline" title="AI has a draft suggestion ready">
+                        <Icon.Check2 /> AI Draft
+                      </span>
+                    )}
                     <textarea
                       ref={textareaRef}
-                      className="chat-input"
-                      placeholder={activeThread ? 'Reply to this thread…' : `No conversation on ${activeChannel}`}
+                      className="chat-input with-hint-placeholder"
+                      placeholder={activeThread ? 'Enter to send · Shift+Enter for newline' : `No conversation on ${activeChannel}`}
                       value={draft}
                       onChange={(e) => setDraft(e.target.value)}
                       onPaste={onPasteInput}
@@ -933,10 +938,6 @@ export default function Conversations() {
                     style={{ display: 'none' }}
                     onChange={onFilesSelected('image')}
                   />
-                  <div className="chat-input-foot">
-                    <span className="ai-draft-chip"><Icon.Check2 /> AI Draft Ready</span>
-                    <span className="chat-input-hint">Enter to send • Shift+Enter for newline</span>
-                  </div>
                 </div>
               </>
             ) : (

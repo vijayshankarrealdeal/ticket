@@ -1,9 +1,11 @@
 import { useState } from 'react';
 import TopBar from '../components/TopBar.jsx';
+import { useAnimationPref } from '../hooks/useAnimationPref.js';
 
 const sections = [
   { key: 'profile', label: 'Profile' },
   { key: 'workspace', label: 'Workspace' },
+  { key: 'preferences', label: 'Preferences' },
   { key: 'notifications', label: 'Notifications' },
   { key: 'security', label: 'Security' },
   { key: 'billing', label: 'Billing' },
@@ -31,6 +33,7 @@ export default function Settings() {
           <div className="card">
             {active === 'profile' && <Profile />}
             {active === 'workspace' && <Workspace />}
+            {active === 'preferences' && <Preferences />}
             {active === 'notifications' && <Notifications />}
             {active === 'security' && <Security />}
             {active === 'billing' && <Billing />}
@@ -80,6 +83,73 @@ function Workspace() {
         </select>
       </div>
       <button className="btn">Save changes</button>
+    </>
+  );
+}
+
+function Preferences() {
+  const { level, setLevel } = useAnimationPref();
+  const options = [
+    {
+      key: 'full',
+      title: 'Full animations',
+      desc: 'Smooth expand/collapse, panel slides, and micro-interactions everywhere.',
+    },
+    {
+      key: 'subtle',
+      title: 'Subtle',
+      desc: 'Quick, minimal motion. Skips entrance/exit animations; keeps hover and toggles snappy.',
+    },
+    {
+      key: 'off',
+      title: 'Off',
+      desc: 'No animations or transitions. UI elements open and close instantly.',
+    },
+  ];
+  return (
+    <>
+      <h3 style={{ marginBottom: 6, fontSize: 16 }}>Preferences</h3>
+      <p style={{ color: 'var(--muted)', marginBottom: 16, fontSize: 13 }}>
+        Control how UI elements expand, collapse, and transition across the app.
+      </p>
+      <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 10 }}>Animations</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {options.map((opt) => {
+          const selected = level === opt.key;
+          return (
+            <label
+              key={opt.key}
+              className={'pref-option' + (selected ? ' selected' : '')}
+              style={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: 12,
+                padding: '12px 14px',
+                border: '1px solid ' + (selected ? 'var(--accent, #1e40af)' : 'var(--border)'),
+                borderRadius: 10,
+                cursor: 'pointer',
+                background: selected ? 'var(--hover)' : 'transparent',
+              }}
+            >
+              <input
+                type="radio"
+                name="animation-level"
+                value={opt.key}
+                checked={selected}
+                onChange={() => setLevel(opt.key)}
+                style={{ marginTop: 3 }}
+              />
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <span style={{ fontWeight: 600, fontSize: 14 }}>{opt.title}</span>
+                <span style={{ color: 'var(--muted)', fontSize: 12 }}>{opt.desc}</span>
+              </div>
+            </label>
+          );
+        })}
+      </div>
+      <p style={{ color: 'var(--muted)', marginTop: 14, fontSize: 12 }}>
+        Changes apply immediately and are saved to this browser.
+      </p>
     </>
   );
 }

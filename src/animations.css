@@ -103,12 +103,76 @@
 
 /* ---- Reduced motion: disable everything ---- */
 @media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
+  :root:not([data-animations]) *,
+  :root:not([data-animations]) *::before,
+  :root:not([data-animations]) *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* ---- User animation preference ----
+   `full`  -> default, no overrides
+   `subtle`-> skip entrance/exit keyframes and section-stagger animations,
+              keep hover/focus transitions and small micro-interactions
+   `off`   -> disable all animations and transitions everywhere
+*/
+
+/* subtle: strip keyframe-driven enter/exit animations */
+:root[data-animations='subtle'] .workspace > *,
+:root[data-animations='subtle'] .page-scroll,
+:root[data-animations='subtle'] .pane,
+:root[data-animations='subtle'] .rail,
+:root[data-animations='subtle'] .rail-sub,
+:root[data-animations='subtle'] .rail-sub.closing,
+:root[data-animations='subtle'] .rail-sub-item,
+:root[data-animations='subtle'] .team-group-list,
+:root[data-animations='subtle'] .team-group-list.closing,
+:root[data-animations='subtle'] .team-group-list .team-row,
+:root[data-animations='subtle'] .rail-brand-mark,
+:root[data-animations='subtle'] .rail-row.active > svg,
+:root[data-animations='subtle'] .dropdown-menu,
+:root[data-animations='subtle'] .dropdown-menu.closing,
+:root[data-animations='subtle'] .notif-panel,
+:root[data-animations='subtle'] .notif-panel.closing,
+:root[data-animations='subtle'] .notif-list .notif-item,
+:root[data-animations='subtle'] .notif-badge,
+:root[data-animations='subtle'] .icon-badge,
+:root[data-animations='subtle'] .right-sidebar,
+:root[data-animations='subtle'] .right-sidebar.closing,
+:root[data-animations='subtle'] .user-menu,
+:root[data-animations='subtle'] .user-menu.closing,
+:root[data-animations='subtle'] .modal-backdrop,
+:root[data-animations='subtle'] .modal-backdrop.closing,
+:root[data-animations='subtle'] .anim-enter,
+:root[data-animations='subtle'] .anim-exit,
+:root[data-animations='subtle'] .anim-fade-in,
+:root[data-animations='subtle'] .anim-slide-up,
+:root[data-animations='subtle'] .anim-slide-down,
+:root[data-animations='subtle'] .anim-slide-right,
+:root[data-animations='subtle'] .anim-pop-in {
+  animation: none !important;
+  opacity: 1 !important;
+}
+
+/* subtle: keep rail collapse/expand smooth but quick */
+:root[data-animations='subtle'] {
+  --dur-xs: 80ms;
+  --dur-sm: 110ms;
+  --dur-md: 140ms;
+  --dur-lg: 180ms;
+}
+
+/* off: kill all motion everywhere */
+:root[data-animations='off'] *,
+:root[data-animations='off'] *::before,
+:root[data-animations='off'] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  animation-delay: 0ms !important;
+  transition-duration: 0.01ms !important;
+  transition-delay: 0ms !important;
+  scroll-behavior: auto !important;
 }

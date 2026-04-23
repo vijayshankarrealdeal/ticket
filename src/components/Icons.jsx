@@ -371,4 +371,35 @@ export const Icon = {
       <path d="M2 12v3M22 12v3" />
     </svg>
   ),
+  Teams: (p) => (
+    <svg viewBox="0 0 24 24" width="20" height="20" {...stroke} {...p}>
+      <path d="M4 11a4 4 0 0 1 8 0v1a4 4 0 0 1-4 4H4z" />
+      <path d="M14 7a3 3 0 1 1 3 3h-3" />
+      <path d="M14 15a3 3 0 0 1 3-3h1a3 3 0 0 1 3 3v4" />
+    </svg>
+  ),
+  Smile: (p) => (
+    <svg viewBox="0 0 24 24" width="18" height="18" {...stroke} {...p}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M8 14s1.5 2 4 2 4-2 4-2" />
+      <path d="M9 9v.01M15 9v.01" />
+    </svg>
+  ),
+  At: (p) => (
+    <svg viewBox="0 0 24 24" width="18" height="18" {...stroke} {...p}>
+      <circle cx="12" cy="12" r="4" />
+      <path d="M16 8v5a3 3 0 0 0 6 0 10 10 0 1 0-4 7.5" />
+    </svg>
+  ),
+  Hash: (p) => (
+    <svg viewBox="0 0 24 24" width="18" height="18" {...stroke} {...p}>
+      <path d="M5 9h14M5 15h14M10 4 8 20M16 4l-2 16" />
+    </svg>
+  ),
+  Pin: (p) => (
+    <svg viewBox="0 0 24 24" width="16" height="16" {...stroke} {...p}>
+      <path d="M12 17v5" />
+      <path d="M9 3h6l-1 5 3 3v3H7v-3l3-3z" />
+    </svg>
+  ),
 };

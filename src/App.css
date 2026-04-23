@@ -1125,6 +1125,23 @@
   font-weight: 600;
   display: inline-flex; align-items: center; gap: 6px;
 }
+.ai-draft-chip.inline {
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  gap: 4px;
+  align-self: center;
+  flex-shrink: 0;
+  margin-left: 2px;
+}
+.ai-draft-chip.inline svg { width: 12px; height: 12px; }
+
+.chat-input.with-hint-placeholder::placeholder {
+  color: var(--muted-2);
+  opacity: 1;
+  font-weight: 400;
+  font-size: 13px;
+}
 
 .reply-preview {
   display: flex;

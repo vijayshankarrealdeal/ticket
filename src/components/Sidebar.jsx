@@ -26,6 +26,7 @@ const items = [
   { to: '/conversations', icon: Icon.Inbox, label: 'Inbox', expandable: true },
   { to: '/tickets', icon: Icon.Ticket, label: 'Tickets' },
   { to: '/customers', icon: Icon.Users, label: 'Customers' },
+  { to: '/teams', icon: Icon.Teams, label: 'Teams' },
   { to: '/notifications', icon: Icon.Bell, label: 'Notifications' },
   { to: '/analytics', icon: Icon.Chart, label: 'Insights', expandable: true },
   { to: '/agent-builder', icon: Icon.AiAgent, label: 'Make Agents', expandable: true },

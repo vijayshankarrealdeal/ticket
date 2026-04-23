@@ -1,10 +1,12 @@
 import { useState } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { GlobalSearchProvider } from './hooks/useGlobalSearch.jsx';
+import { useAnimationPref } from './hooks/useAnimationPref.js';
 import Sidebar from './components/Sidebar.jsx';
 import Conversations from './pages/Conversations.jsx';
 import Tickets from './pages/Tickets.jsx';
 import Customers from './pages/Customers.jsx';
+import Teams from './pages/Teams.jsx';
 import Platforms from './pages/Platforms.jsx';
 import AgentBuilder from './pages/AgentBuilder.jsx';
 import Settings from './pages/Settings.jsx';
@@ -23,6 +25,7 @@ import './App.css';
 
 export default function App() {
   const [user, setUser] = useState(() => loadAuth());
+  useAnimationPref();
 
   if (!user) {
     return (
@@ -45,6 +48,7 @@ export default function App() {
           <Route path="/conversations" element={<Conversations />} />
           <Route path="/tickets" element={<Tickets />} />
           <Route path="/customers" element={<Customers />} />
+          <Route path="/teams" element={<Teams />} />
           <Route path="/platforms" element={<Platforms />} />
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/agent-builder" element={<AgentBuilder />} />
