@@ -22,6 +22,7 @@ from .routers import (
     conversations,
     customers,
     langflow,
+    langflow_proxy,
     me,
     notifications,
     oauth,
@@ -65,6 +66,7 @@ async def lifespan(app: FastAPI):
             (w._embedding_indexer_tick,  60.0,  "embedding_indexer"),
             (w._oauth_state_cleanup_tick, 600,  "oauth_cleanup"),
             (w._watch_renewer_tick,     3600.0, "watch_renewer"),
+            (w._langflow_publish_poll_tick, 30.0, "langflow_poll"),
         ]
         for fn, interval, name in loops:
             worker_tasks.append(asyncio.create_task(
@@ -134,6 +136,11 @@ app.include_router(webhooks.router)
 # so it lines up with the other provider webhooks.
 app.include_router(langflow.launch_router)
 app.include_router(langflow.webhook_router)
+# Reverse-proxy Langflow's UI + API under `/lf/*`. Keeps everything on the
+# backend origin (shared cookies) and injects a brand-strip stylesheet into
+# HTML responses. Needs `LANGFLOW_BASE_URL_PATH=/lf` on the Langflow
+# container so its own frontend emits matching relative URLs.
+app.include_router(langflow_proxy.proxy_router)
 # Widget router includes HTTP (`/widget/bootstrap`, `/widget/messages`,
 # `/widget.js`) and WebSocket (`/widget/ws`) routes — `include_router` mounts
 # all three.

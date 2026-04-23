@@ -133,6 +133,7 @@ export default function Teams() {
   const [showEmojiPicker, setShowEmojiPicker] = useState(null); // {msgId} or 'composer'
   const [attachSheet, setAttachSheet] = useState(null); // 'ticket' | 'customer'
   const [typingNames, setTypingNames] = useState([]);
+  const [dialog, setDialog] = useState(null); // 'channel' | 'dm' | null
 
   const inputRef = useRef(null);
   const chatBodyRef = useRef(null);
@@ -483,7 +484,7 @@ export default function Teams() {
             <TeamGroup
               label="Channels"
               count={filteredChannels.length}
-              onAdd={() => alert('Create channel — coming soon')}
+              onAdd={() => setDialog('channel')}
               onSearch={() => setSearchOpen((v) => !v)}
               searchActive={searchOpen}
             >
@@ -504,7 +505,7 @@ export default function Teams() {
             <TeamGroup
               label="Direct messages"
               count={filteredDMs.length}
-              onAdd={() => alert('Start a new DM — coming soon')}
+              onAdd={() => setDialog('dm')}
             >
               {filteredDMs.map((d) => {
                 const other = d.members.find((id) => id !== CURRENT_USER_ID);
@@ -750,7 +751,144 @@ export default function Teams() {
         {/* Right pane: info */}
         {showInfo && <InfoPane active={active} />}
       </div>
+      {dialog === 'channel' && (
+        <CreateChannelDialog
+          onClose={() => setDialog(null)}
+          onCreated={async (ch) => {
+            setDialog(null);
+            await loadTeamsData();
+            await refreshTeamsUnread();
+            setDataVersion((v) => v + 1);
+            if (ch?.id) setActiveId(ch.id);
+          }}
+        />
+      )}
+      {dialog === 'dm' && (
+        <StartDmDialog
+          onClose={() => setDialog(null)}
+          onCreated={async (dm) => {
+            setDialog(null);
+            await loadTeamsData();
+            await refreshTeamsUnread();
+            setDataVersion((v) => v + 1);
+            if (dm?.id) setActiveId(dm.id);
+          }}
+        />
+      )}
     </>
+  );
+}
+
+function TeamModalShell({ title, onClose, children, footer }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  return (
+    <div className="action-modal-overlay" onClick={onClose}>
+      <div className="action-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 440 }}>
+        <h3 className="action-modal-title">{title}</h3>
+        <div className="action-modal-body">{children}</div>
+        <div className="action-modal-footer">
+          <button className="btn secondary" onClick={onClose}>Cancel</button>
+          {footer}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CreateChannelDialog({ onClose, onCreated }) {
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [privacy, setPrivacy] = useState('private');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const submit = async () => {
+    const slug = name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!slug) { setErr('Name required'); return; }
+    setBusy(true); setErr(null);
+    try {
+      const res = await api.post('/teams/channels', { name: slug, description, privacy });
+      onCreated(res);
+    } catch (e) {
+      setErr(e?.message || 'create failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <TeamModalShell
+      title="Create a channel"
+      onClose={onClose}
+      footer={<button className="btn" onClick={submit} disabled={busy || !name.trim()}>{busy ? 'Creating…' : 'Create'}</button>}
+    >
+      <div style={{ display: 'grid', gap: 10 }}>
+        <label>Name
+          <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="product-launch" />
+        </label>
+        <label>Description (optional)
+          <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What's this channel for?" />
+        </label>
+        <label>Privacy
+          <select value={privacy} onChange={(e) => setPrivacy(e.target.value)}>
+            <option value="private">Private — invite only</option>
+            <option value="public">Public — anyone in the workspace</option>
+          </select>
+        </label>
+        {err && <div style={{ color: 'var(--danger, #ef4444)', fontSize: 12 }}>{err}</div>}
+      </div>
+    </TeamModalShell>
+  );
+}
+
+function StartDmDialog({ onClose, onCreated }) {
+  const [picked, setPicked] = useState(new Set());
+  const [q, setQ] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const others = MEMBERS.filter((m) => m.id && m.id !== CURRENT_USER_ID);
+  const filtered = others.filter((m) => !q || (m.name || '').toLowerCase().includes(q.toLowerCase()));
+  const toggle = (id) => setPicked((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const submit = async () => {
+    if (picked.size === 0) { setErr('Pick at least one teammate'); return; }
+    setBusy(true); setErr(null);
+    try {
+      const res = await api.post('/teams/dms', { members: Array.from(picked) });
+      onCreated(res);
+    } catch (e) {
+      setErr(e?.message || 'create failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <TeamModalShell
+      title="Start a direct message"
+      onClose={onClose}
+      footer={<button className="btn" onClick={submit} disabled={busy || picked.size === 0}>{busy ? 'Starting…' : 'Start chat'}</button>}
+    >
+      <div style={{ display: 'grid', gap: 10 }}>
+        <input autoFocus placeholder="Search teammates…" value={q} onChange={(e) => setQ(e.target.value)} />
+        <div style={{ maxHeight: 260, overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 6 }}>
+          {filtered.length === 0 && <div style={{ padding: 12, color: 'var(--muted)', fontSize: 13 }}>No teammates match.</div>}
+          {filtered.map((m) => (
+            <label key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', cursor: 'pointer', borderBottom: '1px solid var(--border)' }}>
+              <input type="checkbox" checked={picked.has(m.id)} onChange={() => toggle(m.id)} />
+              <Avatar userId={m.id} size={24} hideStatus />
+              <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{m.name}</span>
+              <span style={{ color: 'var(--muted)', fontSize: 12 }}>{m.role}</span>
+            </label>
+          ))}
+        </div>
+        {err && <div style={{ color: 'var(--danger, #ef4444)', fontSize: 12 }}>{err}</div>}
+      </div>
+    </TeamModalShell>
   );
 }
 
@@ -792,7 +930,8 @@ function ChatHeader({ active, onToggleInfo, infoOpen }) {
   if (!active) return null;
   if (active.kind === 'channel') {
     const { ch } = active;
-    const shownMembers = ch.members.slice(0, 5);
+    const chMembers = Array.isArray(ch.members) ? ch.members : [];
+    const shownMembers = chMembers.slice(0, 5);
     return (
       <div className="team-chat-head">
         <div className="team-chat-head-left">
@@ -805,8 +944,8 @@ function ChatHeader({ active, onToggleInfo, infoOpen }) {
         <div className="team-chat-head-right">
           <div className="team-avatar-stack">
             {shownMembers.map((id) => <Avatar key={id} userId={id} size={26} hideStatus />)}
-            {ch.members.length > shownMembers.length && (
-              <span className="team-avatar-more">+{ch.members.length - shownMembers.length}</span>
+            {chMembers.length > shownMembers.length && (
+              <span className="team-avatar-more">+{chMembers.length - shownMembers.length}</span>
             )}
           </div>
           <button className="icon-btn" title="Pinned"><Icon.Pin /></button>
@@ -997,9 +1136,9 @@ function InfoPane({ active }) {
           </div>
         </div>
         <div className="team-info-section">
-          <div className="team-info-section-title">Members · {ch.members.length}</div>
+          <div className="team-info-section-title">Members · {(ch.members || []).length}</div>
           <div className="team-info-members">
-            {ch.members.map((id) => {
+            {(ch.members || []).map((id) => {
               const m = memberById(id);
               return (
                 <div key={id} className="team-info-member">

@@ -101,6 +101,35 @@ export default function ApiLogs() {
     URL.revokeObjectURL(a.href);
   };
 
+  const downloadNdjson = async () => {
+    // Streams direct from the server so the export is *authoritative* — it
+    // pulls up to `limit` rows from the DB, bypassing the in-memory filter
+    // that CSV export uses.
+    const token = (() => {
+      try {
+        const raw = localStorage.getItem('workspacex.auth');
+        const parsed = raw ? JSON.parse(raw) : null;
+        return parsed?.token || parsed?.accessToken || null;
+      } catch { return null; }
+    })();
+    const base = import.meta.env.VITE_API_URL || '/api';
+    const url = `${base}/api-logs/stream?limit=5000`;
+    try {
+      const res = await fetch(url, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const blob = await res.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'api-logs.ndjson';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (e) {
+      alert(`Download failed: ${e?.message || e}`);
+    }
+  };
+
   return (
     <div className="ch-page">
       <div className="ch-page-head">
@@ -118,6 +147,9 @@ export default function ApiLogs() {
         <div className="ch-page-head-actions">
           <button className="btn secondary" onClick={refresh}><Icon.Refresh /> Refresh</button>
           <button className="btn secondary" onClick={downloadCsv}><Icon.ExternalLink /> Export CSV</button>
+          <button className="btn secondary" onClick={downloadNdjson} title="Server-streamed NDJSON, up to 5000 rows">
+            <Icon.ExternalLink /> Export NDJSON
+          </button>
         </div>
       </div>
 

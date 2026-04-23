@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { Icon } from './Icons.jsx';
 import { useTheme } from '../hooks/useTheme.js';
 import { useDelayUnmount } from '../hooks/useDelayUnmount.js';
+import { useWorkspaceCounters } from '../hooks/useWorkspaceCounters.js';
 import { PRODUCT_NAME } from '../config.js';
 
 const CHANNELS = [
@@ -39,6 +40,12 @@ export default function Sidebar() {
   const location = useLocation();
   const navigate = useNavigate();
   const { theme, toggle } = useTheme();
+  const counters = useWorkspaceCounters();
+  const BADGE_BY_LABEL = {
+    Inbox: counters.conversationsUnread,
+    Tickets: counters.ticketsOpen,
+    Notifications: counters.notificationsUnread,
+  };
 
   const [expanded, setExpanded] = useState(() => {
     const saved = localStorage.getItem(EXPANDED_KEY);
@@ -125,6 +132,11 @@ export default function Sidebar() {
               >
                 <I />
                 <span className="rail-label">{it.label}</span>
+                {!!BADGE_BY_LABEL[it.label] && (
+                  <span className="rail-badge" title={`${BADGE_BY_LABEL[it.label]} unread`}>
+                    {BADGE_BY_LABEL[it.label] > 99 ? '99+' : BADGE_BY_LABEL[it.label]}
+                  </span>
+                )}
                 {it.expandable && (
                   <Icon.Chevron
                     className={

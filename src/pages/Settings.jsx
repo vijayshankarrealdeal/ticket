@@ -252,16 +252,91 @@ function Security() {
     });
   }
   return (
-    <form onSubmit={onSubmit}>
-      <h3 style={{ marginBottom: 14, fontSize: 16 }}>Security</h3>
-      <div className="form-group"><label>Current password</label><input name="current" type="password" /></div>
-      <div className="form-group"><label>New password</label><input name="new" type="password" /></div>
-      <div className="form-group"><label>Confirm new password</label><input name="confirm" type="password" /></div>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-        <SaveButton state={state} label="Update password" />
-      </div>
+    <div>
+      <form onSubmit={onSubmit}>
+        <h3 style={{ marginBottom: 14, fontSize: 16 }}>Security</h3>
+        <div className="form-group"><label>Current password</label><input name="current" type="password" /></div>
+        <div className="form-group"><label>New password</label><input name="new" type="password" /></div>
+        <div className="form-group"><label>Confirm new password</label><input name="confirm" type="password" /></div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <SaveButton state={state} label="Update password" />
+        </div>
+      </form>
       <TwoFactor />
-    </form>
+      <ConnectedAccounts />
+    </div>
+  );
+}
+
+function ConnectedAccounts() {
+  // Shows the OAuth providers the user has linked and lets them unlink. The
+  // backend blocks unlink when the user would lock themselves out (no
+  // password hash AND currently on that provider — see DELETE /me/oauth/:p).
+  const [me, setMe] = useState(null);
+  const [busy, setBusy] = useState(null);
+  const [err, setErr] = useState(null);
+  const [msg, setMsg] = useState(null);
+
+  const reload = () => api.get('/me').then(setMe).catch(() => {});
+  useEffect(() => { reload(); }, []);
+
+  const providers = [
+    { id: 'google',  label: 'Google',   connectPath: '/api/auth/oauth/google/start?mode=connect' },
+    { id: 'outlook', label: 'Microsoft', connectPath: '/api/auth/oauth/outlook/start?mode=connect' },
+  ];
+
+  async function unlink(provider) {
+    if (!confirm(`Disconnect ${provider} from your account?`)) return;
+    setBusy(provider); setErr(null); setMsg(null);
+    try {
+      await api.del(`/me/oauth/${provider}`);
+      setMsg(`Disconnected from ${provider}`);
+      await reload();
+    } catch (e) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  if (!me) return null;
+  return (
+    <div style={{ marginTop: 24, paddingTop: 16, borderTop: '1px solid var(--border)' }}>
+      <div style={{ fontWeight: 600, marginBottom: 6 }}>Connected accounts</div>
+      <div style={{ color: 'var(--muted)', fontSize: 13, marginBottom: 12 }}>
+        OAuth providers linked to this user. You can sign in with any of them.
+        To unlink your only provider, set a password first.
+      </div>
+      {err && <div style={{ color: 'var(--danger, #b91c1c)', fontSize: 13, marginBottom: 8 }}>{err}</div>}
+      {msg && <div style={{ color: 'var(--success, #059669)', fontSize: 13, marginBottom: 8 }}>{msg}</div>}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {providers.map((p) => {
+          const linked = me.provider === p.id;
+          return (
+            <div key={p.id} style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '10px 12px', border: '1px solid var(--border)', borderRadius: 8,
+            }}>
+              <div>
+                <div style={{ fontWeight: 500 }}>{p.label}</div>
+                <div style={{ color: 'var(--muted)', fontSize: 12 }}>
+                  {linked ? `Linked · signed in via ${p.label}` : 'Not connected'}
+                </div>
+              </div>
+              {linked ? (
+                <button type="button" className="btn secondary"
+                        disabled={busy === p.id}
+                        onClick={() => unlink(p.id)}>
+                  {busy === p.id ? 'Disconnecting…' : 'Disconnect'}
+                </button>
+              ) : (
+                <a href={p.connectPath} className="btn secondary">Connect</a>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 

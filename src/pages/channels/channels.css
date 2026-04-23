@@ -109,7 +109,29 @@
   max-width: 1400px;
   margin: 0 auto;
   animation: fade-slide-up var(--dur-md) var(--ease-out) both;
+  position: relative;
 }
+
+.ch-toast {
+  position: fixed;
+  top: 22px;
+  right: 22px;
+  z-index: 80;
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.18);
+  cursor: pointer;
+  border: 1px solid transparent;
+  background: var(--surface);
+  color: var(--text);
+  animation: fade-slide-up var(--dur-sm) var(--ease-out) both;
+}
+.ch-toast-success { background: #ecfdf5; color: #065f46; border-color: #a7f3d0; }
+.ch-toast-warning { background: #fffbeb; color: #92400e; border-color: #fde68a; }
+.ch-toast-info    { background: #eff6ff; color: #1e3a8a; border-color: #bfdbfe; }
+.ch-toast-danger  { background: #fef2f2; color: #991b1b; border-color: #fecaca; }
 
 .ch-breadcrumb {
   display: inline-flex;

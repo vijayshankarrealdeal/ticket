@@ -86,18 +86,61 @@ async def delete_store(sid: str, user: dict = Me) -> dict:
         (sid, user["workspace_id"]),
     )
     await db.commit()
-    return {"ok": True}
+    return {"id": sid, "deleted": True}
 
 
 @router.post("/ecommerce/stores/{sid}/sync")
 async def sync_store(sid: str, user: dict = Me) -> dict:
+    """Manual backfill trigger from the E-Commerce page's Sync button.
+
+    Pulls real orders for Shopify stores via `channels/shopify_sync.py` when a
+    `platform_credentials` row is configured; degrades to a synthetic backfill
+    event otherwise so demo workspaces never see an error toast."""
     db = await get_db()
-    await db.execute(
-        "UPDATE ecommerce_stores SET last_sync_at = ? WHERE id = ? AND workspace_id = ?",
-        (_now(), sid, user["workspace_id"]),
+    cur = await db.execute(
+        "SELECT * FROM ecommerce_stores WHERE id = ? AND workspace_id = ?",
+        (sid, user["workspace_id"]),
     )
-    await db.commit()
-    return {"ok": True, "lastSync": _now()}
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "store not found")
+    store = dict(row)
+
+    summary: dict[str, Any] = {
+        "ordersPulled": 0,
+        "newOrders": 0,
+        "lastSync": _now(),
+        "error": None,
+        "fallback": True,
+    }
+    if store.get("platform") == "shopify":
+        from ..channels.shopify_sync import sync_store as _shopify_sync
+        summary = await _shopify_sync(workspace_id=user["workspace_id"], store=store)
+    else:
+        # Non-Shopify connectors haven't shipped a real puller yet; still mark
+        # the store synced + drop a synthetic event so the UI moves.
+        await db.execute(
+            "UPDATE ecommerce_stores SET last_sync_at = now() WHERE id = ?",
+            (sid,),
+        )
+        await db.execute(
+            """
+            INSERT INTO ecommerce_events
+                (workspace_id, store_id, type, title, sub, tone)
+            VALUES (?, ?, 'sync', 'Manual sync', ?, 'info')
+            """,
+            (user["workspace_id"], sid, store.get("name") or store.get("platform")),
+        )
+        await db.commit()
+
+    return {
+        "ok": summary.get("error") is None,
+        "lastSync": summary.get("lastSync") or _now(),
+        "ordersPulled": summary.get("ordersPulled", 0),
+        "newOrders": summary.get("newOrders", 0),
+        "fallback": summary.get("fallback", True),
+        "error": summary.get("error"),
+    }
 
 
 @router.get("/ecommerce/stats")
@@ -302,7 +345,7 @@ async def apis_delete(aid: str, user: dict = Me) -> dict:
         (aid, user["workspace_id"]),
     )
     await db.commit()
-    return {"ok": True}
+    return {"id": aid, "deleted": True}
 
 
 @router.post("/apis/{aid}/test")
@@ -359,7 +402,7 @@ async def integrations_delete(iid: str, user: dict = Me) -> dict:
         (iid, user["workspace_id"]),
     )
     await db.commit()
-    return {"ok": True}
+    return {"id": iid, "deleted": True}
 
 
 # ---------- API Logs ----------
@@ -616,7 +659,7 @@ async def sheets_delete(sid: str, user: dict = Me) -> dict:
         (sid, user["workspace_id"]),
     )
     await db.commit()
-    return {"ok": True}
+    return {"id": sid, "deleted": True}
 
 
 @router.post("/sheets/{sid}/sync")
@@ -818,10 +861,63 @@ def _render_template(src: str, args: dict) -> str:
     return _TEMPLATE_RE.sub(sub, src)
 
 
+async def _invoke_langflow_flow(spec: dict, args: dict) -> tuple[int, Any]:
+    """POST to Langflow's `/api/v1/run/<flowId>` as the WorkspaceX superuser.
+
+    `args` is the orchestrator's tool-call payload; we pass it as the `tweaks`
+    block Langflow expects. Returns `(status_code, response_body)` so the
+    caller can write the same `api_logs` row shape as the HTTP branch.
+    """
+    import os as _os
+    flow_id = spec.get("flowId") or spec.get("flow_id")
+    if not flow_id:
+        return 502, {"ok": False, "error": "langflow spec missing flowId"}
+    lf_url = (_os.environ.get("LANGFLOW_URL") or "").rstrip("/")
+    if not lf_url:
+        return 503, {"ok": False, "error": "LANGFLOW_URL not configured"}
+    try:
+        import httpx  # type: ignore
+    except ImportError:
+        return 501, {"ok": False, "error": "httpx not installed"}
+    # Lazy import so channels.py doesn't pull langflow module at module load.
+    from .langflow import _superuser_bearer
+    bearer = await _superuser_bearer()
+    headers = {"Content-Type": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    body = {
+        "input_value": args.get("input") or args.get("prompt") or args.get("text") or "",
+        "input_type": args.get("inputType") or "chat",
+        "output_type": args.get("outputType") or "chat",
+        "tweaks": args.get("tweaks") or {},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(f"{lf_url}/api/v1/run/{flow_id}",
+                                     json=body, headers=headers)
+        ctype = resp.headers.get("content-type") or ""
+        if "application/json" in ctype:
+            try:
+                return resp.status_code, resp.json()
+            except Exception:
+                return resp.status_code, {"text": resp.text[:4000]}
+        return resp.status_code, {"text": resp.text[:4000]}
+    except Exception as e:
+        return 599, {"ok": False, "error": repr(e)[:500]}
+
+
 async def _execute_api(db, ws_id: str, api_row: dict, args: dict, customer_id: str | None) -> dict:
-    """Invoke a catalog API by row. If `spec.url` is set we run a real httpx
-    request against it; otherwise we echo so offline demos keep working. Every
-    call writes to `api_logs` with secrets redacted."""
+    """Invoke a catalog API by row. Dispatches on `spec.kind`:
+
+    - `spec.kind == 'langflow'` → POST to `{LANGFLOW_URL}/api/v1/run/<flowId>` with
+      the superuser bearer (spec §3.11.E Flow-as-a-tool). Created by the
+      Langflow publish hook in `routers/langflow.py`.
+    - `spec.url` set → real httpx request against the URL (with `{{token}}`
+      template substitution).
+    - fallthrough → echo the args so offline demos keep working.
+
+    Every call writes to `api_logs` with secrets redacted.
+    """
     started = time.perf_counter()
     # Inherit the request-scoped trace_id when present so webhook → internal
     # API → downstream chain shares one id. Fall back to a fresh trc_ when
@@ -830,11 +926,18 @@ async def _execute_api(db, ws_id: str, api_row: dict, args: dict, customer_id: s
     trace_id = current_trace_id() or f"trc_{uuid.uuid4().hex[:12]}"
     spec = jl(api_row.get("spec"), {}) or {}
     method = (api_row.get("method") or spec.get("method") or "GET").upper()
+    kind = (spec.get("kind") or "").lower()
     url = spec.get("url")
-    response_body: Any = {"ok": True, "echo": args, "spec": spec}
+    response_body: Any = {"ok": True, "echo": args, "spec": _redact(spec)}
     status_code = 200
 
-    if url:
+    if kind == "langflow":
+        status_code, response_body = await _invoke_langflow_flow(spec, args)
+        # Normalise method so the api_logs request row tells the truth even
+        # though the user-facing "method" column still says whatever the
+        # catalog row had set (GET by default).
+        method = "POST"
+    elif url:
         try:
             import httpx  # type: ignore
             resolved_url = _render_template(url, args)

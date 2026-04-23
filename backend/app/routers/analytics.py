@@ -184,6 +184,121 @@ async def timeseries(metric: str = "tickets", range: str = "7d", user: dict = Me
     return {"metric": metric, "range": range, "series": series}
 
 
+@router.get("/breakdown")
+async def breakdown(range: str = Query("14d"), user: dict = Me) -> dict:
+    """Returns breakdowns powering the Analytics dashboard charts:
+      - resolutionMix: AI-only vs human-touched on resolved tickets
+      - csatDistribution: counts at each rating 1..5
+      - channelMix: open/resolved counts per channel
+      - statusMix: ticket counts per status
+      - priorityMix: ticket counts per priority
+    """
+    days = int(range[:-1]) if range.endswith("d") and range[:-1].isdigit() else 14
+    days = max(1, min(days, 90))
+    db = await get_db()
+
+    cur = await db.execute(
+        """
+        WITH resolved AS (
+          SELECT id, conversation_id FROM tickets
+           WHERE workspace_id = ? AND status = 'resolved'
+             AND resolved_at > now() - make_interval(days => ?)
+        )
+        SELECT
+          (SELECT COUNT(*) FROM resolved) AS total,
+          (SELECT COUNT(*) FROM resolved r
+            WHERE NOT EXISTS (
+              SELECT 1 FROM messages m
+               WHERE m.conversation_id = r.conversation_id
+                 AND m.from_role = 'agent'
+            )
+          ) AS ai_only
+        """,
+        (user["workspace_id"], days),
+    )
+    rm = await cur.fetchone()
+    total_res = int(rm["total"] or 0) if rm else 0
+    ai_only = int(rm["ai_only"] or 0) if rm else 0
+    resolution_mix = [
+        {"name": "AI resolved", "value": ai_only},
+        {"name": "Human resolved", "value": max(0, total_res - ai_only)},
+    ]
+
+    cur = await db.execute(
+        """
+        SELECT rating, COUNT(*) AS n
+          FROM csat_responses
+         WHERE workspace_id = ? AND at > now() - make_interval(days => ?)
+         GROUP BY rating
+        """,
+        (user["workspace_id"], days),
+    )
+    by_rating = {int(r["rating"]): int(r["n"]) for r in [dict(x) for x in await cur.fetchall()]}
+    csat_distribution = [
+        {"rating": str(r), "count": by_rating.get(r, 0)} for r in (1, 2, 3, 4, 5)
+    ]
+    csat_total = sum(by_rating.values())
+    satisfied = by_rating.get(4, 0) + by_rating.get(5, 0)
+    csat_satisfied_pct = round(100.0 * satisfied / csat_total, 1) if csat_total else None
+
+    cur = await db.execute(
+        """
+        SELECT COALESCE(channel,'unknown') AS channel,
+               SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS resolved,
+               SUM(CASE WHEN status <> 'resolved' THEN 1 ELSE 0 END) AS open
+          FROM tickets
+         WHERE workspace_id = ? AND created_at > now() - make_interval(days => ?)
+         GROUP BY 1
+         ORDER BY (SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) +
+                   SUM(CASE WHEN status <> 'resolved' THEN 1 ELSE 0 END)) DESC
+        """,
+        (user["workspace_id"], days),
+    )
+    channel_mix = [
+        {"channel": r["channel"], "resolved": int(r["resolved"] or 0), "open": int(r["open"] or 0)}
+        for r in [dict(x) for x in await cur.fetchall()]
+    ]
+
+    cur = await db.execute(
+        """
+        SELECT COALESCE(status,'unknown') AS status, COUNT(*) AS n
+          FROM tickets
+         WHERE workspace_id = ? AND created_at > now() - make_interval(days => ?)
+         GROUP BY 1
+        """,
+        (user["workspace_id"], days),
+    )
+    status_mix = [
+        {"name": r["status"], "value": int(r["n"] or 0)}
+        for r in [dict(x) for x in await cur.fetchall()]
+    ]
+
+    cur = await db.execute(
+        """
+        SELECT COALESCE(priority,'normal') AS priority, COUNT(*) AS n
+          FROM tickets
+         WHERE workspace_id = ? AND created_at > now() - make_interval(days => ?)
+         GROUP BY 1
+        """,
+        (user["workspace_id"], days),
+    )
+    priority_mix = [
+        {"name": r["priority"], "value": int(r["n"] or 0)}
+        for r in [dict(x) for x in await cur.fetchall()]
+    ]
+
+    return {
+        "range": range,
+        "resolutionMix": resolution_mix,
+        "csatDistribution": csat_distribution,
+        "csatSatisfiedPct": csat_satisfied_pct,
+        "csatResponses": csat_total,
+        "channelMix": channel_mix,
+        "statusMix": status_mix,
+        "priorityMix": priority_mix,
+    }
+
+
 # ---------- CSAT collect (spec §3.10) ----------
 
 @router.post("/csat")

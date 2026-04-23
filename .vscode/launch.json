@@ -37,6 +37,12 @@
       // --reload forks a worker; track & kill it with the parent.
       "subProcess": true,
       "console": "integratedTerminal",
+      // Pull secrets (LANGFLOW_SUPERUSER_PASSWORD, LANGFLOW_WEBHOOK_SECRET,
+      // WORKSPACEX_SECRET_KEY, AZURE_*, Google Client_*) from the gitignored
+      // `.env` at the repo root. Keeps creds out of this committed file. The
+      // inline `env` below wins on conflict, so localhost-specific URLs still
+      // override any host-ambiguous defaults the .env might carry.
+      "envFile": "${workspaceFolder}/.env",
       "env": {
         "APP_ROLE": "api",
         "PORT": "8000",
@@ -47,7 +53,11 @@
         "S3_BUCKET": "workspacex",
         "S3_ACCESS_KEY": "workspacex",
         "S3_SECRET_KEY": "workspacex-secret",
+        // Host-mode dev: the api talks to Langflow over the docker-published
+        // port, NOT the `langflow` internal DNS name. Public URL is identical
+        // since the browser is on the same host.
         "LANGFLOW_URL": "http://localhost:7860",
+        "LANGFLOW_PUBLIC_URL": "http://localhost:7860",
         "AUTO_MIGRATE": "1",
         "AUTO_SEED": "1",
         "CORS_ORIGINS": "http://localhost:3000,http://localhost:5173",
@@ -65,12 +75,18 @@
       "python": "/home/verti/miniconda3/bin/python",
       "module": "app.worker",
       "cwd": "${workspaceFolder}/backend",
+      // Same envFile pattern as the api — secrets via `.env`, localhost
+      // overrides inline. Without LANGFLOW_SUPERUSER_PASSWORD +
+      // WORKSPACEX_SECRET_KEY the `_langflow_publish_poll_tick` can't
+      // authenticate against Langflow, so the poll loop silently no-ops.
+      "envFile": "${workspaceFolder}/.env",
       "env": {
         "APP_ROLE": "worker",
         "DATABASE_URL": "postgresql://workspacex:workspacex@localhost:5432/workspacex",
         "REDIS_URL": "redis://localhost:6379",
         "S3_ENDPOINT": "http://localhost:9000",
         "LANGFLOW_URL": "http://localhost:7860",
+        "LANGFLOW_PUBLIC_URL": "http://localhost:7860",
         "AUTO_MIGRATE": "0",
         "AUTO_SEED": "0",
         "PYTHONUNBUFFERED": "1"

@@ -915,14 +915,18 @@ async def _watch_renewer_tick() -> None:
 
 
 async def _shopify_backfill_tick() -> None:
-    """Placeholder backfill loop. Real adapter lands with the Shopify connector
-    in Build 3 — for now we tap `last_sync_at` so the UI shows fresh sync
-    timestamps on connected stores (and logs one row per store into
-    `ecommerce_events` as a synthetic 'backfill' event)."""
+    """Hourly backfill loop. For Shopify stores we delegate to the real Admin
+    API puller in `channels/shopify_sync.py` — it loads creds from
+    `platform_credentials`, pages through `orders.json`, upserts into `orders`,
+    refreshes `orders_30d`, and degrades to a synthetic 'demo mode' event when
+    no creds are configured. Non-Shopify stores still get a `last_sync_at`
+    bump + activity row so their tile in the UI keeps moving."""
+    from .channels.shopify_sync import sync_store as _shopify_sync
+
     db = await get_db()
     cur = await db.execute(
         """
-        SELECT id, workspace_id, name FROM ecommerce_stores
+        SELECT * FROM ecommerce_stores
          WHERE status = 'connected'
            AND (last_sync_at IS NULL OR last_sync_at < now() - interval '1 hour')
          LIMIT 20
@@ -931,6 +935,14 @@ async def _shopify_backfill_tick() -> None:
     )
     stores = [dict(r) for r in await cur.fetchall()]
     for s in stores:
+        if s.get("platform") == "shopify":
+            try:
+                await _shopify_sync(workspace_id=s["workspace_id"], store=s)
+            except Exception:
+                log.exception("shopify backfill failed for store %s", s["id"])
+            continue
+        # Non-shopify connectors: keep the existing synthetic backfill so the
+        # UI tile still ticks forward until a real puller ships.
         await db.execute(
             "UPDATE ecommerce_stores SET last_sync_at = now() WHERE id = ?",
             (s["id"],),
@@ -942,8 +954,117 @@ async def _shopify_backfill_tick() -> None:
             """,
             (s["workspace_id"], s["id"], s["name"]),
         )
-    if stores:
         await db.commit()
+
+
+async def _langflow_publish_poll_tick() -> None:
+    """Polling fallback for the Langflow publish webhook (spec §3.11.C).
+
+    Every tick we ask Langflow for the full flow list per known folder, diff
+    each flow's `updated_at` against our last-seen snapshot, and apply the
+    publish path for any flow whose published version has advanced. Belt-and-
+    braces for environments where the `/webhooks/langflow/published` callback
+    can't reach the backend (dev tunnels, firewalled prod).
+
+    No-ops unless `LANGFLOW_URL` + `LANGFLOW_SUPERUSER_PASSWORD` are set.
+    """
+    lf_url = (os.environ.get("LANGFLOW_URL") or "").rstrip("/")
+    lf_password = os.environ.get("LANGFLOW_SUPERUSER_PASSWORD")
+    if not lf_url or not lf_password:
+        return
+    try:
+        import httpx  # type: ignore
+    except ImportError:
+        return
+
+    from .routers.langflow import _superuser_bearer, apply_flow_publish
+
+    bearer = await _superuser_bearer()
+    if not bearer:
+        return
+    headers = {"Authorization": f"Bearer {bearer}"}
+
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT DISTINCT langflow_folder_id FROM workspaces "
+        "WHERE langflow_folder_id IS NOT NULL",
+        (),
+    )
+    folders = [dict(r)["langflow_folder_id"] for r in await cur.fetchall()]
+    if not folders:
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=15, headers=headers) as client:
+            for folder_id in folders:
+                try:
+                    r = await client.get(
+                        f"{lf_url}/api/v1/flows/",
+                        params={"folder_id": folder_id, "get_all": "true"},
+                    )
+                except Exception:
+                    log.exception("langflow poll: list flows failed for %s", folder_id)
+                    continue
+                if r.status_code >= 400:
+                    log.warning("langflow poll: list flows returned %s for %s",
+                                r.status_code, folder_id)
+                    continue
+                flows = r.json() or []
+                if isinstance(flows, dict):
+                    flows = flows.get("flows") or flows.get("items") or []
+                for f in flows:
+                    fid = f.get("id")
+                    if not fid:
+                        continue
+                    updated_at = f.get("updated_at") or f.get("updatedAt") or ""
+                    published = bool(f.get("is_published") or f.get("published"))
+                    if not published:
+                        continue
+                    # The version Langflow returns is monotonic; derive one
+                    # from updated_at when it doesn't surface a counter.
+                    version = int(f.get("version") or 0) or _version_from_updated_at(updated_at)
+                    cur2 = await db.execute(
+                        """
+                        SELECT MAX(COALESCE(lf_version, version)) AS v
+                          FROM agent_flow_snapshots
+                         WHERE lf_flow_id = ?
+                        """,
+                        (str(fid),),
+                    )
+                    row = await cur2.fetchone()
+                    last_version = int(dict(row).get("v") or 0) if row else 0
+                    if version <= last_version:
+                        continue
+                    try:
+                        await apply_flow_publish(
+                            db,
+                            flow_id=str(fid),
+                            folder_id=str(folder_id) if folder_id else None,
+                            version=version,
+                            data=f.get("data") or {},
+                            name=f.get("name") or None,
+                            source="poll",
+                        )
+                        log.info("langflow poll: promoted flow %s -> v%s", fid, version)
+                    except Exception:
+                        log.exception("langflow poll: apply_flow_publish raised for %s", fid)
+    except Exception:
+        log.exception("langflow publish poll tick crashed")
+
+
+def _version_from_updated_at(ts: str) -> int:
+    """Fallback version derivation: epoch seconds of the flow's `updated_at`.
+    Gives us a monotonic int we can compare without Langflow exposing a real
+    version counter."""
+    if not ts:
+        return 1
+    try:
+        from datetime import datetime as _dt
+        # Strip trailing Z for fromisoformat on older Pythons.
+        clean = ts.replace("Z", "+00:00")
+        return int(_dt.fromisoformat(clean).timestamp())
+    except Exception:
+        return 1
 
 
 # ---------- loop harness ----------------------------------------------------
@@ -982,6 +1103,7 @@ async def main() -> None:
         asyncio.create_task(_run_loop(_shopify_backfill_tick,   3600,  stop, "shopify_backfill")),
         asyncio.create_task(_run_loop(_embedding_indexer_tick,    60,  stop, "embedding_indexer")),
         asyncio.create_task(_run_loop(_watch_renewer_tick,      3600,  stop, "watch_renewer")),
+        asyncio.create_task(_run_loop(_langflow_publish_poll_tick, 30,  stop, "langflow_poll")),
     ]
 
     try:

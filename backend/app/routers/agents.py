@@ -86,6 +86,13 @@ def _serialize(a: dict) -> dict:
         "status": a.get("status", "draft"),
         "active_version": a.get("active_version", 1),
         "last_published_at": a.get("last_published_at"),
+        # Surface `kind` + `langflow_flow_id` so the AgentBuilder can tell a
+        # Langflow-backed flow from the default-orchestrator placeholder when
+        # rendering the "Recent flows" picker, and `created_at` so the picker
+        # orders newest-first without an extra round-trip.
+        "kind": a.get("kind") or "default",
+        "langflow_flow_id": a.get("langflow_flow_id"),
+        "created_at": a.get("created_at"),
     }
 
 

@@ -14,6 +14,12 @@ export default function ECommerce() {
   const [events, setEvents] = useState([]);
   const [stats, setStats] = useState(null);
   const [busy, setBusy] = useState(null);
+  const [toast, setToast] = useState(null);
+
+  const flash = (msg, tone = 'success') => {
+    setToast({ msg, tone });
+    setTimeout(() => setToast((t) => (t && t.msg === msg ? null : t)), 4000);
+  };
 
   async function refresh() {
     const [s, e, st] = await Promise.all([
@@ -37,10 +43,19 @@ export default function ECommerce() {
   const syncStore = async (id) => {
     setBusy(id);
     try {
-      await api.post(`/ecommerce/stores/${encodeURIComponent(id)}/sync`);
+      const res = await api.post(`/ecommerce/stores/${encodeURIComponent(id)}/sync`);
       await refresh();
+      if (res?.error) {
+        flash(`Sync warning: ${res.error}`, 'warning');
+      } else if (res?.fallback) {
+        flash('Synced (demo mode — connect Shopify credentials to pull real orders)', 'info');
+      } else {
+        const pulled = res?.ordersPulled ?? 0;
+        const fresh = res?.newOrders ?? 0;
+        flash(`Pulled ${pulled} order${pulled === 1 ? '' : 's'} (${fresh} new)`, 'success');
+      }
     } catch (e) {
-      alert(`Sync failed: ${e.message || e}`);
+      flash(`Sync failed: ${e.message || e}`, 'danger');
     } finally {
       setBusy(null);
     }
@@ -49,8 +64,15 @@ export default function ECommerce() {
   const syncAll = async () => {
     setBusy('all');
     try {
-      await Promise.all(stores.map((s) => api.post(`/ecommerce/stores/${encodeURIComponent(s.id)}/sync`).catch(() => {})));
+      const results = await Promise.all(stores.map((s) =>
+        api.post(`/ecommerce/stores/${encodeURIComponent(s.id)}/sync`)
+          .catch((e) => ({ error: e.message || String(e) }))
+      ));
       await refresh();
+      const totalPulled = results.reduce((n, r) => n + (r?.ordersPulled || 0), 0);
+      const errors = results.filter((r) => r?.error).length;
+      if (errors) flash(`Synced ${stores.length - errors}/${stores.length} stores (${errors} error${errors === 1 ? '' : 's'})`, 'warning');
+      else flash(`Synced ${stores.length} store${stores.length === 1 ? '' : 's'} · ${totalPulled} order${totalPulled === 1 ? '' : 's'}`, 'success');
     } finally {
       setBusy(null);
     }
@@ -70,6 +92,15 @@ export default function ECommerce() {
 
   return (
     <div className="ch-page">
+      {toast && (
+        <div
+          className={`ch-toast ch-toast-${toast.tone}`}
+          role="status"
+          onClick={() => setToast(null)}
+        >
+          {toast.msg}
+        </div>
+      )}
       <div className="ch-page-head">
         <div>
           <div className="ch-breadcrumb">

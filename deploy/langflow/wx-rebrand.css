@@ -1,0 +1,15 @@
+/* WorkspaceX — Langflow rebrand stylesheet (minimal).
+ *
+ * Paired with the gutted wx-rebrand.js: the old sheet tried to strip
+ * Langflow's chrome (logo, GitHub/Discord chips, welcome splash, avatar
+ * badge) but we now embed Langflow in an iframe with WorkspaceX chrome
+ * wrapped around it, so Langflow's own chrome should render normally —
+ * otherwise the editor has no node library and no save controls.
+ *
+ * We keep only the dark-mode base so the editor palette matches the
+ * WorkspaceX shell when `html.dark` is set by wx-rebrand.js.
+ */
+
+html.dark, html.dark body, html.dark #root {
+  color-scheme: dark;
+}

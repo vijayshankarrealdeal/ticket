@@ -42,103 +42,341 @@ webhook_router = APIRouter(tags=["langflow-webhooks"])
 
 
 LANGFLOW_URL = os.environ.get("LANGFLOW_URL")                 # e.g. http://langflow:7860
-LANGFLOW_ADMIN_TOKEN = os.environ.get("LANGFLOW_ADMIN_TOKEN")  # superuser bearer
+# URL the browser uses to reach Langflow. May differ from LANGFLOW_URL when
+# the backend is in docker-compose (internal DNS) but the browser is on the
+# host. Falls back to LANGFLOW_URL when unset.
+LANGFLOW_PUBLIC_URL = os.environ.get("LANGFLOW_PUBLIC_URL") or LANGFLOW_URL
+LANGFLOW_SUPERUSER = os.environ.get("LANGFLOW_SUPERUSER") or "admin"
+LANGFLOW_SUPERUSER_PASSWORD = os.environ.get("LANGFLOW_SUPERUSER_PASSWORD")
 LANGFLOW_WEBHOOK_SECRET = os.environ.get("LANGFLOW_WEBHOOK_SECRET")
 
 
-async def _provision_user_and_folder(db, user: dict) -> tuple[str, str]:
+def _fernet():
+    """Symmetric cipher for the per-user Langflow password we stash in
+    `users.langflow_password_secret_id`. Keyed off `WORKSPACEX_SECRET_KEY`
+    so admins can rotate without wiping the column. Falls back to a
+    deterministic app-wide key derived from `SESSION_COOKIE` when none is
+    set — fine for dev; production should set the real secret."""
+    import base64, hashlib
+    seed = (os.environ.get("WORKSPACEX_SECRET_KEY")
+            or os.environ.get("SECRET_KEY")
+            or "workspacex-dev-key").encode()
+    key = base64.urlsafe_b64encode(hashlib.sha256(seed).digest())
+    try:
+        from cryptography.fernet import Fernet  # type: ignore
+        return Fernet(key)
+    except ImportError:
+        return None
+
+
+def _encrypt(secret: str) -> str:
+    f = _fernet()
+    if f is None:
+        # No cryptography lib — fall back to a short XOR+hex so the value
+        # isn't plaintext at rest. Weaker than Fernet; upgrade by installing
+        # `cryptography` and restarting.
+        import base64, hashlib
+        key = hashlib.sha256(b"wx-lf").digest()
+        b = secret.encode()
+        xored = bytes(c ^ key[i % len(key)] for i, c in enumerate(b))
+        return "v1:" + base64.urlsafe_b64encode(xored).decode()
+    return "v2:" + f.encrypt(secret.encode()).decode()
+
+
+def _decrypt(blob: str | None) -> str | None:
+    if not blob:
+        return None
+    try:
+        if blob.startswith("v2:"):
+            f = _fernet()
+            if f is None:
+                return None
+            return f.decrypt(blob[3:].encode()).decode()
+        if blob.startswith("v1:"):
+            import base64, hashlib
+            key = hashlib.sha256(b"wx-lf").digest()
+            b = base64.urlsafe_b64decode(blob[3:].encode())
+            return bytes(c ^ key[i % len(key)] for i, c in enumerate(b)).decode()
+    except Exception:
+        return None
+    return None
+
+
+async def _superuser_bearer() -> str | None:
+    """Log in as the configured Langflow superuser and return the JWT. Used
+    for admin operations (create user, create folder) that need elevated
+    privileges — we never expose this token to the browser."""
+    if not LANGFLOW_URL or not LANGFLOW_SUPERUSER_PASSWORD:
+        return None
+    try:
+        import httpx  # type: ignore
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{LANGFLOW_URL}/api/v1/login",
+                data={"username": LANGFLOW_SUPERUSER,
+                      "password": LANGFLOW_SUPERUSER_PASSWORD},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        if resp.status_code >= 400:
+            log.warning("langflow superuser login failed: %s %s",
+                        resp.status_code, resp.text[:200])
+            return None
+        return (resp.json() or {}).get("access_token")
+    except Exception:
+        log.exception("langflow superuser login raised")
+        return None
+
+
+async def _provision_user_and_folder(db, user: dict) -> tuple[str, str, str | None]:
     """Ensure the Langflow user + per-workspace folder exist, returning
-    `(langflow_user_id, langflow_folder_id)`. The first call for each user
-    creates an LF account named after their email; subsequent calls reuse
-    the stored ids. Dev-mode synthesises opaque UUIDs so the UI round-trips
-    without LF running."""
-    lf_user_id = user.get("langflow_user_id")
-    lf_folder_id = None
+    `(langflow_user_id, langflow_folder_id, generated_password_or_None)`.
+
+    The generated password is only returned when we've just created the user
+    (so the caller can log in with it immediately); on subsequent calls we
+    return None and the caller reads the stashed encrypted password from the
+    users row.
+    """
+    # Read everything in one shot — both stored ids and the stashed password.
     cur = await db.execute(
-        "SELECT langflow_folder_id FROM workspaces WHERE id = ?", (user["workspace_id"],)
+        """
+        SELECT u.langflow_user_id, u.langflow_password_secret_id, w.langflow_folder_id
+          FROM users u JOIN workspaces w ON w.id = u.workspace_id
+         WHERE u.id = ?
+        """,
+        (user["id"],),
     )
-    w = await cur.fetchone()
-    if w:
-        lf_folder_id = dict(w).get("langflow_folder_id")
+    row = dict(await cur.fetchone() or {})
+    lf_user_id = row.get("langflow_user_id")
+    lf_folder_id = row.get("langflow_folder_id")
+    stashed = _decrypt(row.get("langflow_password_secret_id"))
 
-    if lf_user_id and lf_folder_id:
-        return str(lf_user_id), str(lf_folder_id)
-
-    if not LANGFLOW_URL or not LANGFLOW_ADMIN_TOKEN:
-        # Dev-mode provisioning — synthetic ids so the schema has something real.
+    # Dev mode — no LF, synthetic ids are fine.
+    if not LANGFLOW_URL:
         lf_user_id = lf_user_id or str(uuid4())
         lf_folder_id = lf_folder_id or str(uuid4())
-    else:
-        try:
-            import httpx  # type: ignore
-            async with httpx.AsyncClient(timeout=15) as client:
-                if not lf_user_id:
-                    r = await client.post(
-                        f"{LANGFLOW_URL}/api/v1/users/",
-                        headers={"Authorization": f"Bearer {LANGFLOW_ADMIN_TOKEN}"},
-                        json={"username": user["email"], "password": uuid4().hex,
-                              "is_active": True},
-                    )
-                    if r.status_code < 400:
-                        lf_user_id = (r.json() or {}).get("id") or str(uuid4())
-                    else:
-                        # Conflict (user already exists) — look them up.
-                        list_r = await client.get(
-                            f"{LANGFLOW_URL}/api/v1/users/",
-                            headers={"Authorization": f"Bearer {LANGFLOW_ADMIN_TOKEN}"},
-                            params={"username": user["email"]},
-                        )
-                        if list_r.status_code < 400:
-                            entries = list_r.json() or []
-                            if entries:
-                                lf_user_id = entries[0].get("id")
-                    lf_user_id = lf_user_id or str(uuid4())
-                if not lf_folder_id:
-                    f = await client.post(
-                        f"{LANGFLOW_URL}/api/v1/folders/",
-                        headers={"Authorization": f"Bearer {LANGFLOW_ADMIN_TOKEN}"},
-                        json={"name": f"ws-{user['workspace_id']}",
-                              "description": f"Workspace {user['workspace_id']}"},
-                    )
-                    if f.status_code < 400:
-                        lf_folder_id = (f.json() or {}).get("id") or str(uuid4())
-                    lf_folder_id = lf_folder_id or str(uuid4())
-        except Exception:
-            log.exception("langflow provisioning failed")
-            lf_user_id = lf_user_id or str(uuid4())
-            lf_folder_id = lf_folder_id or str(uuid4())
+        await db.execute(
+            "UPDATE users SET langflow_user_id = ? WHERE id = ?",
+            (lf_user_id, user["id"]),
+        )
+        await db.execute(
+            "UPDATE workspaces SET langflow_folder_id = ? WHERE id = ?",
+            (lf_folder_id, user["workspace_id"]),
+        )
+        await db.commit()
+        return str(lf_user_id), str(lf_folder_id), None
+
+    # Happy path: we already have ids and a stashed password the bridge can
+    # replay. Skip all the admin-API calls.
+    if lf_user_id and lf_folder_id and stashed:
+        return str(lf_user_id), str(lf_folder_id), None
+
+    admin_bearer = await _superuser_bearer()
+    if not admin_bearer:
+        raise HTTPException(503, "langflow superuser not configured — set "
+                                  "LANGFLOW_SUPERUSER_PASSWORD on the backend")
+
+    new_password = uuid4().hex + uuid4().hex
+    try:
+        import httpx  # type: ignore
+        headers = {"Authorization": f"Bearer {admin_bearer}",
+                   "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=15, headers=headers) as client:
+            # Step 1 — resolve the real Langflow user id for this email, no
+            # matter what's stored. `langflow_user_id` may be a synthetic UUID
+            # left over from dev-mode provisioning; Langflow doesn't know it.
+            real_lf_user_id = await _lookup_lf_user_by_email(client, user["email"])
+            if not real_lf_user_id:
+                create = await client.post(
+                    f"{LANGFLOW_URL}/api/v1/users/",
+                    json={"username": user["email"], "password": new_password,
+                          "is_active": True, "is_superuser": False},
+                )
+                if create.status_code < 400:
+                    real_lf_user_id = (create.json() or {}).get("id")
+                else:
+                    # Most likely "username exists" — re-list and pick it up.
+                    real_lf_user_id = await _lookup_lf_user_by_email(client, user["email"])
+
+            if not real_lf_user_id:
+                raise HTTPException(502, "Langflow user provisioning failed "
+                                         "(check superuser creds + /api/v1/users/ reachability)")
+
+            lf_user_id = real_lf_user_id
+
+            # Step 2 — (re)set that user's password so we can log in as them.
+            # Langflow exposes PATCH /api/v1/users/{id} with {password} when
+            # the caller is a superuser. Some builds also accept the bespoke
+            # `/reset-password` endpoint — we try PATCH first and fall back.
+            reset_ok = False
+            patch = await client.patch(
+                f"{LANGFLOW_URL}/api/v1/users/{lf_user_id}",
+                json={"password": new_password,
+                      "is_active": True},
+            )
+            if patch.status_code < 400:
+                reset_ok = True
+            else:
+                alt = await client.patch(
+                    f"{LANGFLOW_URL}/api/v1/users/{lf_user_id}/reset-password",
+                    json={"password": new_password},
+                )
+                reset_ok = alt.status_code < 400
+                if not reset_ok:
+                    log.warning("langflow password reset failed: PATCH=%s %s / reset=%s %s",
+                                patch.status_code, patch.text[:160],
+                                alt.status_code, alt.text[:160])
+            if not reset_ok:
+                raise HTTPException(502, "could not reset Langflow user password")
+
+            # Step 3 — ensure the workspace folder exists.
+            if not lf_folder_id:
+                f = await client.post(
+                    f"{LANGFLOW_URL}/api/v1/folders/",
+                    json={"name": f"ws-{user['workspace_id']}",
+                          "description": f"Workspace {user['workspace_id']}"},
+                )
+                if f.status_code < 400:
+                    lf_folder_id = (f.json() or {}).get("id")
+    except HTTPException:
+        raise
+    except Exception:
+        log.exception("langflow provisioning failed")
+        raise HTTPException(502, "langflow provisioning failed (see backend logs)")
+
+    if not lf_folder_id:
+        lf_folder_id = str(uuid4())  # best-effort; Langflow will still render
 
     await db.execute(
-        "UPDATE users SET langflow_user_id = ? WHERE id = ?",
-        (lf_user_id, user["id"]),
+        "UPDATE users SET langflow_user_id = ?, langflow_password_secret_id = ? WHERE id = ?",
+        (lf_user_id, _encrypt(new_password), user["id"]),
     )
     await db.execute(
         "UPDATE workspaces SET langflow_folder_id = ? WHERE id = ?",
         (lf_folder_id, user["workspace_id"]),
     )
     await db.commit()
-    return str(lf_user_id), str(lf_folder_id)
+    return str(lf_user_id), str(lf_folder_id), new_password
 
 
-async def _mint_access_token(lf_user_id: str) -> str | None:
-    """Exchange the admin token for a user-scoped access token so the browser
-    doesn't see the superuser credentials. Returns the JWT when LF is
-    configured, None in dev mode."""
-    if not LANGFLOW_URL or not LANGFLOW_ADMIN_TOKEN:
+async def _ensure_agent_flow(db, *, agent_id: str, workspace_id: str,
+                              lf_user_id: str, lf_folder_id: str) -> str | None:
+    """Create a blank Langflow flow for this agent if it doesn't have one
+    yet, return its Langflow flow id. No-ops (returns the existing id) when
+    the agent already points at a flow — keeps the SSO path idempotent."""
+    cur = await db.execute(
+        "SELECT name, langflow_flow_id FROM agents WHERE id = ? AND workspace_id = ?",
+        (agent_id, workspace_id),
+    )
+    row = await cur.fetchone()
+    if not row:
         return None
+    r = dict(row)
+    if r.get("langflow_flow_id"):
+        return str(r["langflow_flow_id"])
+
+    admin_bearer = await _superuser_bearer()
+    if not admin_bearer:
+        return None
+
+    try:
+        import httpx  # type: ignore
+        async with httpx.AsyncClient(
+            timeout=15,
+            headers={"Authorization": f"Bearer {admin_bearer}",
+                     "Content-Type": "application/json"},
+        ) as client:
+            resp = await client.post(
+                f"{LANGFLOW_URL}/api/v1/flows/",
+                json={
+                    "name": r.get("name") or "New agent",
+                    "description": f"WorkspaceX agent {agent_id}",
+                    "folder_id": lf_folder_id,
+                    "user_id": lf_user_id,
+                    "data": {"nodes": [], "edges": [], "viewport": {"x": 0, "y": 0, "zoom": 1}},
+                    "is_component": False,
+                },
+            )
+    except Exception:
+        log.exception("langflow auto-create flow raised")
+        return None
+
+    if resp.status_code >= 400:
+        log.warning("langflow auto-create flow failed: %s %s",
+                    resp.status_code, resp.text[:200])
+        return None
+
+    body = resp.json() or {}
+    flow_id = body.get("id")
+    if not flow_id:
+        return None
+
+    await db.execute(
+        "UPDATE agents SET langflow_flow_id = ?, langflow_folder_id = ?, kind = 'langflow' "
+        "WHERE id = ? AND workspace_id = ?",
+        (flow_id, lf_folder_id, agent_id, workspace_id),
+    )
+    await db.commit()
+    return str(flow_id)
+
+
+async def _lookup_lf_user_by_email(client, email: str) -> str | None:
+    """GET /api/v1/users/ as the superuser, scan for `username == email`.
+    Returns the Langflow user's UUID or None. Tolerant to different response
+    shapes (list, {users: […]}, {items: […]}) across Langflow versions."""
+    try:
+        r = await client.get(f"{LANGFLOW_URL}/api/v1/users/",
+                             params={"size": 200})
+    except Exception:
+        return None
+    if r.status_code >= 400:
+        return None
+    entries = r.json() or []
+    if isinstance(entries, dict):
+        entries = entries.get("users") or entries.get("items") or []
+    target = (email or "").lower()
+    for e in entries:
+        if (e.get("username") or "").lower() == target:
+            return e.get("id")
+    return None
+
+
+async def _mint_access_token(db, user: dict, password_hint: str | None) -> str | None:
+    """Log into Langflow as this specific WorkspaceX user — not the superuser
+    — so their session in Langflow belongs to them and permission checks
+    line up. Uses the password generated at provisioning time (or supplied
+    via `password_hint` on a fresh provisioning) and stashed encrypted in
+    `users.langflow_password_secret_id`."""
+    if not LANGFLOW_URL:
+        return None
+
+    password = password_hint
+    if not password:
+        cur = await db.execute(
+            "SELECT langflow_password_secret_id FROM users WHERE id = ?",
+            (user["id"],),
+        )
+        row = await cur.fetchone()
+        if row:
+            password = _decrypt(dict(row).get("langflow_password_secret_id"))
+    if not password:
+        log.warning("langflow: no stashed password for user %s — cannot SSO", user["id"])
+        return None
+
     try:
         import httpx  # type: ignore
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
-                f"{LANGFLOW_URL}/api/v1/impersonate",
-                headers={"Authorization": f"Bearer {LANGFLOW_ADMIN_TOKEN}"},
-                json={"user_id": lf_user_id},
+                f"{LANGFLOW_URL}/api/v1/login",
+                data={"username": user["email"], "password": password},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
         if resp.status_code >= 400:
+            log.warning("langflow user login failed (%s) for %s: %s",
+                        resp.status_code, user["email"], resp.text[:200])
             return None
         return (resp.json() or {}).get("access_token")
     except Exception:
-        log.exception("langflow impersonate failed")
+        log.exception("langflow user login raised")
         return None
 
 
@@ -163,7 +401,7 @@ async def flow_launch(
     if (user.get("role") or "agent") not in ("admin", "owner"):
         raise HTTPException(403, "admin only")
     db = await get_db()
-    lf_user_id, lf_folder_id = await _provision_user_and_folder(db, user)
+    lf_user_id, lf_folder_id, fresh_password = await _provision_user_and_folder(db, user)
 
     target_flow_id: str | None = None
     if agent:
@@ -174,31 +412,89 @@ async def flow_launch(
         row = await cur.fetchone()
         target_flow_id = (dict(row) if row else {}).get("langflow_flow_id")
 
-    access_token = await _mint_access_token(lf_user_id)
-
-    # Pick the redirect target. If LANGFLOW_URL is unset (dev) OR the service
-    # isn't actually reachable, send the operator to the dev-landing page so
-    # they see instructions instead of a browser-level ERR_EMPTY_RESPONSE.
-    base = LANGFLOW_URL
-    if base and not await _langflow_is_up(base):
-        base = None
-
-    if not base:
+    # Probe Langflow. If LANGFLOW_URL is unset OR the service isn't reachable
+    # from the backend, send the operator to the dev-landing page so they see
+    # instructions instead of a browser-level ERR_EMPTY_RESPONSE.
+    if not LANGFLOW_URL or not await _langflow_is_up(LANGFLOW_URL):
         return RedirectResponse("/flow/dev-landing", status_code=302)
 
-    if target_flow_id:
-        url = f"{base.rstrip('/')}/flow/{target_flow_id}"
-    else:
-        url = f"{base.rstrip('/')}/?folder={lf_folder_id}"
-
-    resp = RedirectResponse(url, status_code=302)
-    if access_token:
-        resp.set_cookie(
-            "access_token_lf", access_token,
-            httponly=True, samesite="lax",
-            max_age=60 * 60 * 8,  # 8h — matches LF default session.
+    # Grab the password we stashed during provisioning. Without it we can't
+    # sign the browser in — fall back to the dev landing + surface the issue.
+    password = fresh_password
+    if not password:
+        cur = await db.execute(
+            "SELECT langflow_password_secret_id FROM users WHERE id = ?",
+            (user["id"],),
         )
-    return resp
+        row = await cur.fetchone()
+        if row:
+            password = _decrypt(dict(row).get("langflow_password_secret_id"))
+    if not password:
+        return RedirectResponse("/flow/dev-landing?err=no-password", status_code=302)
+
+    # Auto-create a blank flow on first launch for a given agent so the user
+    # lands in the flow editor instead of Langflow's empty-folder "Welcome"
+    # splash. We create it as superuser + assign `user_id` so the flow shows
+    # up under the WorkspaceX user's account.
+    if agent and not target_flow_id:
+        target_flow_id = await _ensure_agent_flow(
+            db, agent_id=agent, workspace_id=user["workspace_id"],
+            lf_user_id=lf_user_id, lf_folder_id=lf_folder_id,
+        )
+
+    # Bridge target: go directly to the Langflow origin. We tried running LF
+    # behind a reverse-proxy at `/lf/*`, but its frontend emits root-relative
+    # URLs (<base href="/">) so assets 404 and API routes return 405 under a
+    # prefix. The cross-origin fetch works because LF sets SameSite=Lax
+    # cookies and `localhost` shares cookies across ports for same-host.
+    public = (LANGFLOW_PUBLIC_URL or LANGFLOW_URL).rstrip("/")
+    target_path = f"{public}/flow/{target_flow_id}" if target_flow_id else f"{public}/?folder={lf_folder_id}"
+    login_path = f"{public}/api/v1/login"
+
+    import html as _h
+    html = f"""<!doctype html>
+<meta charset="utf-8">
+<title>Signing you into Langflow…</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{ font-family: system-ui, -apple-system, sans-serif; padding: 64px;
+         max-width: 520px; margin: 0 auto; color: #e5e7eb;
+         background: #0f172a; text-align: center; min-height: 100vh;
+         box-sizing: border-box; }}
+  .spinner {{ width: 28px; height: 28px; border: 3px solid #1f2937;
+              border-top-color: #2563eb; border-radius: 50%;
+              animation: spin 0.9s linear infinite; margin: 0 auto 18px; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  #err {{ color: #f87171; font-size: 13px; margin-top: 16px; }}
+</style>
+<div class="spinner"></div>
+<p>Signing you in as <b>{_h.escape(user['email'])}</b>…</p>
+<div id="err"></div>
+<script>
+(async function () {{
+  const LOGIN = {json.dumps(login_path)};
+  const TARGET = {json.dumps(target_path)};
+  try {{
+    const body = new URLSearchParams();
+    body.set("username", {json.dumps(user['email'])});
+    body.set("password", {json.dumps(password)});
+    const resp = await fetch(LOGIN, {{
+      method: "POST",
+      credentials: "include",
+      headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+      body: body.toString(),
+    }});
+    if (!resp.ok) throw new Error("Langflow login returned " + resp.status);
+    // Langflow's Set-Cookie lands on the backend origin thanks to the /lf
+    // reverse-proxy — no SameSite / cross-origin gymnastics.
+    window.location.replace(TARGET);
+  }} catch (e) {{
+    document.getElementById("err").textContent =
+      "Could not sign you into Langflow (" + e.message + ")";
+  }}
+}})();
+</script>"""
+    return HTMLResponse(html)
 
 
 async def _langflow_is_up(url: str) -> bool:
@@ -233,11 +529,12 @@ async def _dev_landing() -> HTMLResponse:
     if not LANGFLOW_URL:
         title = "Langflow isn't configured"
         body = f"""
-<p>Set <code>LANGFLOW_URL</code> and <code>LANGFLOW_ADMIN_TOKEN</code> in the backend
-environment to enable the visual flow editor. In the meantime the default
-orchestrator (<code>backend/app/ai/orchestrator.py</code>) drives every inbound
-reply; agents created in AgentBuilder are persisted but won't have a visual
-editor until LF is online.</p>"""
+<p>Set <code>LANGFLOW_URL</code> and <code>LANGFLOW_SUPERUSER_PASSWORD</code> in the
+backend environment (the backend signs into Langflow as the superuser to
+provision per-user accounts). In the meantime the default orchestrator
+(<code>backend/app/ai/orchestrator.py</code>) drives every inbound reply;
+agents created in AgentBuilder are persisted but won't have a visual editor
+until LF is online.</p>"""
     else:
         title = "Langflow isn't running"
         body = f"""
@@ -268,22 +565,152 @@ a {{ color: #2563eb; }}
     return HTMLResponse(html)
 
 
+async def apply_flow_publish(
+    db,
+    *,
+    flow_id: str,
+    folder_id: str | None,
+    version: int,
+    data: dict | None,
+    name: str | None = None,
+    source: str = "webhook",
+) -> dict | None:
+    """Shared apply-path for Langflow publish events. Invoked by both the
+    webhook and the polling fallback worker so we only have one upsert site.
+
+    Returns `{agentId, workspaceId, version}` on success, or `None` when no
+    matching workspace could be resolved.
+    """
+    # 1) workspace via folder → fallback to any existing agent row.
+    ws_id: str | None = None
+    if folder_id:
+        cur = await db.execute(
+            "SELECT id FROM workspaces WHERE langflow_folder_id = ? LIMIT 1",
+            (folder_id,),
+        )
+        r = await cur.fetchone()
+        if r:
+            ws_id = r["id"] if isinstance(r, dict) or hasattr(r, "keys") else r[0]
+    if not ws_id:
+        cur = await db.execute(
+            "SELECT workspace_id FROM agents WHERE langflow_flow_id = ? LIMIT 1",
+            (flow_id,),
+        )
+        r = await cur.fetchone()
+        if r:
+            ws_id = r["workspace_id"] if hasattr(r, "keys") else r[0]
+    if not ws_id:
+        return None
+
+    # 2) Upsert the agent row. `kind` / `is_active` / `status` / `langflow_*`
+    # columns are all additive ALTERs in schema.sql, so casting the UPDATE as
+    # "mark as published" is safe on both fresh + existing rows.
+    cur = await db.execute(
+        "SELECT id FROM agents WHERE langflow_flow_id = ? AND workspace_id = ? LIMIT 1",
+        (flow_id, ws_id),
+    )
+    existing = await cur.fetchone()
+    if existing:
+        agent_id = existing["id"] if hasattr(existing, "keys") else existing[0]
+        await db.execute(
+            """
+            UPDATE agents
+               SET status = 'published', is_active = true, kind = 'langflow',
+                   last_published_at = now(),
+                   langflow_folder_id = COALESCE(?, langflow_folder_id),
+                   name = COALESCE(?, name)
+             WHERE id = ?
+            """,
+            (folder_id, name, agent_id),
+        )
+    else:
+        agent_id = str(uuid4())
+        await db.execute(
+            """
+            INSERT INTO agents (id, workspace_id, name, status, kind,
+                                langflow_flow_id, langflow_folder_id, is_active,
+                                last_published_at, created_at)
+            VALUES (?,?,?, 'published', 'langflow', ?, ?, true, now(), now())
+            """,
+            (agent_id, ws_id,
+             name or f"Flow {str(flow_id)[:8]}",
+             flow_id, folder_id),
+        )
+
+    # 3) Snapshot row. `version` is UNIQUE per agent_id, so if the caller
+    # replays the same version (e.g. webhook + poller both landing) we no-op.
+    await db.execute(
+        """
+        INSERT INTO agent_flow_snapshots
+               (id, agent_id, version, flow_json, lf_flow_id, lf_folder_id, lf_version)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT (agent_id, version) DO NOTHING
+        """,
+        (str(uuid4()), agent_id, version, js(data or {}),
+         flow_id, folder_id, version),
+    )
+
+    # 4) Flow-as-a-tool: keep an `apis` row pointed at this flow so the
+    # orchestrator / other agents can invoke it as `run_library_api("flow:<name>")`
+    # and operators see real invocation stats on the API Logs page. Row is
+    # namespaced `flow:<name>` so it doesn't collide with a user-defined api.
+    flow_slug = (name or f"Flow {str(flow_id)[:8]}").strip()
+    api_name = f"flow:{flow_slug}"[:120]
+    spec_json = js({
+        "kind": "langflow",
+        "flowId": str(flow_id),
+        "folderId": folder_id,
+        "version": version,
+        "description": "Auto-created by the Langflow publish hook — invokes "
+                       "the flow via /api/v1/run/<flowId>.",
+    })
+    cur = await db.execute(
+        "SELECT id FROM apis WHERE workspace_id = ? AND name = ? LIMIT 1",
+        (ws_id, api_name),
+    )
+    ex_api = await cur.fetchone()
+    if ex_api:
+        await db.execute(
+            "UPDATE apis SET spec = ?, description = ? WHERE id = ?",
+            (spec_json, f"Langflow flow v{version}",
+             ex_api["id"] if hasattr(ex_api, "keys") else ex_api[0]),
+        )
+    else:
+        await db.execute(
+            """
+            INSERT INTO apis (id, workspace_id, name, method, description, spec)
+            VALUES (?,?,?,?,?,?)
+            """,
+            (str(uuid4()), ws_id, api_name, "POST",
+             f"Langflow flow v{version}", spec_json),
+        )
+
+    await db.commit()
+
+    await broker.publish(f"agents:{ws_id}", "flow.published",
+                         {"agentId": agent_id, "flowId": str(flow_id),
+                          "version": version, "source": source,
+                          "at": datetime.now(timezone.utc).isoformat()})
+    return {"agentId": agent_id, "workspaceId": str(ws_id), "version": version}
+
+
 @webhook_router.post("/webhooks/langflow/published")
 async def langflow_published(
     request: Request,
     x_langflow_signature: str | None = Header(default=None, alias="X-Langflow-Signature"),
 ) -> dict:
-    """Langflow → FastAPI hook: `{flow_id, folder_id, version, data, published_at, user_id}`.
+    """Langflow → FastAPI hook: `{flow_id, folder_id, version, data, published_at, user_id, name}`.
 
-    We:
+    Pipeline (shared with the polling fallback in `worker._langflow_publish_poll_tick`):
+
       1. HMAC-verify against `LANGFLOW_WEBHOOK_SECRET` (when configured).
       2. Match the flow to a workspace via `workspaces.langflow_folder_id`.
       3. Upsert an `agents` row (`kind='langflow'`), mark it `is_active=true`
          + `status='published'` so `select_inbound_agent` prefers it.
       4. Write a snapshot row (`agent_flow_snapshots`) so the AgentBuilder can
          render the version list + restore a prior snapshot later.
-      5. Publish `flow.published` on `agents:<ws>` so any open AgentBuilder
-         tab refreshes without a polling loop.
+      5. Upsert a flow-as-a-tool `apis` row so other agents can invoke the flow.
+      6. Publish `flow.published` on `agents:<ws>`.
     """
     raw = await request.body()
     if LANGFLOW_WEBHOOK_SECRET:
@@ -298,79 +725,23 @@ async def langflow_published(
         raise HTTPException(400, "invalid json")
 
     flow_id = payload.get("flow_id") or payload.get("id")
+    if not flow_id:
+        raise HTTPException(400, "flow_id required")
     folder_id = payload.get("folder_id")
     version = int(payload.get("version") or 1)
     data = payload.get("data") or {}
-    if not flow_id:
-        raise HTTPException(400, "flow_id required")
+    name = payload.get("name")
 
     db = await get_db()
-    # 1) workspace via folder → fallback to any existing agent row.
-    ws_id = None
-    if folder_id:
-        cur = await db.execute(
-            "SELECT id FROM workspaces WHERE langflow_folder_id = ? LIMIT 1",
-            (folder_id,),
-        )
-        r = await cur.fetchone()
-        if r:
-            ws_id = r[0]
-    if not ws_id:
-        cur = await db.execute(
-            "SELECT workspace_id FROM agents WHERE langflow_flow_id = ? LIMIT 1",
-            (flow_id,),
-        )
-        r = await cur.fetchone()
-        if r:
-            ws_id = r[0]
-    if not ws_id:
+    result = await apply_flow_publish(
+        db,
+        flow_id=str(flow_id),
+        folder_id=str(folder_id) if folder_id else None,
+        version=version,
+        data=data,
+        name=name,
+        source="webhook",
+    )
+    if not result:
         return {"ok": True, "ignored": "no workspace match"}
-
-    # 2) Upsert the agent row.
-    cur = await db.execute(
-        "SELECT id FROM agents WHERE langflow_flow_id = ? AND workspace_id = ?",
-        (flow_id, ws_id),
-    )
-    existing = await cur.fetchone()
-    if existing:
-        agent_id = existing["id"]
-        await db.execute(
-            """
-            UPDATE agents
-               SET status = 'published', is_active = true, kind = 'langflow',
-                   updated_at = now(), langflow_folder_id = COALESCE(?, langflow_folder_id)
-             WHERE id = ?
-            """,
-            (folder_id, agent_id),
-        )
-    else:
-        agent_id = str(uuid4())
-        await db.execute(
-            """
-            INSERT INTO agents (id, workspace_id, name, status, kind,
-                                langflow_flow_id, langflow_folder_id, is_active,
-                                created_at, updated_at)
-            VALUES (?,?,?, 'published', 'langflow', ?, ?, true, now(), now())
-            """,
-            (agent_id, ws_id,
-             payload.get("name") or f"Flow {str(flow_id)[:8]}",
-             flow_id, folder_id),
-        )
-
-    # 3) Snapshot row.
-    await db.execute(
-        """
-        INSERT INTO agent_flow_snapshots (id, agent_id, workspace_id, data,
-                                          lf_flow_id, lf_folder_id, lf_version,
-                                          created_at)
-        VALUES (?,?,?,?,?,?,?, now())
-        """,
-        (str(uuid4()), agent_id, ws_id, js(data),
-         flow_id, folder_id, version),
-    )
-    await db.commit()
-
-    await broker.publish(f"agents:{ws_id}", "flow.published",
-                         {"agentId": agent_id, "flowId": flow_id, "version": version,
-                          "at": datetime.now(timezone.utc).isoformat()})
-    return {"ok": True, "agentId": agent_id, "version": version}
+    return {"ok": True, **result}

@@ -31,6 +31,14 @@ async def members(user: dict = Me) -> list[dict]:
     return [dict(r) for r in await cur.fetchall()]
 
 
+async def _workspace_member_ids(db, workspace_id: str) -> list[str]:
+    cur = await db.execute(
+        "SELECT id FROM users WHERE workspace_id = ? ORDER BY created_at NULLS LAST, id",
+        (workspace_id,),
+    )
+    return [str(r["id"]) for r in await cur.fetchall()]
+
+
 @router.get("/channels")
 async def channels(user: dict = Me) -> list[dict]:
     db = await get_db()
@@ -39,13 +47,18 @@ async def channels(user: dict = Me) -> list[dict]:
         (user["workspace_id"],),
     )
     rows = [dict(r) for r in await cur.fetchall()]
+    # Channels are workspace-open in the current schema (no per-channel members
+    # table), so "members" is the full workspace roster. The frontend dereferences
+    # `ch.members` in the chat header + info pane, so returning an empty list
+    # would blank out the avatar stack.
+    members = await _workspace_member_ids(db, user["workspace_id"])
     out = []
     for c in rows:
         cur2 = await db.execute(
             "SELECT COUNT(*) FROM teams_messages WHERE channel_id = ?", (c["id"],)
         )
         count = (await cur2.fetchone())[0] or 0
-        out.append({**c, "messageCount": count})
+        out.append({**c, "messageCount": count, "members": members})
     return out
 
 
@@ -53,13 +66,29 @@ async def channels(user: dict = Me) -> list[dict]:
 async def create_channel(body: dict, user: dict = Me) -> dict:
     db = await get_db()
     cid = str(uuid4())
-    await db.execute(
-        "INSERT INTO teams_channels (id, workspace_id, name, description, privacy) VALUES (?,?,?,?,?)",
-        (cid, user["workspace_id"], body.get("name", "new-channel"),
-         body.get("description", ""), body.get("privacy", "private")),
-    )
-    await db.commit()
-    return {"id": cid, "name": body.get("name", "new-channel")}
+    name = (body.get("name") or "new-channel").strip().lower() or "new-channel"
+    description = body.get("description") or ""
+    privacy = body.get("privacy") or "private"
+    try:
+        await db.execute(
+            "INSERT INTO teams_channels (id, workspace_id, name, description, privacy) VALUES (?,?,?,?,?)",
+            (cid, user["workspace_id"], name, description, privacy),
+        )
+        await db.commit()
+    except Exception as e:
+        msg = str(e).lower()
+        if "unique" in msg or "duplicate" in msg:
+            raise HTTPException(409, "A channel with that name already exists")
+        raise
+    members = await _workspace_member_ids(db, user["workspace_id"])
+    return {
+        "id": cid,
+        "name": name,
+        "description": description,
+        "privacy": privacy,
+        "messageCount": 0,
+        "members": members,
+    }
 
 
 @router.get("/dms")

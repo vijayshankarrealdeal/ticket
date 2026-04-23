@@ -60,7 +60,7 @@ export default function Tickets() {
 
   useEffect(() => {
     let alive = true;
-    api.get('/tickets')
+    api.get('/tickets?filter=all')
       .then((res) => {
         if (!alive) return;
         const items = Array.isArray(res) ? res : res?.items || [];
@@ -328,6 +328,9 @@ export default function Tickets() {
                 t={selected}
                 sidebarCollapsed={sidebarCollapsed}
                 onShowSidebar={() => setSidebarCollapsed(false)}
+                onPatch={(patch) =>
+                  setTickets((prev) => prev.map((x) => x.id === selected.id ? { ...x, ...patch, id: x.id } : x))
+                }
               />
             )}
             <div className="detail-tabs">
@@ -423,8 +426,103 @@ function TicketCard({ t, selected, onClick }) {
   );
 }
 
-function DetailHeader({ t, sidebarCollapsed, onShowSidebar }) {
+function DetailHeader({ t, sidebarCollapsed, onShowSidebar, onPatch }) {
   const meta = statusMeta[t.status];
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [busy, setBusy] = useState(null); // 'refresh' | 'status' | null
+  const [flash, setFlash] = useState(null);
+  const moreRef = useRef(null);
+  const flashOk = (msg) => { setFlash({ ok: true, msg }); setTimeout(() => setFlash(null), 2000); };
+  const flashErr = (msg) => { setFlash({ ok: false, msg }); setTimeout(() => setFlash(null), 3000); };
+
+  useEffect(() => {
+    function onClick(e) {
+      if (moreRef.current && !moreRef.current.contains(e.target)) setMoreOpen(false);
+    }
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, []);
+
+  async function copyToClipboard(text) {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      return true;
+    } catch { return false; }
+  }
+
+  async function handleCopyLink() {
+    const idParam = encodeURIComponent(t.id);
+    const url = `${window.location.origin}/tickets?id=${idParam}`;
+    const ok = await copyToClipboard(url);
+    if (ok) flashOk('Link copied'); else flashErr('Copy failed');
+  }
+
+  async function handleRefresh() {
+    if (busy) return;
+    setBusy('refresh');
+    try {
+      const detail = await api.get(`/tickets/${encodeURIComponent(t.id)}`);
+      if (detail && onPatch) onPatch(detail);
+      flashOk('Refreshed');
+    } catch (e) {
+      flashErr(e?.message || 'refresh failed');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleCopyId() {
+    setMoreOpen(false);
+    const ok = await copyToClipboard(t.id);
+    if (ok) flashOk('ID copied'); else flashErr('Copy failed');
+  }
+
+  async function handleToggleStatus() {
+    setMoreOpen(false);
+    if (busy) return;
+    const isResolvedLike = t.status === 'resolved' || t.status === 'closed';
+    const nextStatus = isResolvedLike ? 'queued' : 'resolved';
+    setBusy('status');
+    try {
+      const updated = await api.patch(`/tickets/${encodeURIComponent(t.id)}`, { status: nextStatus });
+      if (onPatch) onPatch(updated || { status: nextStatus });
+      flashOk(isResolvedLike ? 'Ticket reopened' : 'Marked resolved');
+    } catch (e) {
+      flashErr(e?.message || 'update failed');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleSendCsat() {
+    setMoreOpen(false);
+    if (busy) return;
+    setBusy('csat');
+    try {
+      const res = await api.post(`/tickets/${encodeURIComponent(t.id)}/csat/send`, {});
+      const via = Array.isArray(res?.sentVia) && res.sentVia.length ? res.sentVia.join(' + ') : null;
+      if (res?.delivered && via) flashOk(`Survey queued via ${via}`);
+      else if (res?.url) { await copyToClipboard(res.url); flashOk('Survey link copied'); }
+      else flashErr('No contact channel');
+    } catch (e) {
+      flashErr(e?.message || 'send failed');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const isResolvedLike = t.status === 'resolved' || t.status === 'closed';
   return (
     <div className="detail-header">
       <div className="detail-header-left">
@@ -435,10 +533,75 @@ function DetailHeader({ t, sidebarCollapsed, onShowSidebar }) {
         </span>
         <span className="detail-header-task">{t.task}</span>
       </div>
-      <div className="detail-header-right">
-        <button className="icon-btn" title="Copy link"><Icon.Paperclip /></button>
-        <button className="icon-btn" title="Refresh"><Icon.Refresh /></button>
-        <button className="icon-btn" title="More"><Icon.More /></button>
+      <div className="detail-header-right" style={{ position: 'relative' }}>
+        {flash && (
+          <span
+            style={{
+              position: 'absolute',
+              right: 0,
+              top: '100%',
+              marginTop: 6,
+              fontSize: 12,
+              padding: '4px 8px',
+              borderRadius: 6,
+              background: 'var(--panel-2)',
+              border: '1px solid var(--border)',
+              color: flash.ok ? 'var(--success, #22c55e)' : 'var(--danger, #ef4444)',
+              whiteSpace: 'nowrap',
+              zIndex: 5,
+              pointerEvents: 'none',
+            }}
+          >
+            {flash.msg}
+          </span>
+        )}
+        <button className="icon-btn" title="Copy link" onClick={handleCopyLink}>
+          <Icon.Paperclip />
+        </button>
+        <button
+          className="icon-btn"
+          title="Refresh"
+          onClick={handleRefresh}
+          disabled={busy === 'refresh'}
+        >
+          <Icon.Refresh
+            style={busy === 'refresh' ? { animation: 'spin 0.8s linear infinite' } : undefined}
+          />
+        </button>
+        <div className="dropdown" ref={moreRef} style={{ display: 'flex' }}>
+          <button
+            className={'icon-btn' + (moreOpen ? ' active' : '')}
+            title="More"
+            onClick={() => setMoreOpen((v) => !v)}
+          >
+            <Icon.More />
+          </button>
+          {moreOpen && (
+            <div className="dropdown-menu" style={{ right: 0, left: 'auto', minWidth: 180 }}>
+              <button className="filter-option button-row" onClick={handleCopyId}>
+                <Icon.Paperclip />
+                <span>Copy ID</span>
+              </button>
+              <button
+                className="filter-option button-row"
+                onClick={handleToggleStatus}
+                disabled={busy === 'status'}
+              >
+                <Icon.Check2 />
+                <span>{isResolvedLike ? 'Reopen ticket' : 'Mark resolved'}</span>
+              </button>
+              <button
+                className="filter-option button-row"
+                onClick={handleSendCsat}
+                disabled={busy === 'csat' || !isResolvedLike}
+                title={isResolvedLike ? 'Send CSAT survey link' : 'Resolve the ticket first'}
+              >
+                <Icon.Mail />
+                <span>{busy === 'csat' ? 'Sending…' : 'Send CSAT survey'}</span>
+              </button>
+            </div>
+          )}
+        </div>
         {sidebarCollapsed && (
           <button
             className="icon-btn side-toggle-btn"

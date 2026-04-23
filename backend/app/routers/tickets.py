@@ -245,6 +245,10 @@ async def list_tickets(
         clauses.append("t.assignee_id IS NULL")
     elif filter == "blocked":
         clauses.append("t.status = 'blocked'")
+    elif filter == "resolved":
+        clauses.append("t.status IN ('resolved','closed')")
+    elif filter == "all":
+        pass
     elif filter == "all-open" or not filter:
         clauses.append("t.status NOT IN ('resolved','closed')")
     if q:
