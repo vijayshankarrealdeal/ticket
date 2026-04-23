@@ -13,10 +13,11 @@ from __future__ import annotations
 from uuid import uuid4
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 
 from ..db import get_db, jl, js
-from ..deps import Me
+from ..deps import AgentOrAdmin, Me
+from ..idempotency import check_idempotency, save_idempotency
 from ..schemas import MessageIn, NoteIn
 from ..ws import broker
 
@@ -241,7 +242,19 @@ async def list_messages(conv_id: str, user: dict = Me) -> list[dict]:
 
 
 @router.post("/conversations/{conv_id}/messages")
-async def post_message(conv_id: str, body: MessageIn, user: dict = Me) -> dict:
+async def post_message(
+    conv_id: str,
+    body: MessageIn,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    user: dict = AgentOrAdmin,
+) -> dict:
+    # Fall back to body.tempId as the idempotency key so the optimistic-UI
+    # contract (wire.md §2) is protected from double-submits out of the box.
+    idem_key = idempotency_key or (body.tempId if body.tempId else None)
+    scope = f"conv.{conv_id}.msg"
+    cached = await check_idempotency(user, scope, idem_key)
+    if cached is not None:
+        return cached
     db = await get_db()
     cur = await db.execute(
         "SELECT * FROM conversations WHERE id = ? AND workspace_id = ?",
@@ -295,11 +308,12 @@ async def post_message(conv_id: str, body: MessageIn, user: dict = Me) -> dict:
         )
         await db.commit()
         await broker.publish(f"ticket:{tid}", "ticket.timeline.appended", {"ticket_id": tid})
+    await save_idempotency(user, scope, idem_key, msg)
     return msg
 
 
 @router.post("/conversations/{conv_id}/notes")
-async def post_note(conv_id: str, body: NoteIn, user: dict = Me) -> dict:
+async def post_note(conv_id: str, body: NoteIn, user: dict = AgentOrAdmin) -> dict:
     db = await get_db()
     note_id = str(uuid4())
     now = _now()
@@ -315,7 +329,7 @@ async def post_note(conv_id: str, body: NoteIn, user: dict = Me) -> dict:
 
 
 @router.post("/conversations/{conv_id}/typing")
-async def typing(conv_id: str, body: dict, user: dict = Me) -> dict:
+async def typing(conv_id: str, body: dict, user: dict = AgentOrAdmin) -> dict:
     await broker.publish(
         f"conv:{conv_id}",
         "typing.started" if body.get("on", True) else "typing.stopped",
@@ -331,6 +345,138 @@ async def mark_read(message_id: str, user: dict = Me) -> dict:
     await db.execute("UPDATE messages SET read_at = ? WHERE id = ?", (now, message_id))
     await db.commit()
     return {"ok": True}
+
+
+@router.post("/conversations/{conv_id}/inbound")
+async def post_inbound(
+    conv_id: str,
+    body: dict,
+    user: dict = AgentOrAdmin,
+) -> dict:
+    """Simulates a channel adapter receiving a customer message. Writes the
+    message, runs the Stage-1 intent classifier, and executes the resulting
+    `attach | reopen | create` decision. Real channel connectors (WhatsApp /
+    Gmail / Shopify) will call the same code path.
+
+    Body: {text, attachments?, customerPhone?, externalMessageId?}
+    """
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM conversations WHERE id = ? AND workspace_id = ?",
+        (conv_id, user["workspace_id"]),
+    )
+    conv = await cur.fetchone()
+    if not conv:
+        raise HTTPException(404, "conversation not found")
+    conv = dict(conv)
+
+    msg_id = str(uuid4())
+    now = _now()
+    text = body.get("text") or ""
+    attachments = body.get("attachments") or []
+    preview = text[:160]
+    await db.execute(
+        """
+        INSERT INTO messages (id, workspace_id, conversation_id, from_role, from_name,
+                              external_message_id, at, text, attachments)
+        VALUES (?,?,?, 'customer', ?, ?, ?, ?, ?)
+        """,
+        (msg_id, user["workspace_id"], conv_id,
+         body.get("fromName") or "Customer",
+         body.get("externalMessageId"),
+         now, text, js(attachments)),
+    )
+    await db.execute(
+        """
+        UPDATE conversations
+           SET preview = ?, last_message_at = ?, last_inbound_at = ?,
+               unread_count = unread_count + 1
+         WHERE id = ?
+        """,
+        (preview, now, now, conv_id),
+    )
+    await db.commit()
+
+    # Ask the intent classifier what to do with this message.
+    from .tickets import intent_classify
+    decision = await intent_classify(
+        {"conversationId": conv_id, "text": text}, user
+    )
+
+    # Apply the decision. `attach` appends to an existing ticket's timeline;
+    # `reopen` flips status + appends; `create` spawns a new ticket.
+    ticket_id = decision.get("ticketId")
+    if decision["decision"] == "reopen" and ticket_id:
+        await db.execute(
+            "UPDATE tickets SET status = 'queued', updated_at = now() WHERE id = ?",
+            (ticket_id,),
+        )
+        await db.execute(
+            "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'customer', ?)",
+            (ticket_id, f"Reopened — customer replied: {preview}"),
+        )
+        await db.commit()
+    elif decision["decision"] == "attach" and ticket_id:
+        await db.execute(
+            "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'customer', ?)",
+            (ticket_id, f"Customer replied: {preview}"),
+        )
+        await db.commit()
+    elif decision["decision"] == "create":
+        from datetime import timedelta
+        sla_due = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+        cur = await db.execute(
+            """
+            INSERT INTO tickets (workspace_id, customer_id, conversation_id, source, channel,
+                                 task, team, priority, subject, description,
+                                 tags, custom_fields, status, sla_due_at,
+                                 intent_key, intent_confidence, order_ref)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'queued',?, ?,?,?)
+            RETURNING id
+            """,
+            (user["workspace_id"], conv["customer_id"], conv_id,
+             conv["channel"], conv["channel"],
+             decision["intentKey"], "Support", "normal",
+             preview[:80], text, js([]), js({}), sla_due,
+             decision["intentKey"], decision["confidence"], decision.get("orderRef")),
+        )
+        ticket_id = cur.lastrowid
+        await db.execute(
+            "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'system', ?)",
+            (ticket_id, f"Ticket auto-created by intent classifier — {decision['reason']}"),
+        )
+        await db.commit()
+        await broker.publish(
+            f"inbox:{user['workspace_id']}", "ticket.created",
+            {"id": ticket_id, "subject": preview[:80], "task": decision["intentKey"]},
+        )
+
+    # Fan out the message to open consumers.
+    msg = {
+        "id": msg_id,
+        "from": "them",
+        "fromName": body.get("fromName") or "Customer",
+        "at": _fmt_time(now),
+        "text": text,
+        "delivered": True,
+        "attachments": attachments,
+    }
+    await broker.publish(f"conv:{conv_id}", "message.created", msg)
+    await broker.publish(
+        f"inbox:{user['workspace_id']}",
+        "conversation.updated",
+        {"id": conv_id, "preview": preview, "date": _fmt_time(now)},
+    )
+    if ticket_id:
+        await broker.publish(
+            f"ticket:{ticket_id}", "ticket.timeline.appended", {"ticket_id": ticket_id}
+        )
+
+    return {
+        "message": msg,
+        "intent": decision,
+        "ticketId": ticket_id,
+    }
 
 
 @router.get("/conversations/{conv_id}/tickets")

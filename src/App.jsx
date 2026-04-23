@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { GlobalSearchProvider } from './hooks/useGlobalSearch.jsx';
 import { useAnimationPref } from './hooks/useAnimationPref.js';
 import Sidebar from './components/Sidebar.jsx';
@@ -19,6 +19,7 @@ import ApiLogs from './pages/channels/ApiLogs.jsx';
 import GoogleSheets from './pages/channels/GoogleSheets.jsx';
 import Health from './pages/channels/Health.jsx';
 import Notifications from './pages/Notifications.jsx';
+import PublicCsat from './pages/PublicCsat.jsx';
 import AuthPage, { loadAuth, saveAuth } from './pages/AuthPage.jsx';
 import './animations.css';
 import './App.css';
@@ -26,6 +27,17 @@ import './App.css';
 export default function App() {
   const [user, setUser] = useState(() => loadAuth());
   useAnimationPref();
+  const location = useLocation();
+
+  // Public CSAT survey is reachable without auth — the survey link is sent
+  // to customers who do not have workspace accounts.
+  if (location.pathname.startsWith('/csat/')) {
+    return (
+      <Routes>
+        <Route path="/csat/:token" element={<PublicCsat />} />
+      </Routes>
+    );
+  }
 
   if (!user) {
     return (

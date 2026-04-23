@@ -4,34 +4,54 @@ import { api } from '../../api.js';
 
 const STATUS_FILTERS = [
   { key: 'all', label: 'All', match: () => true },
-  { key: 'success', label: 'Success', match: (s) => String(s).startsWith('2') },
-  { key: 'client', label: '4xx errors', match: (s) => String(s).startsWith('4') },
-  { key: 'server', label: '5xx errors', match: (s) => String(s).startsWith('5') },
+  { key: 'success', label: 'Success', match: (s) => s >= 200 && s < 300 },
+  { key: 'client', label: '4xx errors', match: (s) => s >= 400 && s < 500 },
+  { key: 'server', label: '5xx errors', match: (s) => s >= 500 },
 ];
+
+function relTime(iso) {
+  if (!iso) return '—';
+  try {
+    const d = new Date(iso);
+    const secs = Math.max(1, Math.round((Date.now() - d.getTime()) / 1000));
+    if (secs < 60) return `${secs}s ago`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+    return `${Math.floor(secs / 86400)}d ago`;
+  } catch { return '—'; }
+}
 
 export default function ApiLogs() {
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState('all');
   const [apiFilter, setApiFilter] = useState('ALL');
   const [selected, setSelected] = useState(null);
+  const [selectedDetail, setSelectedDetail] = useState(null);
   const [logs, setLogs] = useState([]);
   const [stats, setStats] = useState(null);
 
-  useEffect(() => {
-    let alive = true;
-    Promise.all([
+  async function refresh() {
+    const [l, s] = await Promise.all([
       api.get('/api-logs').catch(() => []),
       api.get('/api-logs/stats').catch(() => null),
-    ]).then(([l, s]) => {
-      if (!alive) return;
-      setLogs(Array.isArray(l) ? l : l?.items || []);
-      setStats(s || null);
-    });
+    ]);
+    setLogs(Array.isArray(l) ? l : l?.items || []);
+    setStats(s || null);
+  }
+
+  useEffect(() => { refresh(); }, []);
+
+  useEffect(() => {
+    if (!selected) { setSelectedDetail(null); return; }
+    let alive = true;
+    api.get(`/api-logs/${encodeURIComponent(selected.id)}`)
+      .then((d) => { if (alive) setSelectedDetail(d); })
+      .catch(() => { if (alive) setSelectedDetail({ error: 'failed to load detail' }); });
     return () => { alive = false; };
-  }, []);
+  }, [selected?.id]);
 
   const apiOptions = useMemo(
-    () => ['ALL', ...Array.from(new Set(logs.map((l) => l.apiName).filter(Boolean)))],
+    () => ['ALL', ...Array.from(new Set(logs.map((l) => l.apiName).filter((n) => n && n !== '—')))],
     [logs],
   );
 
@@ -39,30 +59,47 @@ export default function ApiLogs() {
     const q = query.trim().toLowerCase();
     const filter = STATUS_FILTERS.find((f) => f.key === status).match;
     return logs.filter((l) => {
-      if (!filter(l.status)) return false;
+      if (!filter(Number(l.status))) return false;
       if (apiFilter !== 'ALL' && l.apiName !== apiFilter) return false;
       if (!q) return true;
       return (
         (l.apiName || '').toLowerCase().includes(q) ||
         (l.customerId || '').toLowerCase().includes(q) ||
-        (l.executeAction || '').toLowerCase().includes(q)
+        (l.traceId || '').toLowerCase().includes(q)
       );
     });
   }, [query, status, apiFilter, logs]);
 
   const counts = useMemo(() => {
-    if (stats) return {
-      total: stats.total ?? logs.length,
-      success: stats.success ?? 0,
-      err4: stats.err4 ?? 0,
-      err5: stats.err5 ?? 0,
-    };
+    if (stats) {
+      return {
+        total: stats.total ?? 0,
+        success: stats.success ?? stats.breakdown?.['2xx'] ?? 0,
+        err4: stats.breakdown?.['4xx'] ?? 0,
+        err5: stats.breakdown?.['5xx'] ?? 0,
+      };
+    }
     const total = logs.length;
-    const success = logs.filter((l) => String(l.status).startsWith('2')).length;
-    const err4 = logs.filter((l) => String(l.status).startsWith('4')).length;
-    const err5 = logs.filter((l) => String(l.status).startsWith('5')).length;
+    const success = logs.filter((l) => Number(l.status) >= 200 && Number(l.status) < 300).length;
+    const err4 = logs.filter((l) => Number(l.status) >= 400 && Number(l.status) < 500).length;
+    const err5 = logs.filter((l) => Number(l.status) >= 500).length;
     return { total, success, err4, err5 };
   }, [logs, stats]);
+
+  const successRate = counts.total ? Math.round((counts.success / counts.total) * 100) : 100;
+
+  const downloadCsv = () => {
+    const headers = ['at', 'apiName', 'customerId', 'traceId', 'status', 'latencyMs'];
+    const body = filtered
+      .map((l) => headers.map((h) => JSON.stringify(l[h] ?? '')).join(','))
+      .join('\n');
+    const blob = new Blob([headers.join(',') + '\n' + body], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'api-logs.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
 
   return (
     <div className="ch-page">
@@ -79,14 +116,14 @@ export default function ApiLogs() {
           </p>
         </div>
         <div className="ch-page-head-actions">
-          <button className="btn secondary"><Icon.Refresh /> Refresh</button>
-          <button className="btn secondary"><Icon.ExternalLink /> Export CSV</button>
+          <button className="btn secondary" onClick={refresh}><Icon.Refresh /> Refresh</button>
+          <button className="btn secondary" onClick={downloadCsv}><Icon.ExternalLink /> Export CSV</button>
         </div>
       </div>
 
       <div className="ch-kpi-row">
         <Kpi label="Requests · 24h" value={counts.total} />
-        <Kpi label="Success rate" value={`${Math.round((counts.success / counts.total) * 100)}%`} tone="success" delta="+1.2%" />
+        <Kpi label="Success rate" value={`${successRate}%`} tone="success" />
         <Kpi label="4xx errors" value={counts.err4} tone="warning" />
         <Kpi label="5xx errors" value={counts.err5} tone="danger" />
       </div>
@@ -113,13 +150,12 @@ export default function ApiLogs() {
             options={apiOptions.map((o) => ({ value: o, label: o }))}
             onChange={setApiFilter}
           />
-          <DateRange />
           <div className="ch-search">
             <Icon.Search />
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search by API, customer or action"
+              placeholder="Search by API, customer or trace id"
             />
             {query && (
               <button className="ch-search-clear" onClick={() => setQuery('')}>
@@ -137,7 +173,7 @@ export default function ApiLogs() {
               <tr>
                 <th style={{ width: 140 }}>Time</th>
                 <th>API</th>
-                <th>Execute action</th>
+                <th>Trace</th>
                 <th>Customer ID</th>
                 <th style={{ width: 110 }}>Status</th>
                 <th className="num" style={{ width: 100 }}>Latency</th>
@@ -158,12 +194,12 @@ export default function ApiLogs() {
                     className={'ch-log-row' + (selected?.id === l.id ? ' active' : '')}
                     onClick={() => setSelected(l)}
                   >
-                    <td className="muted">{l.time}</td>
+                    <td className="muted">{relTime(l.at)}</td>
                     <td><span className="ch-api-name">{l.apiName}</span></td>
-                    <td><span className="ch-chip">{l.executeAction}</span></td>
-                    <td className="muted">{l.customerId}</td>
+                    <td><span className="ch-chip" style={{ fontFamily: 'ui-monospace, monospace', fontSize: 11 }}>{l.traceId}</span></td>
+                    <td className="muted">{l.customerId || '—'}</td>
                     <td><StatusPill code={l.status} /></td>
-                    <td className="num">{l.latency}ms</td>
+                    <td className="num">{l.latencyMs}ms</td>
                     <td>
                       <button className="ch-row-action">View</button>
                     </td>
@@ -180,7 +216,7 @@ export default function ApiLogs() {
               <div>
                 <div className="ch-log-detail-title">{selected.apiName}</div>
                 <div className="ch-log-detail-sub">
-                  {selected.timestamp.toLocaleString()} · {selected.customerId}
+                  {selected.at ? new Date(selected.at).toLocaleString() : '—'} · {selected.customerId || '—'}
                 </div>
               </div>
               <button className="ch-icon-btn" onClick={() => setSelected(null)} title="Close">
@@ -194,42 +230,34 @@ export default function ApiLogs() {
               </div>
               <div>
                 <div className="ch-log-meta-label">Latency</div>
-                <div className="ch-log-meta-value">{selected.latency}ms</div>
+                <div className="ch-log-meta-value">{selected.latencyMs}ms</div>
               </div>
               <div>
-                <div className="ch-log-meta-label">Action</div>
-                <div className="ch-log-meta-value">{selected.executeAction}</div>
+                <div className="ch-log-meta-label">Trace</div>
+                <div className="ch-log-meta-value" style={{ fontFamily: 'ui-monospace, monospace', fontSize: 12 }}>
+                  {selected.traceId}
+                </div>
               </div>
             </div>
             <div className="ch-log-section">
               <div className="ch-log-section-title">Request</div>
-              <pre className="ch-code-block">{`POST /api/v1/${selected.executeAction}
-Host: api.workspace.io
-Authorization: Bearer ••••
-Content-Type: application/json
-
-{
-  "customer_id": "${selected.customerId}",
-  "source": "agent_runtime",
-  "trace_id": "${selected.id}"
-}`}</pre>
+              <pre className="ch-code-block">{
+                selectedDetail
+                  ? selectedDetail.error
+                    ? `// ${selectedDetail.error}`
+                    : JSON.stringify(selectedDetail.request, null, 2)
+                  : '// loading…'
+              }</pre>
             </div>
             <div className="ch-log-section">
               <div className="ch-log-section-title">Response</div>
-              <pre className="ch-code-block">{selected.status.startsWith('2')
-                ? `${selected.status} OK
-
-{
-  "ok": true,
-  "duration_ms": ${selected.latency},
-  "data": { "matched": 12 }
-}`
-                : `${selected.status} ${selected.status.startsWith('4') ? 'Bad Request' : 'Internal Server Error'}
-
-{
-  "error": "${selected.status.startsWith('4') ? 'invalid_request' : 'upstream_failure'}",
-  "message": "See runbook for remediation steps."
-}`}</pre>
+              <pre className="ch-code-block">{
+                selectedDetail
+                  ? selectedDetail.error
+                    ? ''
+                    : JSON.stringify(selectedDetail.response, null, 2)
+                  : '// loading…'
+              }</pre>
             </div>
           </aside>
         )}
@@ -264,19 +292,10 @@ function Dropdown({ label, value, options, onChange }) {
   );
 }
 
-function DateRange() {
-  return (
-    <button className="ch-date-range" type="button">
-      <Icon.Calendar />
-      <span>Last 24h</span>
-      <Icon.Chevron />
-    </button>
-  );
-}
-
 function StatusPill({ code }) {
-  const tone = code.startsWith('2') ? 'success' : code.startsWith('4') ? 'warning' : 'danger';
-  const label = code.startsWith('2') ? 'Success' : code.startsWith('4') ? 'Client' : 'Server';
+  const n = Number(code);
+  const tone = n >= 200 && n < 300 ? 'success' : n >= 400 && n < 500 ? 'warning' : 'danger';
+  const label = n >= 200 && n < 300 ? 'Success' : n >= 400 && n < 500 ? 'Client' : 'Server';
   return (
     <span className={'ch-status-pill tone-' + tone}>
       <span className="ch-status-code">{code}</span>

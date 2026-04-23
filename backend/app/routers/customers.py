@@ -163,4 +163,59 @@ async def patch_customer(customer_id: str, body: dict, user: dict = Me) -> dict:
 
 @router.get("/customers/{customer_id}/recordings")
 async def customer_recordings(customer_id: str, user: dict = Me) -> list[dict]:
-    return []
+    """Voice call recordings pulled from each conversation's jsonb blob.
+    Real ingestion lands with the telephony adapter in Build 4 (spec §6.7)."""
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT id, channel, recordings FROM conversations
+         WHERE customer_id = ? AND workspace_id = ?
+           AND jsonb_array_length(COALESCE(recordings, '[]'::jsonb)) > 0
+         ORDER BY last_message_at DESC
+        """,
+        (customer_id, user["workspace_id"]),
+    )
+    out: list[dict] = []
+    for r in [dict(x) for x in await cur.fetchall()]:
+        for rec in jl(r.get("recordings"), []):
+            out.append({"conversationId": r["id"], "channel": r["channel"], **rec})
+    return out
+
+
+@router.get("/channels/for-customer/{customer_id}")
+async def channels_for_customer(customer_id: str, user: dict = Me) -> list[dict]:
+    """Channel switcher source (spec §3.3). Returns one row per channel the
+    customer has been reachable on so the conversation header can hop between
+    WhatsApp / Mail / Call for the same person."""
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT channel, MAX(last_message_at) AS last_at, COUNT(*) AS n
+          FROM conversations
+         WHERE customer_id = ? AND workspace_id = ?
+         GROUP BY channel
+         ORDER BY last_at DESC NULLS LAST
+        """,
+        (customer_id, user["workspace_id"]),
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    # Enrich with the most recent conversation id per channel so the UI can
+    # deep-link without a second round-trip.
+    out: list[dict] = []
+    for r in rows:
+        cur2 = await db.execute(
+            """
+            SELECT id FROM conversations
+             WHERE customer_id = ? AND workspace_id = ? AND channel = ?
+             ORDER BY last_message_at DESC NULLS LAST LIMIT 1
+            """,
+            (customer_id, user["workspace_id"], r["channel"]),
+        )
+        row = await cur2.fetchone()
+        out.append({
+            "channel": r["channel"],
+            "conversationId": row[0] if row else None,
+            "lastAt": r.get("last_at"),
+            "count": r.get("n"),
+        })
+    return out

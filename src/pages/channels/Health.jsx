@@ -16,19 +16,38 @@ export default function Health() {
   const [window, setWindow] = useState('30d');
   const [services, setServices] = useState([]);
   const [incidents, setIncidents] = useState([]);
+  const [flash, setFlash] = useState(null);
 
-  useEffect(() => {
-    let alive = true;
-    Promise.all([
+  async function refresh() {
+    const [s, i] = await Promise.all([
       api.get('/health/services').catch(() => []),
       api.get('/incidents').catch(() => []),
-    ]).then(([s, i]) => {
-      if (!alive) return;
-      setServices(Array.isArray(s) ? s : s?.items || []);
-      setIncidents(Array.isArray(i) ? i : i?.items || []);
-    });
-    return () => { alive = false; };
-  }, []);
+    ]);
+    setServices(Array.isArray(s) ? s : s?.items || []);
+    setIncidents(Array.isArray(i) ? i : i?.items || []);
+  }
+
+  useEffect(() => { refresh(); }, []);
+
+  async function reRun() {
+    setFlash('Re-running…');
+    await refresh();
+    setFlash('Checks refreshed');
+    setTimeout(() => setFlash(null), 2000);
+  }
+
+  async function subscribe() {
+    const email = prompt('Get notified when status changes — email?');
+    if (!email) return;
+    try {
+      await api.post('/incidents/subscribe', { email });
+      setFlash('Subscribed · check inbox');
+      setTimeout(() => setFlash(null), 2500);
+    } catch (e) {
+      setFlash(`Subscribe failed: ${e.message || e}`);
+      setTimeout(() => setFlash(null), 3500);
+    }
+  }
 
   const filtered = useMemo(() => {
     if (filter === 'all') return services;
@@ -73,10 +92,13 @@ export default function Health() {
           </p>
         </div>
         <div className="ch-page-head-actions">
-          <button className="btn secondary"><Icon.Refresh /> Re-run checks</button>
-          <button className="btn secondary"><Icon.Bell /> Subscribe</button>
+          <button className="btn secondary" onClick={reRun}><Icon.Refresh /> Re-run checks</button>
+          <button className="btn secondary" onClick={subscribe}><Icon.Bell /> Subscribe</button>
         </div>
       </div>
+      {flash && (
+        <div style={{ padding: '6px 12px', color: 'var(--muted)', fontSize: 13 }}>{flash}</div>
+      )}
 
       <div className={'ch-status-banner tone-' + overall.tone}>
         <div className="ch-status-banner-left">

@@ -4,10 +4,11 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 
 from ..db import get_db, jl, js
-from ..deps import Me
+from ..deps import AgentOrAdmin, Me
+from ..idempotency import check_idempotency, save_idempotency
 from ..schemas import (
     ChildTicketIn,
     TicketCreateIn,
@@ -15,6 +16,7 @@ from ..schemas import (
     TicketResolveIn,
 )
 from ..ws import broker
+from .notifications import create_notification
 
 router = APIRouter(tags=["tickets"])
 
@@ -89,6 +91,28 @@ async def _get_user_name(db, uid: str | None) -> str | None:
     return r[0] if r else None
 
 
+async def _sla_hours(db, workspace_id: str, team: str | None, task: str | None,
+                     priority: str | None) -> float:
+    """Resolve SLA hours from `sla_policies` by most-specific match first. Falls
+    back to 24h when no policy is configured."""
+    cur = await db.execute(
+        """
+        SELECT hours FROM sla_policies
+         WHERE workspace_id = ?
+           AND (team IS NULL OR team = ?)
+           AND (task IS NULL OR task = ?)
+           AND (priority IS NULL OR priority = ?)
+         ORDER BY (team IS NOT NULL)::int + (task IS NOT NULL)::int + (priority IS NOT NULL)::int DESC
+         LIMIT 1
+        """,
+        (workspace_id, team, task, priority),
+    )
+    row = await cur.fetchone()
+    if row and row[0] is not None:
+        return float(row[0])
+    return 24.0
+
+
 async def _serialize_ticket(db, t: dict, detail: bool = False) -> dict:
     cur = await db.execute("SELECT * FROM customers WHERE id = ?", (t["customer_id"],))
     cust = await cur.fetchone()
@@ -100,6 +124,7 @@ async def _serialize_ticket(db, t: dict, detail: bool = False) -> dict:
         "ago": _ago(t.get("created_at")),
         "customer": customer.get("name"),
         "customerId": customer.get("id"),
+        "conversationId": t.get("conversation_id"),
         "channel": t["channel"],
         "source": t["source"],
         "task": t["task"],
@@ -242,7 +267,14 @@ async def get_ticket(ticket_id: str, user: dict = Me) -> dict:
 
 
 @router.post("/tickets")
-async def create_ticket(body: TicketCreateIn, user: dict = Me) -> dict:
+async def create_ticket(
+    body: TicketCreateIn,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    user: dict = AgentOrAdmin,
+) -> dict:
+    cached = await check_idempotency(user, "tickets.create", idempotency_key)
+    if cached is not None:
+        return cached
     db = await get_db()
 
     # Resolve / create customer
@@ -264,7 +296,7 @@ async def create_ticket(body: TicketCreateIn, user: dict = Me) -> dict:
             )
 
     channel = body.channel or body.source
-    sla_due = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    sla_due = (datetime.now(timezone.utc) + timedelta(hours=await _sla_hours(db, user["workspace_id"], body.team, body.task, body.priority))).isoformat()
 
     cur = await db.execute(
         """
@@ -289,11 +321,12 @@ async def create_ticket(body: TicketCreateIn, user: dict = Me) -> dict:
     row = dict(await cur.fetchone())
     serialized = await _serialize_ticket(db, row, detail=True)
     await broker.publish(f"inbox:{user['workspace_id']}", "ticket.created", serialized)
+    await save_idempotency(user, "tickets.create", idempotency_key, serialized)
     return serialized
 
 
 @router.patch("/tickets/{ticket_id}")
-async def patch_ticket(ticket_id: str, body: TicketPatchIn, user: dict = Me) -> dict:
+async def patch_ticket(ticket_id: str, body: TicketPatchIn, user: dict = AgentOrAdmin) -> dict:
     tid = _parse_ticket_id(ticket_id)
     db = await get_db()
     cur = await db.execute(
@@ -352,16 +385,27 @@ async def patch_ticket(ticket_id: str, body: TicketPatchIn, user: dict = Me) -> 
             )
         await db.commit()
 
+    # Notify new assignee (if changed) — spec §3.7 "Generators".
+    new_assignee = updates.get("assignee_id")
+    if new_assignee and new_assignee != existing.get("assignee_id") and new_assignee != user["id"]:
+        await create_notification(
+            new_assignee, "assign",
+            title=f"Ticket #{tid} assigned to you",
+            body=existing.get("subject") or existing.get("task"),
+            link=f"/tickets?id={tid}",
+        )
+
     cur = await db.execute("SELECT * FROM tickets WHERE id = ?", (tid,))
     row = dict(await cur.fetchone())
     out = await _serialize_ticket(db, row, detail=True)
     await broker.publish(f"ticket:{tid}", "ticket.updated", out)
     await broker.publish(f"inbox:{user['workspace_id']}", "ticket.updated", out)
+    await broker.publish(f"ticket:{tid}", "ticket.timeline.appended", {"ticketId": tid})
     return out
 
 
 @router.post("/tickets/{ticket_id}/notes")
-async def add_ticket_note(ticket_id: str, body: dict, user: dict = Me) -> dict:
+async def add_ticket_note(ticket_id: str, body: dict, user: dict = AgentOrAdmin) -> dict:
     tid = _parse_ticket_id(ticket_id)
     db = await get_db()
     text = body.get("text", "")
@@ -374,7 +418,7 @@ async def add_ticket_note(ticket_id: str, body: dict, user: dict = Me) -> dict:
 
 
 @router.post("/tickets/{ticket_id}/child")
-async def create_child(ticket_id: str, body: ChildTicketIn, user: dict = Me) -> dict:
+async def create_child(ticket_id: str, body: ChildTicketIn, user: dict = AgentOrAdmin) -> dict:
     tid = _parse_ticket_id(ticket_id)
     db = await get_db()
     await db.execute(
@@ -399,12 +443,12 @@ async def create_child(ticket_id: str, body: ChildTicketIn, user: dict = Me) -> 
 
 
 @router.patch("/tickets/{ticket_id}/child")
-async def patch_child(ticket_id: str, body: ChildTicketIn, user: dict = Me) -> dict:
+async def patch_child(ticket_id: str, body: ChildTicketIn, user: dict = AgentOrAdmin) -> dict:
     return await create_child(ticket_id, body, user)
 
 
 @router.post("/tickets/{ticket_id}/resolve")
-async def resolve_ticket(ticket_id: str, body: TicketResolveIn, user: dict = Me) -> dict:
+async def resolve_ticket(ticket_id: str, body: TicketResolveIn, user: dict = AgentOrAdmin) -> dict:
     tid = _parse_ticket_id(ticket_id)
     db = await get_db()
     now = _now()
@@ -425,6 +469,177 @@ async def resolve_ticket(ticket_id: str, body: TicketResolveIn, user: dict = Me)
     out = await _serialize_ticket(db, row, detail=True)
     await broker.publish(f"ticket:{tid}", "ticket.updated", out)
     return out
+
+
+@router.post("/tickets/{ticket_id}/merge")
+async def merge_ticket(ticket_id: str, body: dict, user: dict = AgentOrAdmin) -> dict:
+    """Merge `intoTicketId` into `ticket_id`. Moves messages + timeline across,
+    closes the source (spec §3.4.1)."""
+    src_id = _parse_ticket_id(ticket_id)
+    into_id = body.get("intoTicketId")
+    if not into_id:
+        raise HTTPException(400, "intoTicketId required")
+    into_id = _parse_ticket_id(str(into_id))
+    db = await get_db()
+    await db.execute("UPDATE messages SET ticket_id = ? WHERE ticket_id = ?", (into_id, src_id))
+    await db.execute(
+        "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'system', ?)",
+        (into_id, f"Merged ticket #{src_id} in"),
+    )
+    await db.execute(
+        "UPDATE tickets SET status = 'closed', resolution_notes = ?, resolved_at = ?, updated_at = ? WHERE id = ?",
+        (f"Merged into #{into_id}", _now(), _now(), src_id),
+    )
+    await db.commit()
+    await broker.publish(f"inbox:{user['workspace_id']}", "ticket.updated", {"id": src_id, "status": "closed"})
+    await broker.publish(f"ticket:{into_id}", "ticket.timeline.appended", {"ticketId": into_id})
+    return {"ok": True, "merged": src_id, "into": into_id}
+
+
+@router.post("/tickets/{ticket_id}/attach-message")
+async def attach_message(ticket_id: str, body: dict, user: dict = AgentOrAdmin) -> dict:
+    """Manual override: move a single message under a different ticket (spec
+    §3.4.1). Useful when the intent classifier guesses wrong."""
+    tid = _parse_ticket_id(ticket_id)
+    mid = body.get("messageId")
+    if not mid:
+        raise HTTPException(400, "messageId required")
+    db = await get_db()
+    await db.execute("UPDATE messages SET ticket_id = ? WHERE id = ?", (tid, mid))
+    await db.execute(
+        "INSERT INTO ticket_timeline (ticket_id, actor, actor_user_id, text) VALUES (?,?,?,?)",
+        (tid, user["email"], user["id"], f"Message {mid} attached manually"),
+    )
+    await db.commit()
+    await broker.publish(f"ticket:{tid}", "ticket.timeline.appended", {"ticketId": tid})
+    return {"ok": True}
+
+
+@router.post("/tickets/{ticket_id}/split")
+async def split_ticket(ticket_id: str, body: dict, user: dict = AgentOrAdmin) -> dict:
+    """Split the ticket in two starting at `fromMessageId` (spec §3.4.1).
+    Creates a sibling ticket inheriting core metadata and re-points the tail
+    messages to it."""
+    tid = _parse_ticket_id(ticket_id)
+    from_mid = body.get("fromMessageId")
+    if not from_mid:
+        raise HTTPException(400, "fromMessageId required")
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM tickets WHERE id = ? AND workspace_id = ?",
+        (tid, user["workspace_id"]),
+    )
+    src = await cur.fetchone()
+    if not src:
+        raise HTTPException(404, "ticket not found")
+    src = dict(src)
+    cur = await db.execute("SELECT at FROM messages WHERE id = ?", (from_mid,))
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "message not found")
+    split_at = row[0]
+
+    cur = await db.execute(
+        """
+        INSERT INTO tickets (workspace_id, customer_id, conversation_id, source, channel,
+                             task, team, assignee_id, priority, subject, description,
+                             tags, custom_fields, status, parent_ticket_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'queued', ?)
+        RETURNING id
+        """,
+        (src["workspace_id"], src["customer_id"], src.get("conversation_id"),
+         src["source"], src["channel"], src["task"], src["team"],
+         src.get("assignee_id"), src.get("priority", "normal"),
+         (src.get("subject") or "") + " (split)", src.get("description"),
+         js(jl(src.get("tags"), [])), js({}), src["id"]),
+    )
+    new_id = cur.lastrowid
+    await db.execute(
+        "UPDATE messages SET ticket_id = ? WHERE conversation_id = ? AND at >= ?",
+        (new_id, src.get("conversation_id"), split_at),
+    )
+    await db.execute(
+        "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'system', ?)",
+        (new_id, f"Split from ticket #{src['id']} at {split_at}"),
+    )
+    await db.execute(
+        "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'system', ?)",
+        (tid, f"Split into ticket #{new_id} from {split_at}"),
+    )
+    await db.commit()
+    await broker.publish(f"inbox:{user['workspace_id']}", "ticket.created", {"id": new_id})
+    return {"ok": True, "newTicketId": new_id}
+
+
+# ---------- Intent classifier (spec §3.4.1 Stage 1) -------------------------
+
+INTENT_KEYWORDS: list[tuple[tuple[str, ...], str]] = [
+    (("refund", "money back"),                 "refund_pending"),
+    (("where is", "status", "tracking", "when will", "delivery"), "delivery_status_enquiry"),
+    (("return", "exchange"),                   "return_request"),
+    (("address", "relocate", "moved"),         "address_change"),
+    (("broken", "defect", "quality", "damage"), "product_quality"),
+    (("cancel",),                              "cancel_request"),
+]
+
+
+def _classify_stage_one(text: str) -> tuple[str, str | None, float, str]:
+    """Deterministic Stage-1 router. Returns (intent_key, order_ref, confidence, reason)."""
+    import re as _re
+    t = (text or "").lower()
+    m = _re.search(r"\b(\d{7,})\b", t)
+    order_ref = m.group(1) if m else None
+    for tokens, intent in INTENT_KEYWORDS:
+        if any(tok in t for tok in tokens):
+            return intent, order_ref, 0.8, f"matched keyword → {intent}"
+    return "general_enquiry", order_ref, 0.4, "no keyword match"
+
+
+@router.post("/internal/intent/classify")
+async def intent_classify(body: dict, user: dict = Me) -> dict:
+    """Server-internal classifier used by the inbound pipeline. Decides
+    `attach | reopen | create` based on deterministic rules; Stage 2 LLM
+    classifier is a Build-2 upgrade."""
+    conv_id = body.get("conversationId")
+    text = body.get("text") or ""
+    if not conv_id:
+        raise HTTPException(400, "conversationId required")
+    intent, order_ref, confidence, reason = _classify_stage_one(text)
+    db = await get_db()
+    # Candidate tickets: open ones on this conversation + resolved in last 7d.
+    cur = await db.execute(
+        """
+        SELECT id, status, intent_key, order_ref, resolved_at
+          FROM tickets
+         WHERE conversation_id = ?
+           AND (status NOT IN ('resolved','closed')
+                OR resolved_at >= now() - interval '7 days')
+         ORDER BY created_at DESC
+        """,
+        (conv_id,),
+    )
+    candidates = [dict(r) for r in await cur.fetchall()]
+    decision = "create"
+    ticket_id = None
+    for c in candidates:
+        if c.get("status") not in ("resolved", "closed"):
+            same_intent = (c.get("intent_key") or "") == intent
+            same_order = (c.get("order_ref") or None) == (order_ref or None)
+            if same_intent and (same_order or not order_ref):
+                decision, ticket_id = "attach", c["id"]
+                break
+        else:
+            if (c.get("intent_key") or "") == intent and (c.get("order_ref") or None) == (order_ref or None):
+                decision, ticket_id = "reopen", c["id"]
+                break
+    return {
+        "decision": decision,
+        "ticketId": ticket_id,
+        "intentKey": intent,
+        "orderRef": order_ref,
+        "confidence": confidence,
+        "reason": reason,
+    }
 
 
 @router.post("/tickets/similar")

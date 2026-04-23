@@ -1,69 +1,665 @@
 """Channels subpages: E-Commerce / APIs / Integrations / Logs / Sheets / Health (spec §3.9).
 
-Read-only stubs for Build 1 — returns empty arrays / zeros so the pages render
-without errors. Wire each source when the corresponding integration ships.
+Build-2 surface for the API Library + API Logs + Integrations. The tool-call
+executor `POST /internal/apis/:name` lives here too — it's how the default
+orchestrator (and, later, Langflow flows) invoke catalog entries while leaving
+an `api_logs` trail the UI can render.
+
+`_execute_api` now does real outbound HTTP via `httpx` when the catalog spec
+contains a `url`. Otherwise it falls back to echo mode so the demo + tests can
+keep running without network access.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+import logging
+import re
+import time
+import uuid
+from datetime import datetime, timezone, timedelta
+from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
+from ..db import get_db, jl, js
 from ..deps import Me
+
+log = logging.getLogger(__name__)
+
+# Keys redacted from request/response bodies before they hit api_logs.
+REDACT_KEYS = {"authorization", "api_key", "apikey", "password", "secret",
+               "token", "x-api-key", "access_token"}
 
 router = APIRouter(tags=["channels"])
 
 
-# --- E-Commerce ---
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------- E-Commerce ----------
 
 @router.get("/ecommerce/stores")
 async def ecomm_stores(user: dict = Me) -> list[dict]:
-    return []
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM ecommerce_stores WHERE workspace_id = ? ORDER BY created_at DESC",
+        (user["workspace_id"],),
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    return [
+        {
+            "id": r["id"],
+            "platform": r["platform"],
+            "name": r["name"],
+            "health": r["health"],
+            "orders30d": r["orders_30d"],
+            "lastSync": r["last_sync_at"],
+            "status": r["status"],
+        }
+        for r in rows
+    ]
+
+
+@router.post("/ecommerce/stores")
+async def create_store(body: dict, user: dict = Me) -> dict:
+    db = await get_db()
+    sid = str(uuid.uuid4())
+    await db.execute(
+        """
+        INSERT INTO ecommerce_stores (id, workspace_id, platform, name, config, status)
+        VALUES (?,?,?,?,?,'connected')
+        """,
+        (sid, user["workspace_id"], body.get("platform", "shopify"),
+         body.get("name", "Store"), js(body.get("config", {}))),
+    )
+    await db.commit()
+    return {"id": sid, "status": "connected"}
+
+
+@router.delete("/ecommerce/stores/{sid}")
+async def delete_store(sid: str, user: dict = Me) -> dict:
+    db = await get_db()
+    await db.execute(
+        "DELETE FROM ecommerce_stores WHERE id = ? AND workspace_id = ?",
+        (sid, user["workspace_id"]),
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/ecommerce/stores/{sid}/sync")
+async def sync_store(sid: str, user: dict = Me) -> dict:
+    db = await get_db()
+    await db.execute(
+        "UPDATE ecommerce_stores SET last_sync_at = ? WHERE id = ? AND workspace_id = ?",
+        (_now(), sid, user["workspace_id"]),
+    )
+    await db.commit()
+    return {"ok": True, "lastSync": _now()}
 
 
 @router.get("/ecommerce/events")
-async def ecomm_events(user: dict = Me) -> list[dict]:
-    return []
+async def ecomm_events(limit: int = Query(50, ge=1, le=200), user: dict = Me) -> list[dict]:
+    """Recent webhook activity. Returns whatever the Shopify/ingestion workers
+    have appended to `ecommerce_events` (spec §3.9.2, §6)."""
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT e.*, s.name AS store_name
+          FROM ecommerce_events e LEFT JOIN ecommerce_stores s ON s.id = e.store_id
+         WHERE e.workspace_id = ?
+         ORDER BY e.at DESC LIMIT ?
+        """,
+        (user["workspace_id"], int(limit)),
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    return [
+        {
+            "id": r["id"], "type": r["type"], "title": r["title"],
+            "sub": r.get("sub") or r.get("store_name") or "",
+            "tone": r.get("tone"),
+            "time": _rel(r.get("at")),
+        }
+        for r in rows
+    ]
 
 
-# --- API Library ---
+# ---------- API Library ----------
+
+def _serialize_api(r: dict) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "method": r["method"],
+        "description": r.get("description"),
+        "integrationId": r.get("integration_id"),
+        "spec": jl(r.get("spec"), {}),
+        "calls24h": r.get("calls_24h", 0),
+        "p95": r.get("p95_ms", 0),
+        "lastUsed": r.get("last_used_at"),
+    }
+
+
+def _serialize_integration(r: dict) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "description": r.get("description"),
+        "kind": r.get("kind", "custom"),
+        "health": r.get("health", "good"),
+        "config": jl(r.get("config"), {}),
+    }
+
 
 @router.get("/apis")
-async def apis(user: dict = Me) -> list[dict]:
-    return []
+async def apis_list(user: dict = Me) -> list[dict]:
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM apis WHERE workspace_id = ? ORDER BY created_at DESC",
+        (user["workspace_id"],),
+    )
+    return [_serialize_api(dict(r)) for r in await cur.fetchall()]
 
+
+@router.post("/apis")
+async def apis_create(body: dict, user: dict = Me) -> dict:
+    db = await get_db()
+    aid = str(uuid.uuid4())
+    await db.execute(
+        """
+        INSERT INTO apis (id, workspace_id, integration_id, name, method, description, spec)
+        VALUES (?,?,?,?,?,?,?)
+        """,
+        (aid, user["workspace_id"], body.get("integrationId"),
+         body.get("name", "untitled"), body.get("method", "GET"),
+         body.get("description"), js(body.get("spec", {}))),
+    )
+    await db.commit()
+    cur = await db.execute("SELECT * FROM apis WHERE id = ?", (aid,))
+    return _serialize_api(dict(await cur.fetchone()))
+
+
+@router.patch("/apis/{aid}")
+async def apis_patch(aid: str, body: dict, user: dict = Me) -> dict:
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM apis WHERE id = ? AND workspace_id = ?",
+        (aid, user["workspace_id"]),
+    )
+    if not await cur.fetchone():
+        raise HTTPException(404, "api not found")
+    fields: dict[str, Any] = {}
+    for k_src, k_db in [("name", "name"), ("method", "method"),
+                        ("description", "description"),
+                        ("integrationId", "integration_id")]:
+        if k_src in body:
+            fields[k_db] = body[k_src]
+    if "spec" in body:
+        fields["spec"] = js(body["spec"])
+    if fields:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        await db.execute(
+            f"UPDATE apis SET {sets} WHERE id = ? AND workspace_id = ?",
+            (*fields.values(), aid, user["workspace_id"]),
+        )
+        await db.commit()
+    cur = await db.execute("SELECT * FROM apis WHERE id = ?", (aid,))
+    return _serialize_api(dict(await cur.fetchone()))
+
+
+@router.post("/apis/{aid}/clone")
+async def apis_clone(aid: str, user: dict = Me) -> dict:
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM apis WHERE id = ? AND workspace_id = ?",
+        (aid, user["workspace_id"]),
+    )
+    src = await cur.fetchone()
+    if not src:
+        raise HTTPException(404, "api not found")
+    src = dict(src)
+    new_id = str(uuid.uuid4())
+    await db.execute(
+        """
+        INSERT INTO apis (id, workspace_id, integration_id, name, method, description, spec)
+        VALUES (?,?,?,?,?,?,?)
+        """,
+        (new_id, user["workspace_id"], src.get("integration_id"),
+         f"{src['name']} (copy)", src["method"], src.get("description"),
+         js(jl(src.get("spec"), {}))),
+    )
+    await db.commit()
+    cur = await db.execute("SELECT * FROM apis WHERE id = ?", (new_id,))
+    return _serialize_api(dict(await cur.fetchone()))
+
+
+@router.delete("/apis/{aid}")
+async def apis_delete(aid: str, user: dict = Me) -> dict:
+    db = await get_db()
+    await db.execute(
+        "DELETE FROM apis WHERE id = ? AND workspace_id = ?",
+        (aid, user["workspace_id"]),
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/apis/{aid}/test")
+async def apis_test(aid: str, body: dict | None = None, user: dict = Me) -> dict:
+    # Exercises the catalog entry through the same executor the orchestrator
+    # uses, so the "Test" button in the API Library matches production calls.
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM apis WHERE id = ? AND workspace_id = ?",
+        (aid, user["workspace_id"]),
+    )
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "api not found")
+    row = dict(row)
+    return await _execute_api(db, user["workspace_id"], row, body or {}, customer_id=None)
+
+
+# ---------- Integrations ----------
 
 @router.get("/integrations")
-async def integrations(user: dict = Me) -> list[dict]:
-    return []
+async def integrations_list(user: dict = Me) -> list[dict]:
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM integrations WHERE workspace_id = ? ORDER BY created_at DESC",
+        (user["workspace_id"],),
+    )
+    return [_serialize_integration(dict(r)) for r in await cur.fetchall()]
 
 
-# --- API Logs ---
+@router.post("/integrations")
+async def integrations_create(body: dict, user: dict = Me) -> dict:
+    db = await get_db()
+    iid = str(uuid.uuid4())
+    await db.execute(
+        """
+        INSERT INTO integrations (id, workspace_id, name, description, kind, config)
+        VALUES (?,?,?,?,?,?)
+        """,
+        (iid, user["workspace_id"], body.get("name", "Integration"),
+         body.get("description"), body.get("kind", "custom"),
+         js(body.get("config", {}))),
+    )
+    await db.commit()
+    cur = await db.execute("SELECT * FROM integrations WHERE id = ?", (iid,))
+    return _serialize_integration(dict(await cur.fetchone()))
+
+
+@router.delete("/integrations/{iid}")
+async def integrations_delete(iid: str, user: dict = Me) -> dict:
+    db = await get_db()
+    await db.execute(
+        "DELETE FROM integrations WHERE id = ? AND workspace_id = ?",
+        (iid, user["workspace_id"]),
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+# ---------- API Logs ----------
 
 @router.get("/api-logs")
-async def api_logs(user: dict = Me) -> list[dict]:
-    return []
+async def api_logs_list(
+    status: str | None = Query(None),
+    apiId: str | None = Query(None, alias="apiId"),
+    q: str | None = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    user: dict = Me,
+) -> list[dict]:
+    db = await get_db()
+    clauses = ["l.workspace_id = ?"]
+    params: list = [user["workspace_id"]]
+    if status == "2xx":
+        clauses.append("l.status BETWEEN 200 AND 299")
+    elif status == "4xx":
+        clauses.append("l.status BETWEEN 400 AND 499")
+    elif status == "5xx":
+        clauses.append("l.status >= 500")
+    if apiId:
+        clauses.append("l.api_id = ?")
+        params.append(apiId)
+    if q:
+        clauses.append("(l.trace_id ILIKE ? OR a.name ILIKE ?)")
+        params.extend([f"%{q}%", f"%{q}%"])
+    sql = f"""
+        SELECT l.*, a.name AS api_name
+        FROM api_logs l LEFT JOIN apis a ON a.id = l.api_id
+        WHERE {' AND '.join(clauses)}
+        ORDER BY l.at DESC
+        LIMIT {int(limit)}
+    """
+    cur = await db.execute(sql, params)
+    rows = [dict(r) for r in await cur.fetchall()]
+    return [
+        {
+            "id": r["id"],
+            "apiId": r.get("api_id"),
+            "apiName": r.get("api_name") or "—",
+            "customerId": r.get("customer_id"),
+            "traceId": r["trace_id"],
+            "status": r["status"],
+            "latencyMs": r["latency_ms"],
+            "at": r["at"],
+        }
+        for r in rows
+    ]
 
 
 @router.get("/api-logs/stats")
 async def api_logs_stats(user: dict = Me) -> dict:
-    return {"total": 0, "success": 0, "error": 0, "successRate": 100}
+    db = await get_db()
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    cur = await db.execute(
+        """
+        SELECT
+          COUNT(*)                                              AS total,
+          COUNT(*) FILTER (WHERE status BETWEEN 200 AND 299)    AS s2xx,
+          COUNT(*) FILTER (WHERE status BETWEEN 400 AND 499)    AS s4xx,
+          COUNT(*) FILTER (WHERE status >= 500)                 AS s5xx
+        FROM api_logs WHERE workspace_id = ? AND at >= ?
+        """,
+        (user["workspace_id"], since),
+    )
+    r = dict(await cur.fetchone()) or {}
+    total = int(r.get("total") or 0)
+    success = int(r.get("s2xx") or 0)
+    return {
+        "total": total,
+        "success": success,
+        "error": int(r.get("s4xx") or 0) + int(r.get("s5xx") or 0),
+        "successRate": round(100.0 * success / total, 2) if total else 100.0,
+        "breakdown": {"2xx": success, "4xx": int(r.get("s4xx") or 0), "5xx": int(r.get("s5xx") or 0)},
+    }
 
 
-# --- Sheets ---
+@router.get("/api-logs/{lid}")
+async def api_log_detail(lid: str, user: dict = Me) -> dict:
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT l.*, a.name AS api_name
+        FROM api_logs l LEFT JOIN apis a ON a.id = l.api_id
+        WHERE l.id = ? AND l.workspace_id = ?
+        """,
+        (lid, user["workspace_id"]),
+    )
+    r = await cur.fetchone()
+    if not r:
+        raise HTTPException(404, "log not found")
+    r = dict(r)
+    return {
+        "id": r["id"],
+        "apiId": r.get("api_id"),
+        "apiName": r.get("api_name") or "—",
+        "customerId": r.get("customer_id"),
+        "traceId": r["trace_id"],
+        "status": r["status"],
+        "latencyMs": r["latency_ms"],
+        "at": r["at"],
+        "request": jl(r.get("request"), {}),
+        "response": jl(r.get("response"), {}),
+    }
+
+
+@router.get("/api-logs/stream")
+async def api_logs_stream(limit: int = Query(1000, ge=1, le=10000),
+                          user: dict = Me) -> StreamingResponse:
+    """NDJSON export for the API Logs page "Download" button (spec §3.9.4, §9).
+    One JSON object per line — streams straight from the DB cursor."""
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT l.id, l.api_id, l.customer_id, l.trace_id, l.status, l.latency_ms, l.at,
+               a.name AS api_name
+          FROM api_logs l LEFT JOIN apis a ON a.id = l.api_id
+         WHERE l.workspace_id = ?
+         ORDER BY l.at DESC LIMIT ?
+        """,
+        (user["workspace_id"], int(limit)),
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+
+    async def generate():
+        for r in rows:
+            yield json.dumps({
+                "id": r["id"], "apiId": r.get("api_id"),
+                "apiName": r.get("api_name") or "—", "traceId": r["trace_id"],
+                "status": r["status"], "latencyMs": r["latency_ms"], "at": str(r["at"]),
+            }, default=str) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson",
+                             headers={"Content-Disposition": "attachment; filename=api-logs.ndjson"})
+
+
+# ---------- Sheets (lean stub until connector ships) ----------
 
 @router.get("/sheets")
 async def sheets(user: dict = Me) -> list[dict]:
-    return []
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM sheets WHERE workspace_id = ? ORDER BY created_at DESC",
+        (user["workspace_id"],),
+    )
+    return [
+        {"id": r["id"], "url": r["url"], "name": r.get("name"), "tabs": jl(r.get("tabs"), []),
+         "rows": r.get("rows", 0), "status": r.get("status"), "lastSync": r.get("last_sync_at")}
+        for r in [dict(x) for x in await cur.fetchall()]
+    ]
 
 
-# --- Health ---
+# ---------- Health services + incidents (spec §3.9.6) ----------
 
 @router.get("/health/services")
 async def health_services(user: dict = Me) -> list[dict]:
-    return []
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM health_services WHERE workspace_id = ? ORDER BY name",
+        (user["workspace_id"],),
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "category": r.get("category"),
+            "status": r["status"],
+            "uptime30d": float(r.get("uptime_30d") or 0),
+            "latencyP95": int(r.get("latency_p95_ms") or 0),
+            "errorRate": float(r.get("error_rate") or 0),
+            "lastCheck": _rel(r.get("last_check_at")),
+            "accent": r.get("accent") or "#38bdf8",
+            "letter": r.get("letter") or (r["name"][:1].upper() if r.get("name") else "?"),
+        }
+        for r in rows
+    ]
+
+
+@router.get("/health/services/{sid}/uptime")
+async def health_service_uptime(sid: str, window: str = "30d", user: dict = Me) -> dict:
+    """Return a synthetic uptime series for the bar chart. Once the health
+    prober is wired the series comes from `health_checks` samples."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT uptime_30d, status FROM health_services WHERE id = ? AND workspace_id = ?",
+        (sid, user["workspace_id"]),
+    )
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "service not found")
+    r = dict(row)
+    days = {"24h": 1, "7d": 7, "30d": 30, "90d": 90}.get(window, 30)
+    series = []
+    base = float(r.get("uptime_30d") or 100)
+    for i in range(days):
+        series.append({"day": i, "uptime": round(base - (i % 5) * 0.1, 2)})
+    return {"window": window, "series": series}
 
 
 @router.get("/incidents")
 async def incidents(user: dict = Me) -> list[dict]:
-    return []
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM incidents WHERE workspace_id = ? ORDER BY started_at DESC LIMIT 50",
+        (user["workspace_id"],),
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    return [
+        {
+            "id": r["id"],
+            "title": r["title"],
+            "status": r["status"],
+            "tone": r["tone"],
+            "components": jl(r.get("components"), []),
+            "summary": r.get("summary") or "",
+            "started": _rel(r.get("started_at")),
+            "resolvedAt": r.get("resolved_at"),
+        }
+        for r in rows
+    ]
+
+
+@router.post("/incidents/subscribe")
+async def incidents_subscribe(body: dict, user: dict = Me) -> dict:
+    email = (body or {}).get("email") or user.get("email")
+    if not email:
+        raise HTTPException(400, "email required")
+    db = await get_db()
+    await db.execute(
+        """
+        INSERT INTO incident_subscribers (workspace_id, email)
+        VALUES (?, ?)
+        ON CONFLICT (workspace_id, email) DO NOTHING
+        """,
+        (user["workspace_id"], email),
+    )
+    await db.commit()
+    return {"ok": True, "email": email}
+
+
+def _rel(ts) -> str:
+    if not ts:
+        return "never"
+    try:
+        dt = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return str(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+# ---------- Internal tool-call executor (spec §3.11.D, §3.11.H) ----------
+
+def _redact(obj: Any) -> Any:
+    """Strip secret-ish keys so they never land in `api_logs`."""
+    if isinstance(obj, dict):
+        return {k: ("<redacted>" if k.lower() in REDACT_KEYS else _redact(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact(v) for v in obj]
+    return obj
+
+
+_TEMPLATE_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
+
+
+def _render_template(src: str, args: dict) -> str:
+    """Replace `{{foo}}` tokens in URL / body templates with values from args.
+    Missing tokens are left untouched so the operator notices."""
+    def sub(m: re.Match) -> str:
+        key = m.group(1)
+        return str(args.get(key, m.group(0)))
+    return _TEMPLATE_RE.sub(sub, src)
+
+
+async def _execute_api(db, ws_id: str, api_row: dict, args: dict, customer_id: str | None) -> dict:
+    """Invoke a catalog API by row. If `spec.url` is set we run a real httpx
+    request against it; otherwise we echo so offline demos keep working. Every
+    call writes to `api_logs` with secrets redacted."""
+    started = time.perf_counter()
+    trace_id = f"trc_{uuid.uuid4().hex[:12]}"
+    spec = jl(api_row.get("spec"), {}) or {}
+    method = (api_row.get("method") or spec.get("method") or "GET").upper()
+    url = spec.get("url")
+    response_body: Any = {"ok": True, "echo": args, "spec": spec}
+    status_code = 200
+
+    if url:
+        try:
+            import httpx  # type: ignore
+            resolved_url = _render_template(url, args)
+            headers = spec.get("headers") or {}
+            body = spec.get("body")
+            if isinstance(body, (dict, list)):
+                body = json.loads(_render_template(json.dumps(body), args))
+            timeout = float(spec.get("timeout") or 15)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.request(
+                    method, resolved_url,
+                    params=args if method == "GET" else None,
+                    json=body if method != "GET" else None,
+                    headers=headers,
+                )
+            status_code = resp.status_code
+            ctype = resp.headers.get("content-type") or ""
+            if "application/json" in ctype:
+                try:
+                    response_body = resp.json()
+                except Exception:
+                    response_body = {"text": resp.text[:4000]}
+            else:
+                response_body = {"text": resp.text[:4000]}
+        except ImportError:
+            log.info("httpx not installed — _execute_api falling back to echo")
+        except Exception as e:
+            status_code = 599
+            response_body = {"ok": False, "error": repr(e)[:500]}
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    await db.execute(
+        """
+        INSERT INTO api_logs (workspace_id, api_id, customer_id, trace_id, status,
+                              latency_ms, request, response)
+        VALUES (?,?,?,?,?,?,?,?)
+        """,
+        (ws_id, api_row["id"], customer_id, trace_id, status_code, latency_ms,
+         js(_redact({"args": args, "method": method, "name": api_row["name"],
+                     "url": url, "spec": spec})),
+         js(_redact(response_body if isinstance(response_body, (dict, list)) else {"value": response_body}))),
+    )
+    await db.execute(
+        "UPDATE apis SET last_used_at = ?, calls_24h = calls_24h + 1 WHERE id = ?",
+        (_now(), api_row["id"]),
+    )
+    await db.commit()
+    return {"traceId": trace_id, "status": status_code, "latencyMs": latency_ms,
+            "response": response_body}
+
+
+@router.post("/internal/apis/{name}")
+async def internal_api_call(name: str, body: dict, user: dict = Me) -> dict:
+    """Invoked by the orchestrator / Langflow custom node. Resolves a catalog
+    entry by name within the caller's workspace and runs `_execute_api`."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM apis WHERE workspace_id = ? AND name = ? LIMIT 1",
+        (user["workspace_id"], name),
+    )
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"api '{name}' not found")
+    return await _execute_api(db, user["workspace_id"], dict(row), body or {}, customer_id=body.get("customerId") if body else None)

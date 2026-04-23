@@ -40,6 +40,37 @@ export const api = {
   del: (path, opts) => request('DELETE', path, undefined, opts),
 };
 
+/**
+ * Upload a File via the presigned MinIO/S3 URL flow (see wire.md §5).
+ *   1. POST /uploads → {uploadUrl, publicUrl, key}
+ *   2. PUT <uploadUrl> with the file bytes + matching Content-Type
+ *   3. return {publicUrl, name, size, mime} — drop into messages.attachments
+ */
+export async function uploadFile(file) {
+  const pre = await api.post('/uploads', {
+    name: file.name,
+    mime: file.type || 'application/octet-stream',
+    size: file.size,
+  });
+  const uploadUrl = pre.uploadUrl || pre.upload_url;
+  const publicUrl = pre.publicUrl || pre.public_url;
+  const res = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': file.type || 'application/octet-stream' },
+    body: file,
+  });
+  if (!res.ok) {
+    throw new Error(`upload failed: ${res.status} ${res.statusText}`);
+  }
+  return {
+    url: publicUrl,
+    name: file.name,
+    size: file.size,
+    mime: file.type || 'application/octet-stream',
+    key: pre.key,
+  };
+}
+
 export function qs(params) {
   const usp = new URLSearchParams();
   Object.entries(params || {}).forEach(([k, v]) => {

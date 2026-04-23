@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
@@ -12,6 +13,10 @@ from ..schemas import ReactionIn, TeamMessageIn
 from ..ws import broker
 
 router = APIRouter(prefix="/teams", tags=["teams"])
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 @router.get("/members")
@@ -173,3 +178,124 @@ async def typing(cid: str, body: dict, user: dict = Me) -> dict:
         {"user_id": user["id"], "name": user["name"], "on": body.get("on", True)},
     )
     return {"ok": True}
+
+
+# ---------- read cursors + unread badges (spec §3.6 teams_read_cursors) ----------
+
+@router.post("/conversations/{cid}/read")
+async def mark_read(cid: str, user: dict = Me) -> dict:
+    """Record the caller's last-read time on a channel or DM so unread badges
+    can be derived without O(messages) scans."""
+    db = await get_db()
+    is_channel = await _is_channel(db, cid)
+    now = _now()
+    if is_channel:
+        await db.execute(
+            """
+            INSERT INTO teams_read_cursors (user_id, channel_id, last_read_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT (user_id, channel_id) WHERE channel_id IS NOT NULL
+            DO UPDATE SET last_read_at = EXCLUDED.last_read_at
+            """,
+            (user["id"], cid, now),
+        )
+    else:
+        await db.execute(
+            """
+            INSERT INTO teams_read_cursors (user_id, dm_id, last_read_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT (user_id, dm_id) WHERE dm_id IS NOT NULL
+            DO UPDATE SET last_read_at = EXCLUDED.last_read_at
+            """,
+            (user["id"], cid, now),
+        )
+    await db.commit()
+    return {"ok": True, "at": now}
+
+
+@router.get("/unread")
+async def teams_unread(user: dict = Me) -> dict:
+    """Per-channel + per-DM unread counts for the left-rail badges. Also
+    returns an aggregate for the TopBar."""
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT ch.id, COUNT(m.id) AS unread
+          FROM teams_channels ch
+          LEFT JOIN teams_read_cursors r
+            ON r.channel_id = ch.id AND r.user_id = ?
+          LEFT JOIN teams_messages m
+            ON m.channel_id = ch.id AND m.user_id <> ?
+           AND m.at > COALESCE(r.last_read_at, '1970-01-01'::timestamptz)
+         WHERE ch.workspace_id = ?
+         GROUP BY ch.id
+        """,
+        (user["id"], user["id"], user["workspace_id"]),
+    )
+    channels_unread = {r["id"]: int(r["unread"] or 0) for r in [dict(x) for x in await cur.fetchall()]}
+    cur = await db.execute(
+        """
+        SELECT d.id, COUNT(m.id) AS unread
+          FROM teams_dms d
+          LEFT JOIN teams_read_cursors r
+            ON r.dm_id = d.id AND r.user_id = ?
+          LEFT JOIN teams_messages m
+            ON m.dm_id = d.id AND m.user_id <> ?
+           AND m.at > COALESCE(r.last_read_at, '1970-01-01'::timestamptz)
+         WHERE d.workspace_id = ?
+         GROUP BY d.id
+        """,
+        (user["id"], user["id"], user["workspace_id"]),
+    )
+    dms_unread = {r["id"]: int(r["unread"] or 0) for r in [dict(x) for x in await cur.fetchall()]}
+    total = sum(channels_unread.values()) + sum(dms_unread.values())
+    return {"channels": channels_unread, "dms": dms_unread, "total": total}
+
+
+# ---------- Presence (spec §3.6) ----------
+
+@router.get("/presence")
+async def presence(user: dict = Me) -> list[dict]:
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT id, name, status, last_seen_at FROM users
+         WHERE workspace_id = ? ORDER BY name
+        """,
+        (user["workspace_id"],),
+    )
+    now = datetime.now(timezone.utc)
+    out = []
+    for r in [dict(x) for x in await cur.fetchall()]:
+        # Anyone whose last heartbeat is > 2 min old is effectively offline.
+        last = r.get("last_seen_at")
+        status = r["status"] or "offline"
+        if last:
+            try:
+                dt = last if isinstance(last, datetime) else datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if (now - dt) > timedelta(minutes=2) and status != "offline":
+                    status = "away"
+            except Exception:
+                pass
+        out.append({"id": r["id"], "name": r["name"], "status": status, "lastSeenAt": last})
+    return out
+
+
+@router.post("/presence/heartbeat")
+async def presence_heartbeat(body: dict | None = None, user: dict = Me) -> dict:
+    """Tab calls this every 30s to stay 'online'. The reaper worker flips users
+    offline when heartbeats stop — see worker.py."""
+    db = await get_db()
+    status = (body or {}).get("status") or "online"
+    await db.execute(
+        "UPDATE users SET last_seen_at = now(), status = ? WHERE id = ?",
+        (status, user["id"]),
+    )
+    await db.commit()
+    await broker.publish(
+        f"workspace:{user['workspace_id']}", "presence.changed",
+        {"userId": user["id"], "status": status},
+    )
+    return {"ok": True, "status": status}

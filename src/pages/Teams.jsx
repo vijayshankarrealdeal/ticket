@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
 import { useDelayUnmount } from '../hooks/useDelayUnmount.js';
+import { useRealtimeTopic } from '../hooks/useRealtime.js';
 import {
   MEMBERS,
   CHANNELS,
@@ -154,6 +155,29 @@ export default function Teams() {
   useEffect(() => {
     setTypingNames([]);
   }, [activeId, active]);
+
+  // Realtime subscription for the currently open teams channel / DM.
+  // Server publishes on `teams:<channel_or_dm_id>` (see wire.md §3).
+  useRealtimeTopic(
+    activeId ? `teams:${activeId}` : null,
+    (evt) => {
+      if (!evt || evt.topic !== `teams:${activeId}`) return;
+      if (evt.type === 'team.message.created' && evt.data) {
+        const data = evt.data;
+        if (data.userId && data.userId === CURRENT_USER_ID && data.id?.startsWith('m-')) return;
+        setThreadsByConv((prev) => {
+          const prior = prev[activeId] || [];
+          if (data.id && prior.some((m) => m.id === data.id)) return prev;
+          return { ...prev, [activeId]: [...prior, data] };
+        });
+      } else if (evt.type === 'team.typing' && evt.data) {
+        const who = evt.data.userName;
+        if (!who || evt.data.userId === CURRENT_USER_ID) return;
+        setTypingNames((prev) => (prev.includes(who) ? prev : [...prev, who]));
+        setTimeout(() => setTypingNames((prev) => prev.filter((n) => n !== who)), 2500);
+      }
+    },
+  );
 
   const filteredChannels = CHANNELS.filter((c) => c.name.toLowerCase().includes(query.toLowerCase()));
   const filteredDMs = DMS.filter((d) => dmTitle(d).toLowerCase().includes(query.toLowerCase()));

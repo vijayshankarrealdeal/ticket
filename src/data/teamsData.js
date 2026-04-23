@@ -29,12 +29,29 @@ export async function loadTeamsData() {
     api.get('/customers?shareable=1').catch(() => []),
     api.get('/auth/me').catch(() => null),
   ]);
-  replaceArray(MEMBERS, Array.isArray(members) ? members : members?.items || []);
+  const rawMembers = Array.isArray(members) ? members : members?.items || [];
+  CURRENT_USER_ID = me?.id || me?.userId || null;
+
+  const meId = CURRENT_USER_ID;
+  let meEntry = meId ? rawMembers.find((m) => m.id === meId) : null;
+  const others = meId ? rawMembers.filter((m) => m.id !== meId) : rawMembers.slice();
+  if (!meEntry && me) {
+    meEntry = {
+      id: meId,
+      name: me.name || 'You',
+      email: me.email,
+      role: me.role || 'You',
+      status: me.status || 'online',
+      avatar_url: me.avatar_url,
+    };
+  }
+  const ordered = meEntry ? [{ ...meEntry, me: true }, ...others] : others;
+
+  replaceArray(MEMBERS, ordered);
   replaceArray(CHANNELS, Array.isArray(channels) ? channels : channels?.items || []);
   replaceArray(DMS, Array.isArray(dms) ? dms : dms?.items || []);
   replaceArray(SHAREABLE_TICKETS, Array.isArray(tickets) ? tickets : tickets?.items || []);
   replaceArray(SHAREABLE_CUSTOMERS, Array.isArray(customers) ? customers : customers?.items || []);
-  CURRENT_USER_ID = me?.id || me?.userId || null;
   return { members: MEMBERS, channels: CHANNELS, dms: DMS };
 }
 

@@ -34,6 +34,16 @@ async def wipe(db) -> None:
         "notifications, platforms, agents, "
         "auth_sessions, users, workspaces RESTART IDENTITY CASCADE"
     )
+    # Tables that weren't in the original TRUNCATE list but may hold stale rows
+    # from earlier seeds. Swallow missing-table errors so this works on older dbs.
+    for table in ("kb_chunks", "sla_policies", "health_services", "incidents",
+                  "incident_subscribers", "csat_responses", "sheets",
+                  "ecommerce_events", "ecommerce_stores", "api_logs",
+                  "apis", "integrations"):
+        try:
+            await db.execute(f"TRUNCATE {table} RESTART IDENTITY CASCADE")
+        except Exception:
+            pass
 
 
 async def seed(db=None) -> None:
@@ -260,6 +270,99 @@ async def seed(db=None) -> None:
         await db.execute(
             "INSERT INTO notifications (user_id, type, title, body, link) VALUES (?,?,?,?,?)",
             (me_uid, t, title, body, link),
+        )
+
+    # SLA policies — priority overrides, otherwise 24h.
+    for team, task, priority, hours in [
+        (None, None, "urgent", 6),
+        (None, None, "high", 12),
+        ("Support", "delay_delivery", None, 18),
+        ("Returns", "return_request", None, 48),
+        ("Finance", "refund_pending", None, 36),
+    ]:
+        await db.execute(
+            "INSERT INTO sla_policies (workspace_id, team, task, priority, hours) VALUES (?,?,?,?,?)",
+            (ws_id, team, task, priority, hours),
+        )
+
+    # Health services — one row per integration we care about on the Health page.
+    for name, category, status, up, lat, err, accent, letter in [
+        ("WhatsApp Cloud API", "Messaging", "operational", 99.95, 180, 0.05, "#22c55e", "W"),
+        ("Gmail API",          "Email",     "operational", 99.99, 220, 0.02, "#ef4444", "G"),
+        ("Instagram Graph",    "Messaging", "degraded",    98.50, 420, 1.10, "#ec4899", "I"),
+        ("Shopify Admin API",  "E-commerce","operational", 99.90, 160, 0.10, "#7c3aed", "S"),
+        ("Postgres primary",   "Datastore", "operational", 100.00, 12, 0.00, "#0ea5e9", "P"),
+        ("MinIO",              "Storage",   "operational", 99.98,  24, 0.00, "#f59e0b", "M"),
+    ]:
+        await db.execute(
+            """INSERT INTO health_services (workspace_id, name, category, status, uptime_30d,
+                                            latency_p95_ms, error_rate, last_check_at, accent, letter)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT (workspace_id, name) DO NOTHING""",
+            (ws_id, name, category, status, up, lat, err, iso(now), accent, letter),
+        )
+
+    # Incidents
+    await db.execute(
+        """INSERT INTO incidents (workspace_id, title, status, tone, components, summary, started_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (ws_id, "Instagram DM latency elevated", "monitoring", "warning",
+         js(["Instagram Graph"]),
+         "Meta Graph responses ~420ms p95 since 03:00 IST. Watching for recovery.",
+         iso(now - timedelta(hours=5))),
+    )
+
+    # API Library sample + integrations
+    integ_id = str(uuid4())
+    await db.execute(
+        """INSERT INTO integrations (id, workspace_id, name, description, kind, health)
+           VALUES (?,?,?,?,?,?)""",
+        (integ_id, ws_id, "Shopify Admin", "Orders + inventory lookups", "shopify", "good"),
+    )
+    for name, method, desc, spec in [
+        ("shopify_order_lookup", "GET", "Look up an order by id",
+         {"url": "https://{{shop}}.myshopify.com/admin/api/2024-04/orders/{{orderId}}.json"}),
+        ("clickpost_tracking",   "GET", "Courier tracking via Clickpost",
+         {"url": "https://api.clickpost.in/api/v1/track/?waybill={{awb}}"}),
+    ]:
+        await db.execute(
+            """INSERT INTO apis (id, workspace_id, integration_id, name, method, description, spec)
+               VALUES (?,?,?,?,?,?,?)""",
+            (str(uuid4()), ws_id, integ_id, name, method, desc, js(spec)),
+        )
+
+    # E-commerce stores + recent events for the activity feed
+    store_id = str(uuid4())
+    await db.execute(
+        """INSERT INTO ecommerce_stores (id, workspace_id, platform, name, status, orders_30d, health, last_sync_at, config)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (store_id, ws_id, "shopify", "the-sleep-co", "connected", 1464, 96, iso(now - timedelta(minutes=5)),
+         js({"plan": "Shopify Plus", "letter": "S", "accent": "#7c3aed"})),
+    )
+    for typ, title, sub, tone, mins in [
+        ("order",  "New order #SHO-20472244", "the-sleep-co", "success", 4),
+        ("sync",   "Inventory sync complete", "142 SKUs updated", "info", 12),
+        ("refund", "Refund issued #SHO-20466921", "₹7,499", "danger", 120),
+        ("issue",  "Webhook retry (orders/create)", "last attempt in 30s", "warning", 240),
+    ]:
+        await db.execute(
+            """INSERT INTO ecommerce_events (workspace_id, store_id, type, title, sub, tone, at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (ws_id, store_id, typ, title, sub, tone, iso(now - timedelta(minutes=mins))),
+        )
+
+    # KB chunks so kb_search has something to return.
+    for src, title, body in [
+        ("macro:refunds", "Refund policy",
+         "Refunds are processed within 5 business days of the return pickup. Cap is ₹10,000 for AI-initiated refunds; above that a human agent must approve."),
+        ("macro:delivery", "Delivery timelines",
+         "Standard delivery is 3-7 business days. Orders placed before 2pm IST dispatch same day."),
+        ("macro:returns", "Return window",
+         "Mattresses carry a 100-night trial; pillows must be unused and in packaging within 14 days."),
+    ]:
+        await db.execute(
+            "INSERT INTO kb_chunks (workspace_id, source, title, body) VALUES (?,?,?,?)",
+            (ws_id, src, title, body),
         )
 
     # Default orchestrator agent placeholder

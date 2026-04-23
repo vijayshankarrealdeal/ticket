@@ -35,3 +35,31 @@ async def optional_user(
 # Short aliases
 Me = Depends(current_user)
 MaybeMe = Depends(optional_user)
+
+
+ROLE_RANK = {"viewer": 0, "agent": 1, "admin": 2}
+
+
+def require_role(min_role: str):
+    """Dependency factory. Usage: `user: dict = Depends(require_role("agent"))`.
+
+    Roles: viewer < agent < admin. `viewer` can read but not mutate; `agent`
+    can mutate tickets / conversations / teams; `admin` can mutate workspace
+    settings and integrations.
+    """
+    min_rank = ROLE_RANK.get(min_role, 1)
+
+    async def checker(user: dict = Me) -> dict:
+        user_rank = ROLE_RANK.get(user.get("role") or "viewer", 0)
+        if user_rank < min_rank:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"role '{user.get('role')}' cannot perform this action (needs {min_role})",
+            )
+        return user
+
+    return Depends(checker)
+
+
+AgentOrAdmin = require_role("agent")
+AdminOnly = require_role("admin")

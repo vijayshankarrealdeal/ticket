@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
@@ -319,9 +319,9 @@ export default function Tickets() {
             </div>
 
             {tab === 'info' && selected && <InfoBody t={selected} />}
-            {tab === 'convo' && <EmptyBody label="Conversation thread" />}
-            {tab === 'notes' && <EmptyBody label="Internal notes" />}
-            {tab === 'customer' && <EmptyBody label="Customer profile" />}
+            {tab === 'convo' && selected && <ConvoBody t={selected} />}
+            {tab === 'notes' && selected && <NotesBody t={selected} />}
+            {tab === 'customer' && selected && <CustomerBody t={selected} /> }
           </div>
 
           {/* Right sidebar */}
@@ -515,6 +515,113 @@ function EmptyBody({ label }) {
   );
 }
 
+function ConvoBody({ t }) {
+  // Shows the conversation linked to this ticket. The server already carries
+  // conversation id on the ticket row (ticket.conversationId when set) — we
+  // fetch lazily so the tab loads only when opened.
+  const [messages, setMessages] = useState(null);
+  const convId = t?.conversationId || t?.conversation_id;
+  useEffect(() => {
+    if (!convId) { setMessages([]); return; }
+    let alive = true;
+    api.get(`/conversations/${convId}`)
+      .then((c) => { if (alive) setMessages(Array.isArray(c?.messages) ? c.messages : []); })
+      .catch(() => { if (alive) setMessages([]); });
+    return () => { alive = false; };
+  }, [convId]);
+  if (!convId) {
+    return <div className="empty-state" style={{ margin: 'auto' }}><Icon.InboxEmpty /><div className="empty-state-text">No conversation linked.</div></div>;
+  }
+  if (messages === null) {
+    return <div style={{ padding: 20, color: 'var(--muted)' }}>Loading…</div>;
+  }
+  if (messages.length === 0) {
+    return <div className="empty-state" style={{ margin: 'auto' }}><Icon.InboxEmpty /><div className="empty-state-text">No messages yet.</div></div>;
+  }
+  return (
+    <div style={{ padding: 16, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 10 }}>
+      {messages.map((m, i) => (
+        <div key={m.id || i} style={{
+          alignSelf: m.from === 'me' || m.from === 'agent' ? 'flex-end' : 'flex-start',
+          maxWidth: '70%',
+          background: m.from === 'me' || m.from === 'agent' ? 'var(--primary, #1e40af)' : 'var(--hover)',
+          color: m.from === 'me' || m.from === 'agent' ? '#fff' : 'var(--text)',
+          padding: '8px 12px', borderRadius: 12, fontSize: 14,
+        }}>
+          {m.fromName && <div style={{ fontSize: 11, opacity: 0.75, marginBottom: 2 }}>{m.fromName}</div>}
+          <div style={{ whiteSpace: 'pre-wrap' }}>{m.text}</div>
+          {m.at && <div style={{ fontSize: 10, opacity: 0.65, marginTop: 4 }}>{m.at}</div>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function NotesBody({ t }) {
+  const [draft, setDraft] = useState('');
+  const [notes, setNotes] = useState(Array.isArray(t?.notes) ? t.notes : []);
+  const [busy, setBusy] = useState(false);
+  async function submit(e) {
+    e.preventDefault();
+    const text = draft.trim();
+    if (!text) return;
+    setBusy(true);
+    try {
+      const created = await api.post(`/tickets/${t.idNumber || t.id}/notes`, { text });
+      setNotes((prev) => [...prev, created]);
+      setDraft('');
+    } finally { setBusy(false); }
+  }
+  return (
+    <div style={{ padding: 16, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 10 }}>
+      {notes.length === 0 && <div style={{ color: 'var(--muted)', fontSize: 13 }}>No notes yet.</div>}
+      {notes.map((n, i) => (
+        <div key={i} style={{ background: 'var(--hover)', padding: 12, borderRadius: 10 }}>
+          <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 4 }}>
+            {n.author || 'Unknown'} · {n.at}
+          </div>
+          <div style={{ whiteSpace: 'pre-wrap', fontSize: 14 }}>{n.text}</div>
+        </div>
+      ))}
+      <form onSubmit={submit} style={{ display: 'flex', gap: 8, marginTop: 'auto' }}>
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="Add an internal note…"
+          style={{ flex: 1 }}
+        />
+        <button className="btn" disabled={busy || !draft.trim()}>{busy ? 'Saving…' : 'Add note'}</button>
+      </form>
+    </div>
+  );
+}
+
+function CustomerBody({ t }) {
+  const cd = t?.customerDetails || {};
+  const rows = [
+    ['Name', t?.customer],
+    ['Email', cd.email],
+    ['Phone', cd.phone],
+    ['Customer since', cd.since],
+    ['Address', cd.address],
+    ['Orders', cd.orders],
+    ['Returns', cd.returns],
+  ];
+  return (
+    <div style={{ padding: 20, overflow: 'auto' }}>
+      <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12 }}>Customer profile</div>
+      <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', rowGap: 8, columnGap: 16, fontSize: 14 }}>
+        {rows.map(([k, v]) => (
+          <Fragment key={k}>
+            <div style={{ color: 'var(--muted)' }}>{k}</div>
+            <div>{v ?? '—'}</div>
+          </Fragment>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function PropRow({ label, children }) {
   return (
     <div className="prop-row">
@@ -526,7 +633,56 @@ function PropRow({ label, children }) {
 
 function TicketSidebar({ t, onExpand, onCollapse }) {
   const [resolTab, setResolTab] = useState('resolution');
+  const [busy, setBusy] = useState(null);
+  const [flash, setFlash] = useState(null);
+  const [modal, setModal] = useState(null); // 'merge'|'split'|'attach'|null
   const meta = statusMeta[t.status];
+
+  const flashOk = (msg) => { setFlash({ ok: true, msg }); setTimeout(() => setFlash(null), 2500); };
+  const flashErr = (msg) => { setFlash({ ok: false, msg }); setTimeout(() => setFlash(null), 3500); };
+
+  async function submitMerge(intoTicketId) {
+    setBusy('merge');
+    try {
+      await api.post(`/tickets/${encodeURIComponent(t.id)}/merge`, {
+        intoTicketId: String(intoTicketId).replace(/^#/, ''),
+      });
+      flashOk(`Merged into #${String(intoTicketId).replace(/^#/, '')}`);
+      setModal(null);
+    } catch (e) {
+      flashErr(e?.message || 'merge failed');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function submitSplit(fromMessageId) {
+    setBusy('split');
+    try {
+      const res = await api.post(`/tickets/${encodeURIComponent(t.id)}/split`, {
+        fromMessageId,
+      });
+      flashOk(`New ticket #${res.newTicketId || res.id || ''}`);
+      setModal(null);
+    } catch (e) {
+      flashErr(e?.message || 'split failed');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function submitAttach(messageId) {
+    setBusy('attach');
+    try {
+      await api.post(`/tickets/${encodeURIComponent(t.id)}/attach-message`, { messageId });
+      flashOk('Message attached');
+      setModal(null);
+    } catch (e) {
+      flashErr(e?.message || 'attach failed');
+    } finally {
+      setBusy(null);
+    }
+  }
   return (
     <aside className="right-sidebar tickets-right">
       <div className="tickets-right-head">
@@ -639,7 +795,220 @@ function TicketSidebar({ t, onExpand, onCollapse }) {
           <button className="btn">Save</button>
         </div>
       </div>
+
+      <div className="side-section">
+        <div className="side-section-title">Ticket actions</div>
+        <div style={{ display: 'grid', gap: 6 }}>
+          <button className="btn ghost" disabled={busy === 'merge'} onClick={() => setModal('merge')}>
+            <Icon.Pencil /> Merge into another ticket
+          </button>
+          <button className="btn ghost" disabled={busy === 'split'} onClick={() => setModal('split')}>
+            <Icon.Plus /> Split from message
+          </button>
+          <button className="btn ghost" disabled={busy === 'attach'} onClick={() => setModal('attach')}>
+            <Icon.Inbox /> Attach a message
+          </button>
+          {flash && (
+            <div
+              style={{
+                fontSize: 12,
+                marginTop: 4,
+                color: flash.ok ? 'var(--success, #22c55e)' : 'var(--danger, #ef4444)',
+              }}
+            >
+              {flash.msg}
+            </div>
+          )}
+        </div>
+      </div>
+      {modal === 'merge' && (
+        <MergeTicketModal
+          currentTicketId={t.id}
+          onClose={() => setModal(null)}
+          onSubmit={submitMerge}
+          busy={busy === 'merge'}
+        />
+      )}
+      {modal === 'split' && (
+        <SplitTicketModal
+          conversationId={t.conversationId}
+          onClose={() => setModal(null)}
+          onSubmit={submitSplit}
+          busy={busy === 'split'}
+        />
+      )}
+      {modal === 'attach' && (
+        <AttachMessageModal
+          conversationId={t.conversationId}
+          onClose={() => setModal(null)}
+          onSubmit={submitAttach}
+          busy={busy === 'attach'}
+        />
+      )}
     </aside>
+  );
+}
+
+function ActionModalShell({ title, onClose, children, footer }) {
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 60,
+      }}
+      onClick={onClose}
+    >
+      <div
+        style={{
+          background: 'var(--card, #fff)', borderRadius: 12, padding: 20, width: 480,
+          maxWidth: '94%', boxShadow: '0 20px 50px rgba(15,23,42,0.25)',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={{ margin: '0 0 12px' }}>{title}</h3>
+        {children}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+          <button className="btn secondary" onClick={onClose}>Cancel</button>
+          {footer}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MergeTicketModal({ currentTicketId, onClose, onSubmit, busy }) {
+  const [options, setOptions] = useState([]);
+  const [pick, setPick] = useState('');
+  useEffect(() => {
+    let alive = true;
+    api.get('/tickets?filter=all-open').then((res) => {
+      if (!alive) return;
+      const rows = (Array.isArray(res) ? res : res?.items || []).filter((x) => x.id !== currentTicketId);
+      setOptions(rows);
+      if (rows[0]) setPick(rows[0].id);
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, [currentTicketId]);
+  return (
+    <ActionModalShell
+      title={`Merge ${currentTicketId} into…`}
+      onClose={onClose}
+      footer={
+        <button
+          className="btn"
+          disabled={!pick || busy}
+          onClick={() => onSubmit(pick)}
+        >
+          {busy ? 'Merging…' : 'Merge'}
+        </button>
+      }
+    >
+      <div style={{ display: 'grid', gap: 10 }}>
+        <label>Target ticket
+          <select value={pick} onChange={(e) => setPick(e.target.value)}>
+            {options.length === 0 && <option value="">No other open tickets</option>}
+            {options.map((o) => (
+              <option key={o.id} value={o.id}>
+                {o.id} — {o.subject || o.task} ({o.customer})
+              </option>
+            ))}
+          </select>
+        </label>
+        <div style={{ fontSize: 12, color: 'var(--muted)' }}>
+          The source ticket becomes <b>closed</b>; its timeline is appended into the target.
+        </div>
+      </div>
+    </ActionModalShell>
+  );
+}
+
+function SplitTicketModal({ conversationId, onClose, onSubmit, busy }) {
+  const [messages, setMessages] = useState([]);
+  const [pick, setPick] = useState('');
+  useEffect(() => {
+    if (!conversationId) return;
+    let alive = true;
+    api.get(`/conversations/${encodeURIComponent(conversationId)}/messages`).then((res) => {
+      if (!alive) return;
+      const rows = Array.isArray(res) ? res : res?.items || [];
+      setMessages(rows);
+      if (rows[0]) setPick(rows[0].id);
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, [conversationId]);
+  return (
+    <ActionModalShell
+      title="Split new ticket from a message"
+      onClose={onClose}
+      footer={
+        <button
+          className="btn"
+          disabled={!pick || busy}
+          onClick={() => onSubmit(pick)}
+        >
+          {busy ? 'Splitting…' : 'Split'}
+        </button>
+      }
+    >
+      <div style={{ display: 'grid', gap: 10 }}>
+        {!conversationId && <div style={{ fontSize: 13, color: 'var(--danger)' }}>No conversation linked to this ticket.</div>}
+        <label>Start new ticket from message
+          <select value={pick} onChange={(e) => setPick(e.target.value)}>
+            {messages.length === 0 && <option value="">No messages</option>}
+            {messages.map((m) => (
+              <option key={m.id} value={m.id}>
+                [{m.at}] {m.from}: {(m.text || '').slice(0, 60)}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+    </ActionModalShell>
+  );
+}
+
+function AttachMessageModal({ conversationId, onClose, onSubmit, busy }) {
+  const [messages, setMessages] = useState([]);
+  const [pick, setPick] = useState('');
+  useEffect(() => {
+    if (!conversationId) return;
+    let alive = true;
+    api.get(`/conversations/${encodeURIComponent(conversationId)}/messages`).then((res) => {
+      if (!alive) return;
+      const rows = Array.isArray(res) ? res : res?.items || [];
+      setMessages(rows);
+      if (rows[0]) setPick(rows[0].id);
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, [conversationId]);
+  return (
+    <ActionModalShell
+      title="Attach a message to this ticket"
+      onClose={onClose}
+      footer={
+        <button
+          className="btn"
+          disabled={!pick || busy}
+          onClick={() => onSubmit(pick)}
+        >
+          {busy ? 'Attaching…' : 'Attach'}
+        </button>
+      }
+    >
+      <div style={{ display: 'grid', gap: 10 }}>
+        {!conversationId && <div style={{ fontSize: 13, color: 'var(--danger)' }}>No conversation linked to this ticket.</div>}
+        <label>Pick a message
+          <select value={pick} onChange={(e) => setPick(e.target.value)}>
+            {messages.length === 0 && <option value="">No messages</option>}
+            {messages.map((m) => (
+              <option key={m.id} value={m.id}>
+                [{m.at}] {m.from}: {(m.text || '').slice(0, 60)}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+    </ActionModalShell>
   );
 }
 

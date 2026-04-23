@@ -73,10 +73,23 @@ Sign-out: `clearAuth()` removes the localStorage entry and fires `POST /auth/sig
 | [GlobalSearch.jsx](src/components/GlobalSearch.jsx) | `GET /search` | [search.py](backend/app/routers/search.py) |
 | [Platforms.jsx](src/pages/Platforms.jsx) | `GET /platforms`, `GET /platforms/stats`, `POST /platforms/:id/(dis)connect` | [platforms.py](backend/app/routers/platforms.py) |
 | [Analytics.jsx](src/pages/Analytics.jsx) | `GET /analytics/summary`, `/analytics/timeseries` | [analytics.py](backend/app/routers/analytics.py) |
-| [AgentBuilder.jsx](src/pages/AgentBuilder.jsx) | `GET /agents`, `POST /agents`, `PATCH /agents/:id`, `POST /agents/:id/test` | [agents.py](backend/app/routers/agents.py) |
+| [AgentBuilder.jsx](src/pages/AgentBuilder.jsx) | `GET /agents`, `POST /agents`, `PATCH /agents/:id`, `POST /agents/:id/test`, `POST /agents/:id/run` (SSE) | [agents.py](backend/app/routers/agents.py) |
+| [Conversations.jsx](src/pages/Conversations.jsx) AI Draft chip | `POST /ai/draft` | [agents.py](backend/app/routers/agents.py) — `draft_router` |
+| Channel adapters (future) | `POST /conversations/:id/inbound` | [conversations.py](backend/app/routers/conversations.py) — simulates webhook → intent classifier → `attach/reopen/create` |
+| [PublicCsat.jsx](src/pages/PublicCsat.jsx) | `GET /csat/:token`, `POST /csat/:token` (unauth) + `POST /tickets/:id/csat/send` (authed) | [analytics.py](backend/app/routers/analytics.py) — `csat_router` |
 | [channels/*](src/pages/channels/) | `/ecommerce/*`, `/apis`, `/integrations`, `/api-logs*`, `/sheets`, `/health/services`, `/incidents` | [channels.py](backend/app/routers/channels.py) |
 
 All write endpoints echo the resulting entity, not `{ok:true}` — mirrors spec §8 "Optimistic UI contract", so the client never refetches after a mutation.
+
+### Idempotency keys
+
+`POST /tickets` and `POST /conversations/:id/messages` honour an `Idempotency-Key` request header. First call records the response in `idempotency_keys (workspace_id, scope, key) → response`; every subsequent call with the same key replays the stored response without re-running the handler. Scope strings: `tickets.create`, `conv.<conv_id>.msg`.
+
+For messages, if the client doesn't send the header, `body.tempId` from the optimistic-UI contract is used as the key instead — so double-click retries never create duplicate rows out of the box.
+
+### RBAC
+
+Roles ordered `viewer < agent < admin`. `AgentOrAdmin` (in [backend/app/deps.py](backend/app/deps.py)) gates every mutation route in tickets / conversations; `AdminOnly` guards `PATCH /workspace`. Viewers can still read anywhere their workspace allows.
 
 ### Optimistic UI contract for messages
 

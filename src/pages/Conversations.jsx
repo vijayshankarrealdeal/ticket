@@ -4,7 +4,7 @@ import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
 import { useDelayUnmount } from '../hooks/useDelayUnmount.js';
 import { useGlobalSearch } from '../hooks/useGlobalSearch.jsx';
-import { api } from '../api.js';
+import { api, uploadFile } from '../api.js';
 import { useRealtimeTopic } from '../hooks/useRealtime.js';
 import { loadAuth } from './AuthPage.jsx';
 
@@ -27,6 +27,7 @@ export default function Conversations() {
     return Number.isFinite(n) ? n : null;
   });
   const [draft, setDraft] = useState('');
+  const [draftLoading, setDraftLoading] = useState(false);
   const [list, setList] = useState([]);
 
   useEffect(() => {
@@ -184,6 +185,19 @@ export default function Conversations() {
     setParams(next, { replace: true });
   };
 
+  const requestDraft = async () => {
+    if (!activeThread || draftLoading) return;
+    setDraftLoading(true);
+    try {
+      const res = await api.post('/ai/draft', { conversationId: activeThread.id });
+      if (res?.draft) setDraft(res.draft);
+    } catch (e) {
+      // silent — the chip just won't fill anything
+    } finally {
+      setDraftLoading(false);
+    }
+  };
+
   const send = () => {
     if ((!draft.trim() && pending.length === 0) || !activeThread) return;
     const targetId = activeThread.id;
@@ -229,8 +243,11 @@ export default function Conversations() {
     requestAnimationFrame(() => textareaRef.current?.focus());
   };
 
-  const addFiles = (fileList, kindHint) => {
+  const addFiles = async (fileList, kindHint) => {
     if (!activeThread || !fileList || fileList.length === 0) return;
+    // Optimistic insert with local blob URL so the preview renders immediately,
+    // then kick off the presign→PUT upload from api.js (wire.md §5) and swap
+    // the url to the public one on success.
     const items = Array.from(fileList).map((f) => ({
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       kind: kindHint || (f.type.startsWith('image/') ? 'image' : 'file'),
@@ -238,8 +255,22 @@ export default function Conversations() {
       size: f.size,
       mime: f.type,
       url: URL.createObjectURL(f),
+      _file: f,
+      uploading: true,
     }));
     setPending((p) => [...p, ...items]);
+    for (const it of items) {
+      try {
+        const out = await uploadFile(it._file);
+        setPending((p) => p.map((x) => {
+          if (x.id !== it.id) return x;
+          try { URL.revokeObjectURL(x.url); } catch {}
+          return { ...x, url: out.url, key: out.key, uploading: false, _file: undefined };
+        }));
+      } catch (err) {
+        setPending((p) => p.map((x) => (x.id === it.id ? { ...x, uploading: false, error: String(err?.message || err) } : x)));
+      }
+    }
   };
 
   const addLink = (raw) => {
@@ -840,9 +871,16 @@ export default function Conversations() {
                       )}
                     </div>
                     {activeThread && (
-                      <span className="ai-draft-chip inline" title="AI has a draft suggestion ready">
-                        <Icon.Check2 /> AI Draft
-                      </span>
+                      <button
+                        type="button"
+                        className="ai-draft-chip inline"
+                        title="Generate an AI draft for this conversation"
+                        onClick={requestDraft}
+                        disabled={draftLoading}
+                        style={{ cursor: draftLoading ? 'progress' : 'pointer' }}
+                      >
+                        <Icon.Check2 /> {draftLoading ? 'Drafting…' : 'AI Draft'}
+                      </button>
                     )}
                     <textarea
                       ref={textareaRef}

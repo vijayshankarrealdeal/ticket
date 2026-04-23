@@ -274,3 +274,300 @@ CREATE TABLE IF NOT EXISTS agents (
   last_published_at timestamptz,
   created_at        timestamptz NOT NULL DEFAULT now()
 );
+
+-- ---------- API Library / Integrations / Logs (spec §3.9.3, §3.9.4) ----------
+CREATE TABLE IF NOT EXISTS integrations (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  name          text NOT NULL,
+  description   text,
+  kind          text NOT NULL DEFAULT 'custom',
+  config        jsonb NOT NULL DEFAULT '{}'::jsonb,
+  health        text NOT NULL DEFAULT 'good',
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS integrations_ws_idx ON integrations (workspace_id);
+
+CREATE TABLE IF NOT EXISTS apis (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id    uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  integration_id  uuid REFERENCES integrations(id) ON DELETE SET NULL,
+  name            text NOT NULL,
+  method          text NOT NULL DEFAULT 'GET',
+  description     text,
+  spec            jsonb NOT NULL DEFAULT '{}'::jsonb,
+  calls_24h       int NOT NULL DEFAULT 0,
+  p95_ms          int NOT NULL DEFAULT 0,
+  last_used_at    timestamptz,
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS apis_ws_idx ON apis (workspace_id);
+CREATE INDEX IF NOT EXISTS apis_ws_name_idx ON apis (workspace_id, name);
+
+CREATE TABLE IF NOT EXISTS api_logs (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  api_id        uuid REFERENCES apis(id) ON DELETE SET NULL,
+  customer_id   uuid REFERENCES customers(id),
+  trace_id      text NOT NULL,
+  status        int NOT NULL,
+  latency_ms    int NOT NULL DEFAULT 0,
+  request       jsonb,
+  response      jsonb,
+  at            timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS api_logs_ws_at_idx  ON api_logs (workspace_id, at DESC);
+CREATE INDEX IF NOT EXISTS api_logs_api_at_idx ON api_logs (api_id, at DESC);
+
+-- ---------- E-commerce stores (spec §3.9.2) ----------
+CREATE TABLE IF NOT EXISTS ecommerce_stores (
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id   uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  platform       text NOT NULL,
+  name           text NOT NULL,
+  health         int  NOT NULL DEFAULT 100,
+  orders_30d     int  NOT NULL DEFAULT 0,
+  last_sync_at   timestamptz,
+  status         text NOT NULL DEFAULT 'connected',
+  config         jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at     timestamptz NOT NULL DEFAULT now()
+);
+
+-- ---------- Outbox dispatcher (spec §11) ----------
+CREATE TABLE IF NOT EXISTS outbox (
+  id           bigserial PRIMARY KEY,
+  workspace_id uuid REFERENCES workspaces(id) ON DELETE CASCADE,
+  kind         text NOT NULL,
+  payload      jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status       text NOT NULL DEFAULT 'pending',
+  attempts     int  NOT NULL DEFAULT 0,
+  not_before   timestamptz NOT NULL DEFAULT now(),
+  last_error   text,
+  locked_by    text,
+  locked_at    timestamptz,
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS outbox_due_idx ON outbox (status, not_before) WHERE status = 'pending';
+
+-- ---------- Agent runs + Langflow snapshots (spec §3.11.C) ----------
+CREATE TABLE IF NOT EXISTS agent_runs (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id    uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  agent_id        uuid REFERENCES agents(id) ON DELETE SET NULL,
+  conversation_id uuid REFERENCES conversations(id) ON DELETE SET NULL,
+  version         int  NOT NULL DEFAULT 0,
+  input           jsonb NOT NULL DEFAULT '{}'::jsonb,
+  output          jsonb,
+  status          text NOT NULL DEFAULT 'ok',
+  latency_ms      int,
+  tokens_in       int,
+  tokens_out      int,
+  cost_usd        numeric(10, 4),
+  trace           jsonb,
+  at              timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS agent_runs_agent_at_idx ON agent_runs (agent_id, at DESC);
+CREATE INDEX IF NOT EXISTS agent_runs_ws_at_idx    ON agent_runs (workspace_id, at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_flow_snapshots (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id    uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  version     int  NOT NULL,
+  flow_json   jsonb NOT NULL,
+  created_by  uuid REFERENCES users(id),
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (agent_id, version)
+);
+
+-- ---------- Password resets / OAuth / Langflow columns (spec §3.1, §3.11.C) ----------
+CREATE TABLE IF NOT EXISTS password_resets (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash  text NOT NULL UNIQUE,
+  expires_at  timestamptz NOT NULL,
+  used_at     timestamptz,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- ---------- Additive columns on existing tables ----------
+-- Users: OAuth identity + Langflow per-user binding.
+ALTER TABLE users           ADD COLUMN IF NOT EXISTS oauth_sub text;
+ALTER TABLE users           ADD COLUMN IF NOT EXISTS langflow_user_id uuid;
+ALTER TABLE users           ADD COLUMN IF NOT EXISTS langflow_password_secret_id text;
+CREATE UNIQUE INDEX IF NOT EXISTS users_provider_sub_idx
+  ON users (workspace_id, provider, oauth_sub) WHERE oauth_sub IS NOT NULL;
+
+-- Workspaces: AI guardrails + Langflow folder.
+ALTER TABLE workspaces      ADD COLUMN IF NOT EXISTS default_lang text NOT NULL DEFAULT 'en';
+ALTER TABLE workspaces      ADD COLUMN IF NOT EXISTS ai_prompt_append text;
+ALTER TABLE workspaces      ADD COLUMN IF NOT EXISTS ai_allowed_tools jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE workspaces      ADD COLUMN IF NOT EXISTS ai_force_default boolean NOT NULL DEFAULT false;
+ALTER TABLE workspaces      ADD COLUMN IF NOT EXISTS intent_rules jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE workspaces      ADD COLUMN IF NOT EXISTS langflow_folder_id uuid;
+
+-- Agents: Langflow bindings + schemas.
+ALTER TABLE agents          ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'builtin';
+ALTER TABLE agents          ADD COLUMN IF NOT EXISTS langflow_flow_id uuid;
+ALTER TABLE agents          ADD COLUMN IF NOT EXISTS langflow_folder_id uuid;
+ALTER TABLE agents          ADD COLUMN IF NOT EXISTS input_schema  jsonb;
+ALTER TABLE agents          ADD COLUMN IF NOT EXISTS output_schema jsonb;
+ALTER TABLE agents          ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES users(id);
+ALTER TABLE agents          ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true;
+
+-- Tickets: intent classifier columns (spec §3.4.1).
+ALTER TABLE tickets         ADD COLUMN IF NOT EXISTS intent_confidence numeric(3, 2);
+ALTER TABLE tickets         ADD COLUMN IF NOT EXISTS order_ref        text;
+ALTER TABLE tickets         ADD COLUMN IF NOT EXISTS last_customer_at timestamptz;
+ALTER TABLE tickets         ADD COLUMN IF NOT EXISTS auto_close_at    timestamptz;
+
+-- Notifications: prefs blob on users.
+ALTER TABLE users           ADD COLUMN IF NOT EXISTS notification_prefs jsonb NOT NULL DEFAULT '{"email":true,"browser":true,"digest":"daily"}'::jsonb;
+
+-- Conversations: external-channel recordings reference.
+ALTER TABLE conversations   ADD COLUMN IF NOT EXISTS recordings jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+-- ---------- KB chunks (spec §7, §3.11.H kb_search tool) ----------
+-- Build-2 subset: ILIKE-over-body until pgvector lands. When vector is enabled,
+-- promote `embedding bytea` to `vector(1536)` + add the HNSW index from §9.
+CREATE TABLE IF NOT EXISTS kb_chunks (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  source        text NOT NULL,
+  title         text,
+  body          text NOT NULL,
+  embedding     bytea,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS kb_chunks_ws_idx       ON kb_chunks (workspace_id);
+CREATE INDEX IF NOT EXISTS kb_chunks_body_trgm_idx ON kb_chunks USING gin (body gin_trgm_ops);
+
+-- ---------- SLA policy (spec §3.4, §11) ----------
+-- Per-team-per-task SLA hours. Used by POST /tickets to compute sla_due_at.
+CREATE TABLE IF NOT EXISTS sla_policies (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  team          text,
+  task          text,
+  hours         numeric(6, 2) NOT NULL DEFAULT 24,
+  priority      text,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, team, task, priority)
+);
+CREATE INDEX IF NOT EXISTS sla_policies_ws_idx ON sla_policies (workspace_id);
+
+-- ---------- Teams read cursors + presence (spec §3.6) ----------
+CREATE TABLE IF NOT EXISTS teams_read_cursors (
+  user_id       uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  channel_id    uuid REFERENCES teams_channels(id) ON DELETE CASCADE,
+  dm_id         uuid REFERENCES teams_dms(id) ON DELETE CASCADE,
+  last_read_at  timestamptz NOT NULL DEFAULT now(),
+  CHECK ((channel_id IS NOT NULL) <> (dm_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS teams_read_cursors_chan_idx
+  ON teams_read_cursors (user_id, channel_id) WHERE channel_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS teams_read_cursors_dm_idx
+  ON teams_read_cursors (user_id, dm_id) WHERE dm_id IS NOT NULL;
+
+-- ---------- Health services + incidents (spec §3.9.6) ----------
+CREATE TABLE IF NOT EXISTS health_services (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id    uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  name            text NOT NULL,
+  category        text,
+  status          text NOT NULL DEFAULT 'operational',
+  uptime_30d      numeric(5, 2) NOT NULL DEFAULT 100,
+  latency_p95_ms  int NOT NULL DEFAULT 0,
+  error_rate      numeric(5, 2) NOT NULL DEFAULT 0,
+  last_check_at   timestamptz,
+  accent          text,
+  letter          text,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS incidents (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  title         text NOT NULL,
+  status        text NOT NULL DEFAULT 'investigating',
+  tone          text NOT NULL DEFAULT 'warning',
+  components    jsonb NOT NULL DEFAULT '[]'::jsonb,
+  summary       text,
+  started_at    timestamptz NOT NULL DEFAULT now(),
+  resolved_at   timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS incident_subscribers (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  email         citext NOT NULL,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, email)
+);
+
+-- ---------- CSAT surveys (spec §3.10) ----------
+CREATE TABLE IF NOT EXISTS csat_responses (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  ticket_id     bigint REFERENCES tickets(id) ON DELETE CASCADE,
+  customer_id   uuid REFERENCES customers(id),
+  rating        int NOT NULL,
+  comment       text,
+  at            timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS csat_ws_at_idx ON csat_responses (workspace_id, at DESC);
+
+-- Tokens issued on ticket-resolve so the survey URL can be rendered without
+-- exposing ticket IDs to the public CSAT form.
+CREATE TABLE IF NOT EXISTS csat_tokens (
+  token         text PRIMARY KEY,
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  ticket_id     bigint NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+  customer_id   uuid REFERENCES customers(id),
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  submitted_at  timestamptz
+);
+CREATE INDEX IF NOT EXISTS csat_tokens_ticket_idx ON csat_tokens (ticket_id);
+
+-- ---------- Sheets (spec §3.9.5) — table for when the sync worker lands ----------
+CREATE TABLE IF NOT EXISTS sheets (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  url           text NOT NULL,
+  name          text,
+  tabs          jsonb NOT NULL DEFAULT '[]'::jsonb,
+  rows          int NOT NULL DEFAULT 0,
+  status        text NOT NULL DEFAULT 'connected',
+  last_sync_at  timestamptz,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- ---------- E-commerce events feed (spec §3.9.2) ----------
+CREATE TABLE IF NOT EXISTS ecommerce_events (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  store_id      uuid REFERENCES ecommerce_stores(id) ON DELETE SET NULL,
+  type          text NOT NULL,
+  title         text NOT NULL,
+  sub           text,
+  tone          text,
+  at            timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ecommerce_events_ws_at_idx ON ecommerce_events (workspace_id, at DESC);
+
+-- ---------- Idempotency keys (spec cross-cutting §3.3, §3.4) ----------
+-- Scoped per user+endpoint so repeated POSTs from a flaky webhook / network
+-- don't create duplicate tickets or messages. 24h TTL is enforced by a
+-- cleanup pass in the worker.
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  id            bigserial PRIMARY KEY,
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  user_id       uuid REFERENCES users(id) ON DELETE CASCADE,
+  scope         text NOT NULL,
+  key           text NOT NULL,
+  response      jsonb NOT NULL,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, scope, key)
+);
+CREATE INDEX IF NOT EXISTS idem_ws_scope_created_idx
+  ON idempotency_keys (workspace_id, scope, created_at DESC);
