@@ -17,6 +17,7 @@ import {
   Legend,
 } from 'recharts';
 import TopBar from '../components/TopBar.jsx';
+import { Spinner } from '../components/Spinner.jsx';
 import { api } from '../api.js';
 
 const BLUE = {
@@ -48,15 +49,14 @@ export default function Analytics() {
   const [breakdown, setBreakdown] = useState(null);
   const [metric, setMetric] = useState('tickets');
   const [series, setSeries] = useState([]);
+  const [initialLoading, setInitialLoading] = useState(true);
 
   useEffect(() => {
     let alive = true;
-    api.get('/analytics/summary')
-      .then((s) => { if (alive) setSummary(s || null); })
-      .catch(() => {});
-    api.get('/analytics/breakdown?range=14d')
-      .then((b) => { if (alive) setBreakdown(b || null); })
-      .catch(() => {});
+    Promise.allSettled([
+      api.get('/analytics/summary').then((s) => { if (alive) setSummary(s || null); }),
+      api.get('/analytics/breakdown?range=14d').then((b) => { if (alive) setBreakdown(b || null); }),
+    ]).finally(() => { if (alive) setInitialLoading(false); });
     return () => { alive = false; };
   }, []);
 
@@ -91,6 +91,12 @@ export default function Analytics() {
         }
       />
       <div className="page-scroll">
+        {initialLoading && !summary && !breakdown ? (
+          <div style={{ padding: '80px 16px', display: 'flex', justifyContent: 'center' }}>
+            <Spinner size={32} />
+          </div>
+        ) : (
+        <>
         <div className="stat-row">
           <Stat label="Tickets this week" value={summary?.ticketsThisWeek ?? '—'} />
           <Stat label="Avg resolution" value={summary?.avgResolution ?? '—'} />
@@ -305,6 +311,8 @@ export default function Analytics() {
             </div>
           )}
         </div>
+        </>
+        )}
       </div>
     </>
   );

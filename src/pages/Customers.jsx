@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
+import { Spinner } from '../components/Spinner.jsx';
 import { useGlobalSearch } from '../hooks/useGlobalSearch.jsx';
 import { api } from '../api.js';
 
@@ -28,6 +29,7 @@ const FILTERS = [
 export default function Customers() {
   const [params, setParams] = useSearchParams();
   const [customers, setCustomers] = useState([]);
+  const [customersLoading, setCustomersLoading] = useState(true);
 
   const findByParams = (list = customers) => {
     const id = params.get('id');
@@ -60,7 +62,8 @@ export default function Customers() {
         setCustomers(items);
         setSelectedId((cur) => cur ?? findByParams(items) ?? items[0]?.id ?? null);
       })
-      .catch(() => { if (alive) setCustomers([]); });
+      .catch(() => { if (alive) setCustomers([]); })
+      .finally(() => { if (alive) setCustomersLoading(false); });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -221,19 +224,27 @@ export default function Customers() {
             </div>
 
             <div className="conv-list">
-              {visible.map((c) => (
-                <CustomerRow
-                  key={c.id}
-                  c={c}
-                  selected={c.id === selectedId}
-                  onClick={() => setSelectedId(c.id)}
-                />
-              ))}
-              {visible.length === 0 && (
-                <div className="tickets-empty">
-                  <Icon.InboxEmpty />
-                  <div>No customers match your search.</div>
+              {customersLoading ? (
+                <div style={{ padding: '40px 16px', display: 'flex', justifyContent: 'center' }}>
+                  <Spinner size={24} />
                 </div>
+              ) : (
+                <>
+                  {visible.map((c) => (
+                    <CustomerRow
+                      key={c.id}
+                      c={c}
+                      selected={c.id === selectedId}
+                      onClick={() => setSelectedId(c.id)}
+                    />
+                  ))}
+                  {visible.length === 0 && (
+                    <div className="tickets-empty">
+                      <Icon.InboxEmpty />
+                      <div>No customers match your search.</div>
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </div>

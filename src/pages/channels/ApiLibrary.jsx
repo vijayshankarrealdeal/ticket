@@ -1,30 +1,67 @@
 import { Fragment, useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Icon } from '../../components/Icons.jsx';
+import { Spinner } from '../../components/Spinner.jsx';
 import { api as apiClient } from '../../api.js';
 
 const METHODS = ['ALL', 'GET', 'POST', 'PUT', 'DELETE'];
 const EDITABLE_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'];
 
 export default function ApiLibrary() {
+  const navigate = useNavigate();
   const [tab, setTab] = useState('apis');
   const [query, setQuery] = useState('');
   const [method, setMethod] = useState('ALL');
   const [integration, setIntegration] = useState('ALL');
   const [apis, setApis] = useState([]);
   const [integrations, setIntegrations] = useState([]);
-  const [modal, setModal] = useState(null); // { mode: 'newApi'|'editApi'|'newIntegration', data? }
+  const [modal, setModal] = useState(null); // { mode: 'editApi'|'newIntegration', data? }
   const [testOutput, setTestOutput] = useState(null);
+  const [initialLoading, setInitialLoading] = useState(true);
 
   async function refresh() {
-    const [a, i] = await Promise.all([
+    // Pull both the legacy `/apis` rows and the saved Playground endpoints so
+    // the Library is the single canonical view of every API the workspace
+    // can call. Playground rows are tagged so we route their row actions
+    // back to the Playground instead of the legacy edit modal.
+    const [legacyResp, integrationsResp, pgEndpointsResp, pgFoldersResp] = await Promise.all([
       apiClient.get('/apis').catch(() => []),
       apiClient.get('/integrations').catch(() => []),
+      apiClient.get('/api-playground/endpoints').catch(() => []),
+      apiClient.get('/api-playground/folders').catch(() => []),
     ]);
-    setApis(Array.isArray(a) ? a : a?.items || []);
-    setIntegrations(Array.isArray(i) ? i : i?.items || []);
+    const legacy = (Array.isArray(legacyResp) ? legacyResp : legacyResp?.items || [])
+      .map((row) => ({ ...row, source: 'legacy' }));
+
+    // Folder lookup so each playground row can carry its parent folder name —
+    // shown as a breadcrumb prefix in the Name column for quick scanning.
+    const folderName = new Map();
+    (Array.isArray(pgFoldersResp) ? pgFoldersResp : []).forEach((f) => {
+      folderName.set(f.id, f.name);
+    });
+
+    const playground = (Array.isArray(pgEndpointsResp) ? pgEndpointsResp : []).map((ep) => ({
+      id: ep.id,
+      name: ep.name,
+      folderName: ep.folderId ? folderName.get(ep.folderId) || 'Unfiled' : 'Unfiled',
+      method: ep.method,
+      description: ep.description || '',
+      integrationId: null,
+      integration: 'Playground',
+      spec: { url: ep.url },
+      calls24h: 0,
+      p95: 0,
+      lastUsed: ep.lastRunAt || null,
+      source: 'playground',
+      hasSchema: !!ep.outputSchema,
+    }));
+    setApis([...playground, ...legacy]);
+    setIntegrations(Array.isArray(integrationsResp) ? integrationsResp : integrationsResp?.items || []);
   }
 
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => {
+    refresh().finally(() => setInitialLoading(false));
+  }, []);
 
   const integrationById = useMemo(() => {
     const m = new Map();
@@ -54,7 +91,8 @@ export default function ApiLibrary() {
       return (
         (a.name || '').toLowerCase().includes(q) ||
         (a.description || '').toLowerCase().includes(q) ||
-        (a.integration || '').toLowerCase().includes(q)
+        (a.integration || '').toLowerCase().includes(q) ||
+        (a.folderName || '').toLowerCase().includes(q)
       );
     });
   }, [enrichedApis, query, method, integration]);
@@ -67,10 +105,13 @@ export default function ApiLibrary() {
     );
   }, [integrations, query]);
 
-  const deleteApi = async (id) => {
+  const deleteApi = async (row) => {
     if (!confirm('Delete this API entry?')) return;
-    try { await apiClient.del(`/apis/${encodeURIComponent(id)}`); } catch {}
-    setApis((prev) => prev.filter((a) => a.id !== id));
+    const path = row.source === 'playground'
+      ? `/api-playground/endpoints/${encodeURIComponent(row.id)}`
+      : `/apis/${encodeURIComponent(row.id)}`;
+    try { await apiClient.del(path); } catch {}
+    setApis((prev) => prev.filter((a) => a.id !== row.id));
   };
 
   const cloneApi = async (id) => {
@@ -143,8 +184,8 @@ export default function ApiLibrary() {
             <Icon.Book /> Export logs
           </button>
           {tab === 'apis' ? (
-            <button className="btn" onClick={() => setModal({ mode: 'newApi' })}>
-              <Icon.Plus /> Add API
+            <button className="btn" onClick={() => navigate('/api-playground')}>
+              <Icon.Bolt /> Open Playground
             </button>
           ) : (
             <button className="btn" onClick={() => setModal({ mode: 'newIntegration' })}>
@@ -154,14 +195,18 @@ export default function ApiLibrary() {
         </div>
       </div>
 
+      {initialLoading && apis.length === 0 && integrations.length === 0 ? (
+        <div style={{ padding: '80px 16px', display: 'flex', justifyContent: 'center' }}>
+          <Spinner size={32} />
+        </div>
+      ) : (
+      <>
       <div className="ch-kpi-row">
         <Kpi label="Total APIs" value={apis.length} />
         <Kpi label="Integrations" value={integrations.length} />
         <Kpi
           label="Calls · 24h"
           value={apis.reduce((s, a) => s + (a.calls24h || 0), 0).toLocaleString()}
-          delta="+6%"
-          tone="success"
         />
         <Kpi
           label="p95 latency"
@@ -226,10 +271,13 @@ export default function ApiLibrary() {
           onDelete={deleteApi}
           onEdit={(a) => setModal({ mode: 'editApi', data: a })}
           onTest={testApi}
+          onOpenInPlayground={(a) => navigate('/api-playground')}
           testOutput={testOutput}
         />
       ) : (
         <IntegrationsTable items={filteredIntegrations} onDelete={deleteIntegration} />
+      )}
+      </>
       )}
 
       {modal && (
@@ -275,7 +323,7 @@ function MethodBadge({ method }) {
   return <span className={'ch-method ch-method-' + (method || '').toLowerCase()}>{method}</span>;
 }
 
-function ApiTable({ items, onClone, onDelete, onEdit, onTest, testOutput }) {
+function ApiTable({ items, onClone, onDelete, onEdit, onTest, onOpenInPlayground, testOutput }) {
   if (items.length === 0) return <EmptyTable label="No APIs match your filters" />;
   return (
     <div className="ch-table-wrap">
@@ -284,40 +332,65 @@ function ApiTable({ items, onClone, onDelete, onEdit, onTest, testOutput }) {
           <tr>
             <th style={{ width: 72 }}>Method</th>
             <th>Name</th>
-            <th>Integration</th>
+            <th>Source</th>
             <th className="num">Calls · 24h</th>
             <th className="num">p95</th>
             <th>Last used</th>
-            <th style={{ width: 260 }}>Actions</th>
+            <th style={{ width: 280 }}>Actions</th>
           </tr>
         </thead>
         <tbody>
-          {items.map((a) => (
+          {items.map((a) => {
+            const isPlayground = a.source === 'playground';
+            return (
             <Fragment key={a.id}>
               <tr>
                 <td><MethodBadge method={a.method} /></td>
                 <td>
-                  <div className="ch-api-name">{a.name}</div>
-                  <div className="ch-api-desc">{a.description}</div>
+                  <div className="ch-api-name">
+                    {isPlayground && a.folderName && (
+                      <>
+                        <span style={{ color: 'var(--muted)', fontWeight: 500 }}>
+                          {a.folderName}
+                        </span>
+                        <span style={{ color: 'var(--muted-2, var(--muted))', margin: '0 6px', fontWeight: 500 }}>/</span>
+                      </>
+                    )}
+                    {a.name}
+                    {isPlayground && a.hasSchema && (
+                      <span className="ch-chip" style={{ marginLeft: 6, fontSize: 10 }}>schema</span>
+                    )}
+                  </div>
+                  <div className="ch-api-desc">{a.description || (isPlayground ? <em style={{ color: 'var(--warning, #b45309)' }}>No description — add one in the Playground</em> : '')}</div>
                 </td>
                 <td>
-                  <span className="ch-chip">{a.integration || '—'}</span>
+                  <span className={'ch-chip' + (isPlayground ? ' ch-chip-info' : '')}>
+                    {isPlayground ? 'Playground' : (a.integration || '—')}
+                  </span>
                 </td>
                 <td className="num">{(a.calls24h || 0).toLocaleString()}</td>
                 <td className="num">{a.p95 || 0}</td>
                 <td className="muted">{a.lastUsed || '—'}</td>
                 <td>
                   <div className="ch-row-actions">
-                    <button className="ch-row-action" onClick={() => onEdit(a)}>
-                      <Icon.Pencil /> Edit
-                    </button>
-                    <button className="ch-row-action" onClick={() => onClone(a.id)}>
-                      <Icon.Copy /> Clone
-                    </button>
-                    <button className="ch-row-action" onClick={() => onTest(a)}>
-                      <Icon.Play /> Test
-                    </button>
-                    <button className="ch-row-action danger" onClick={() => onDelete(a.id)}>
+                    {isPlayground ? (
+                      <button className="ch-row-action" onClick={() => onOpenInPlayground(a)}>
+                        <Icon.ExternalLink /> Open
+                      </button>
+                    ) : (
+                      <>
+                        <button className="ch-row-action" onClick={() => onEdit(a)}>
+                          <Icon.Pencil /> Edit
+                        </button>
+                        <button className="ch-row-action" onClick={() => onClone(a.id)}>
+                          <Icon.Copy /> Clone
+                        </button>
+                        <button className="ch-row-action" onClick={() => onTest(a)}>
+                          <Icon.Play /> Test
+                        </button>
+                      </>
+                    )}
+                    <button className="ch-row-action danger" onClick={() => onDelete(a)}>
                       <Icon.Trash /> Delete
                     </button>
                   </div>
@@ -343,7 +416,8 @@ function ApiTable({ items, onClone, onDelete, onEdit, onTest, testOutput }) {
                 </tr>
               )}
             </Fragment>
-          ))}
+            );
+          })}
         </tbody>
       </table>
     </div>

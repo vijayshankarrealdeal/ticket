@@ -5281,3 +5281,32 @@
   background: var(--panel);
 }
 
+
+/* ---------- Spinner / loading indicator ---------- */
+.spinner {
+  display: inline-block;
+  border-style: solid;
+  border-color: var(--border);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  box-sizing: border-box;
+  flex-shrink: 0;
+}
+.loading-block {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 40px 16px;
+  color: var(--muted);
+}
+.loading-block-label {
+  font-size: 13px;
+  color: var(--muted);
+}
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation-duration: 1.6s; }
+}

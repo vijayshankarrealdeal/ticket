@@ -784,16 +784,39 @@ async def incidents_subscribe(body: dict, user: dict = Me) -> dict:
     if not email:
         raise HTTPException(400, "email required")
     db = await get_db()
-    await db.execute(
+    cur = await db.execute(
         """
         INSERT INTO incident_subscribers (workspace_id, email)
         VALUES (?, ?)
         ON CONFLICT (workspace_id, email) DO NOTHING
+        RETURNING id
         """,
         (user["workspace_id"], email),
     )
+    inserted = await cur.fetchone()
+    if inserted:
+        # First-time subscribe — send a confirmation email through the outbox
+        # so the subscriber can see the signup round-tripped. Re-subscribes
+        # (unique conflict) skip the email so we don't flood repeat clicks.
+        await db.execute(
+            """
+            INSERT INTO outbox (workspace_id, kind, payload)
+            VALUES (?, 'email', ?)
+            """,
+            (user["workspace_id"], js({
+                "workspace_id": user["workspace_id"],
+                "to": email,
+                "subject": "You're subscribed to status updates",
+                "body": (
+                    "You'll receive an email whenever a service goes degraded "
+                    "or down, and again when it recovers.\n\n"
+                    "Reply to unsubscribe at any time."
+                ),
+                "kind": "incident_subscribe",
+            })),
+        )
     await db.commit()
-    return {"ok": True, "email": email}
+    return {"ok": True, "email": email, "newSubscriber": bool(inserted)}
 
 
 @router.post("/health/probe")
@@ -929,6 +952,7 @@ async def _execute_api(db, ws_id: str, api_row: dict, args: dict, customer_id: s
     kind = (spec.get("kind") or "").lower()
     url = spec.get("url")
     response_body: Any = {"ok": True, "echo": args, "spec": _redact(spec)}
+    response_headers: dict[str, str] = {}
     status_code = 200
 
     if kind == "langflow":
@@ -954,6 +978,7 @@ async def _execute_api(db, ws_id: str, api_row: dict, args: dict, customer_id: s
                     headers=headers,
                 )
             status_code = resp.status_code
+            response_headers = {k: v for k, v in resp.headers.items()}
             ctype = resp.headers.get("content-type") or ""
             if "application/json" in ctype:
                 try:
@@ -986,7 +1011,7 @@ async def _execute_api(db, ws_id: str, api_row: dict, args: dict, customer_id: s
     )
     await db.commit()
     return {"traceId": trace_id, "status": status_code, "latencyMs": latency_ms,
-            "response": response_body}
+            "response": response_body, "headers": _redact(response_headers)}
 
 
 @router.post("/internal/apis/{name}")
@@ -1002,3 +1027,109 @@ async def internal_api_call(name: str, body: dict, user: dict = Me) -> dict:
     if not row:
         raise HTTPException(404, f"api '{name}' not found")
     return await _execute_api(db, user["workspace_id"], dict(row), body or {}, customer_id=body.get("customerId") if body else None)
+
+
+# ---------- API Playground (ad-hoc proxy) ----------
+
+@router.post("/api-playground/send")
+async def api_playground_send(body: dict, user: dict = Me) -> dict:
+    """Proxy an ad-hoc HTTP request from the in-app API Playground.
+
+    The browser-side playground can't call arbitrary hosts directly (CORS),
+    so the SPA sends `{method, url, headers, body}` here. We run the request
+    server-side via httpx, log it to `api_logs` with `api_id=NULL`, and echo
+    `{traceId, status, latencyMs, body, headers}` back. Secrets are redacted
+    from the persisted row.
+    """
+    started = time.perf_counter()
+    from ..tracing import current_trace_id
+    trace_id = current_trace_id() or f"trc_{uuid.uuid4().hex[:12]}"
+
+    method = (body.get("method") or "GET").upper()
+    url = (body.get("url") or "").strip()
+    req_headers = body.get("headers") or {}
+    req_body_raw = body.get("body")
+    timeout = float(body.get("timeout") or 30)
+
+    if not url or not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(400, "url must start with http:// or https://")
+    if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+        raise HTTPException(400, f"unsupported method {method}")
+    if not isinstance(req_headers, dict):
+        raise HTTPException(400, "headers must be an object")
+
+    status_code = 0
+    response_body: Any = None
+    response_headers: dict[str, str] = {}
+    error: str | None = None
+
+    try:
+        import httpx  # type: ignore
+        kwargs: dict[str, Any] = {"headers": req_headers}
+        if method not in {"GET", "HEAD"} and req_body_raw not in (None, ""):
+            # Accept pre-formed string bodies (the UI sends the raw textarea
+            # content so operators keep full control over the payload).
+            if isinstance(req_body_raw, (dict, list)):
+                kwargs["json"] = req_body_raw
+            else:
+                kwargs["content"] = str(req_body_raw)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.request(method, url, **kwargs)
+        status_code = resp.status_code
+        response_headers = {k: v for k, v in resp.headers.items()}
+        ctype = (resp.headers.get("content-type") or "").lower()
+        # Accept application/json, application/vnd.api+json, application/ld+json,
+        # anything ending in +json, or bare "json" payloads. Falls back to
+        # attempting a parse opportunistically so APIs with sloppy Content-Type
+        # (text/plain returning JSON) still get structured output.
+        looks_jsonish = (
+            "json" in ctype
+            or "+json" in ctype
+        )
+        if looks_jsonish:
+            try:
+                response_body = resp.json()
+            except Exception:
+                response_body = resp.text[:16000]
+        else:
+            text = resp.text[:16000]
+            stripped = text.lstrip()
+            if stripped.startswith(("{", "[")):
+                try:
+                    response_body = resp.json()
+                except Exception:
+                    response_body = text
+            else:
+                response_body = text
+    except ImportError:
+        raise HTTPException(500, "httpx not installed on the server")
+    except Exception as e:
+        status_code = 599
+        error = repr(e)[:500]
+        response_body = {"ok": False, "error": error}
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    db = await get_db()
+    await db.execute(
+        """
+        INSERT INTO api_logs (workspace_id, api_id, customer_id, trace_id, status,
+                              latency_ms, request, response)
+        VALUES (?,?,?,?,?,?,?,?)
+        """,
+        (user["workspace_id"], None, None, trace_id, status_code, latency_ms,
+         js(_redact({"source": "playground", "method": method, "url": url,
+                     "headers": req_headers, "body": req_body_raw})),
+         js(_redact(response_body if isinstance(response_body, (dict, list))
+                    else {"value": response_body}))),
+    )
+    await db.commit()
+
+    return {
+        "traceId": trace_id,
+        "status": status_code,
+        "latencyMs": latency_ms,
+        "body": response_body,
+        "headers": _redact(response_headers),
+        "ok": 200 <= status_code < 300,
+        **({"error": error} if error else {}),
+    }

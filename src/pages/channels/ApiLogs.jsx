@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Icon } from '../../components/Icons.jsx';
+import { Spinner } from '../../components/Spinner.jsx';
 import { api } from '../../api.js';
 
 const STATUS_FILTERS = [
@@ -29,6 +30,7 @@ export default function ApiLogs() {
   const [selectedDetail, setSelectedDetail] = useState(null);
   const [logs, setLogs] = useState([]);
   const [stats, setStats] = useState(null);
+  const [initialLoading, setInitialLoading] = useState(true);
 
   async function refresh() {
     const [l, s] = await Promise.all([
@@ -39,7 +41,9 @@ export default function ApiLogs() {
     setStats(s || null);
   }
 
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => {
+    refresh().finally(() => setInitialLoading(false));
+  }, []);
 
   useEffect(() => {
     if (!selected) { setSelectedDetail(null); return; }
@@ -153,6 +157,12 @@ export default function ApiLogs() {
         </div>
       </div>
 
+      {initialLoading && logs.length === 0 ? (
+        <div style={{ padding: '80px 16px', display: 'flex', justifyContent: 'center' }}>
+          <Spinner size={32} />
+        </div>
+      ) : (
+      <>
       <div className="ch-kpi-row">
         <Kpi label="Requests · 24h" value={counts.total} />
         <Kpi label="Success rate" value={`${successRate}%`} tone="success" />
@@ -294,6 +304,8 @@ export default function ApiLogs() {
           </aside>
         )}
       </div>
+      </>
+      )}
     </div>
   );
 }

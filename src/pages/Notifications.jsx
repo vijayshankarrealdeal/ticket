@@ -2,7 +2,8 @@ import { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
-import { useNotifications, notificationsApi } from '../hooks/useNotifications.js';
+import { Spinner } from '../components/Spinner.jsx';
+import { useNotifications, useNotificationsLoading, notificationsApi } from '../hooks/useNotifications.js';
 
 const TYPE_META = {
   assign:    { icon: Icon.Ticket,    tone: 'primary', label: 'Assignments'  },
@@ -32,6 +33,7 @@ function groupOf(ts) {
 
 export default function Notifications() {
   const items = useNotifications();
+  const loading = useNotificationsLoading();
   const [filter, setFilter] = useState('all');
   const navigate = useNavigate();
 
@@ -104,7 +106,11 @@ export default function Notifications() {
         </div>
 
         <div className="notif-page-list">
-          {filtered.length === 0 ? (
+          {loading && items.length === 0 ? (
+            <div style={{ padding: '48px 16px', display: 'flex', justifyContent: 'center' }}>
+              <Spinner size={28} />
+            </div>
+          ) : filtered.length === 0 ? (
             <div className="notif-page-empty">
               <Icon.Bell />
               <div className="notif-page-empty-title">No notifications</div>

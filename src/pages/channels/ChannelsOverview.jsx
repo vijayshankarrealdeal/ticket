@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Icon } from '../../components/Icons.jsx';
+import { Spinner } from '../../components/Spinner.jsx';
 import { api } from '../../api.js';
 
 const CATEGORIES = [
@@ -14,6 +15,7 @@ export default function ChannelsOverview() {
   const [query, setQuery] = useState('');
   const [cat, setCat] = useState('all');
   const [items, setItems] = useState([]);
+  const [initialLoading, setInitialLoading] = useState(true);
 
   useEffect(() => {
     let alive = true;
@@ -27,7 +29,8 @@ export default function ChannelsOverview() {
         }));
         setItems(normalized);
       })
-      .catch(() => { if (alive) setItems([]); });
+      .catch(() => { if (alive) setItems([]); })
+      .finally(() => { if (alive) setInitialLoading(false); });
     return () => { alive = false; };
   }, []);
 
@@ -149,6 +152,12 @@ export default function ChannelsOverview() {
         </div>
       </div>
 
+      {initialLoading && items.length === 0 && (
+        <div style={{ padding: '80px 16px', display: 'flex', justifyContent: 'center' }}>
+          <Spinner size={32} />
+        </div>
+      )}
+
       {(cat === 'all' || cat === 'messaging' || cat === 'connected') && msgList.length > 0 && (
         <Section
           title="Messaging & Broadcasts"
@@ -178,7 +187,7 @@ export default function ChannelsOverview() {
         </Section>
       )}
 
-      {filtered.length === 0 && (
+      {!initialLoading && filtered.length === 0 && (
         <div className="ch-empty">
           <Icon.InboxEmpty />
           <div className="ch-empty-title">No matching channels</div>

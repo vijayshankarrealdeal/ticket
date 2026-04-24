@@ -621,6 +621,34 @@ async def _probe_url(url: str, timeout: float = 6.0) -> tuple[int, int]:
         return 0, int((time.perf_counter() - started) * 1000)
 
 
+async def _fan_out_incident_email(db, workspace_id: str, subject: str, body: str) -> None:
+    """Enqueue one `email` outbox row per row in `incident_subscribers`. The
+    dispatcher picks them up on the next outbox_tick; delivery logs keep the
+    trail visible in Settings → Deliveries.
+    """
+    cur = await db.execute(
+        "SELECT email FROM incident_subscribers WHERE workspace_id = ?",
+        (workspace_id,),
+    )
+    subs = [dict(x) for x in await cur.fetchall()]
+    for s in subs:
+        if not s.get("email"):
+            continue
+        await db.execute(
+            """
+            INSERT INTO outbox (workspace_id, kind, payload)
+            VALUES (?, 'email', ?)
+            """,
+            (workspace_id, js({
+                "workspace_id": workspace_id,
+                "to": s["email"],
+                "subject": subject,
+                "body": body,
+                "kind": "incident",
+            })),
+        )
+
+
 async def _health_prober_tick() -> None:
     """Automated counterpart to `POST /health/probe`. When a service has a
     `health_services.config.ping_url` configured we send a real HTTP HEAD/GET
@@ -694,20 +722,27 @@ async def _health_prober_tick() -> None:
             (p95, err_rate, status, r["id"]),
         )
         # Open an incident on the transition into a bad state so the
-        # Incidents page + subscriber list know about it. No auto-resolve
-        # yet — that's done manually from the UI in Build 2.
+        # Incidents page + subscriber list know about it. The resolver
+        # branch flips the row back to resolved + notifies subscribers.
         if status != prev_status and status in ("degraded", "outage"):
             tone = "warning" if status == "degraded" else "danger"
+            title = f"{r['name']} is {status}"
+            summary = f"p95={p95}ms, error_rate={err_rate:.1f}%"
             await db.execute(
                 """
                 INSERT INTO incidents (workspace_id, title, status, tone, components, summary)
                 VALUES (?, ?, 'investigating', ?, ?, ?)
                 """,
-                (r["workspace_id"],
-                 f"{r['name']} is {status}",
-                 tone,
-                 js([r["name"]]),
-                 f"p95={p95}ms, error_rate={err_rate:.1f}%"),
+                (r["workspace_id"], title, tone, js([r["name"]]), summary),
+            )
+            await _fan_out_incident_email(
+                db, r["workspace_id"],
+                subject=f"[Incident] {title}",
+                body=(
+                    f"We've detected a problem with {r['name']}.\n\n"
+                    f"Status: {status}\n{summary}\n\n"
+                    f"We're investigating. You'll get another email when the service recovers."
+                ),
             )
         elif status == "operational" and prev_status in ("degraded", "outage"):
             await db.execute(
@@ -718,6 +753,15 @@ async def _health_prober_tick() -> None:
                    AND components @> ?::jsonb
                 """,
                 (r["workspace_id"], js([r["name"]])),
+            )
+            await _fan_out_incident_email(
+                db, r["workspace_id"],
+                subject=f"[Resolved] {r['name']} is back to normal",
+                body=(
+                    f"{r['name']} has returned to operational (p95={p95}ms, "
+                    f"error_rate={err_rate:.1f}%).\n\n"
+                    f"Thanks for your patience."
+                ),
             )
     if rows:
         await db.commit()
@@ -1052,6 +1096,113 @@ async def _langflow_publish_poll_tick() -> None:
         log.exception("langflow publish poll tick crashed")
 
 
+# ---------- Notification digest emails --------------------------------------
+
+async def _notification_digest_tick() -> None:
+    """Roll each user's unread notifications from the last 24h into a single
+    email, respecting `notification_prefs.digest` (`daily` / `weekly` / `off`).
+    Idempotent: writes a marker row to `delivery_log.kind='digest_marker'` and
+    skips users whose latest marker is still fresh.
+
+    Design notes:
+    - Only fires when unread > 0 — silent when there's nothing to tell.
+    - Honours per-user email opt-in (`notification_prefs.email=true`).
+    - Relies on the outbox dispatcher to actually send. If `SMTP_HOST` isn't
+      configured, the row lands in `delivery_log` so the operator can see
+      what *would* have been sent.
+    """
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT u.id, u.email, u.name, u.notification_prefs, u.workspace_id,
+               (SELECT MAX(at) FROM delivery_log dl
+                 WHERE dl.workspace_id = u.workspace_id
+                   AND dl.kind = 'digest_marker'
+                   AND dl.target = u.email) AS last_digest
+          FROM users u
+         WHERE u.email IS NOT NULL
+        """,
+        (),
+    )
+    users = [dict(r) for r in await cur.fetchall()]
+    for u in users:
+        prefs = jl(u.get("notification_prefs"), {}) or {}
+        if not prefs.get("email"):
+            continue
+        freq = (prefs.get("digest") or "daily").lower()
+        if freq in ("off", "none", "never"):
+            continue
+        interval_hours = 24 if freq == "daily" else 168  # weekly
+        # Re-send guard: skip if we sent a digest within the window.
+        last = u.get("last_digest")
+        if last is not None:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                if isinstance(last, str):
+                    last = _dt.fromisoformat(last.replace("Z", "+00:00"))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=_tz.utc)
+                age_hours = (_dt.now(_tz.utc) - last).total_seconds() / 3600
+                if age_hours < interval_hours - 1:
+                    continue
+            except Exception:
+                pass
+        cur = await db.execute(
+            """
+            SELECT id, type, title, body, link, ts
+              FROM notifications
+             WHERE user_id = ? AND unread = true
+               AND ts > now() - (? || ' hours')::interval
+             ORDER BY ts DESC LIMIT 50
+            """,
+            (u["id"], str(interval_hours)),
+        )
+        notifs = [dict(r) for r in await cur.fetchall()]
+        if not notifs:
+            continue
+        lines = [f"Hi {u.get('name') or 'there'},",
+                 "",
+                 f"You have {len(notifs)} unread notification(s):",
+                 ""]
+        for n in notifs:
+            ttl = (n.get("title") or n.get("type") or "Notification").strip()
+            lines.append(f"• [{n.get('type') or 'notification'}] {ttl}")
+            if n.get("body"):
+                lines.append(f"    {n['body']}")
+            if n.get("link"):
+                lines.append(f"    {n['link']}")
+        lines.append("")
+        lines.append(
+            "Manage your digest in Settings → Notifications."
+        )
+        await db.execute(
+            """
+            INSERT INTO outbox (workspace_id, kind, payload)
+            VALUES (?, 'email', ?)
+            """,
+            (u["workspace_id"], js({
+                "workspace_id": u["workspace_id"],
+                "to": u["email"],
+                "subject": f"Your {'weekly' if freq == 'weekly' else 'daily'} WorkspaceX digest",
+                "body": "\n".join(lines),
+                "kind": "digest",
+            })),
+        )
+        # Marker row so the next tick can cheaply check if we already sent.
+        try:
+            await db.execute(
+                """
+                INSERT INTO delivery_log (workspace_id, kind, target, subject, status)
+                VALUES (?, 'digest_marker', ?, ?, 'sent')
+                """,
+                (u["workspace_id"], u["email"],
+                 f"digest-{freq}-{len(notifs)}"),
+            )
+        except Exception:
+            pass
+    await db.commit()
+
+
 def _version_from_updated_at(ts: str) -> int:
     """Fallback version derivation: epoch seconds of the flow's `updated_at`.
     Gives us a monotonic int we can compare without Langflow exposing a real
@@ -1104,6 +1255,7 @@ async def main() -> None:
         asyncio.create_task(_run_loop(_embedding_indexer_tick,    60,  stop, "embedding_indexer")),
         asyncio.create_task(_run_loop(_watch_renewer_tick,      3600,  stop, "watch_renewer")),
         asyncio.create_task(_run_loop(_langflow_publish_poll_tick, 30,  stop, "langflow_poll")),
+        asyncio.create_task(_run_loop(_notification_digest_tick, 3600,  stop, "notification_digest")),
     ]
 
     try:

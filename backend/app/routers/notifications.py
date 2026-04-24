@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from .. import cache
 from ..db import get_db
 from ..deps import Me
 from ..ws import broker
@@ -41,6 +42,7 @@ async def mark_read(nid: int, user: dict = Me) -> dict:
         (nid, user["id"]),
     )
     await db.commit()
+    await cache.invalidate(cache.k_unread(user["id"]))
     return {"ok": True}
 
 
@@ -51,6 +53,7 @@ async def read_all(user: dict = Me) -> dict:
         "UPDATE notifications SET unread = false WHERE user_id = ?", (user["id"],)
     )
     await db.commit()
+    await cache.invalidate(cache.k_unread(user["id"]))
     return {"ok": True}
 
 
@@ -61,6 +64,7 @@ async def delete_one(nid: int, user: dict = Me) -> dict:
         "DELETE FROM notifications WHERE id = ? AND user_id = ?", (nid, user["id"])
     )
     await db.commit()
+    await cache.invalidate(cache.k_unread(user["id"]))
     return {"ok": True}
 
 
@@ -69,6 +73,7 @@ async def clear_all(user: dict = Me) -> dict:
     db = await get_db()
     await db.execute("DELETE FROM notifications WHERE user_id = ?", (user["id"],))
     await db.commit()
+    await cache.invalidate(cache.k_unread(user["id"]))
     return {"ok": True}
 
 
@@ -80,4 +85,7 @@ async def create_notification(user_id: str, type_: str, title: str, body: str | 
     )
     nid = cur.lastrowid
     cur = await db.execute("SELECT * FROM notifications WHERE id = ?", (nid,))
+    # Drop the cached unread count so the next /me/unread-counts poll returns
+    # the fresh number instead of the stale pre-insert value.
+    await cache.invalidate(cache.k_unread(user_id))
     await broker.publish(f"notif:{user_id}", "notification.created", _serialize(dict(await cur.fetchone())))

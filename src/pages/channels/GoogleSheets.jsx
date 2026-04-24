@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Icon } from '../../components/Icons.jsx';
+import { Spinner } from '../../components/Spinner.jsx';
 import { api } from '../../api.js';
 
 export default function GoogleSheets() {
@@ -8,6 +9,7 @@ export default function GoogleSheets() {
   const [url, setUrl] = useState('');
   const [validating, setValidating] = useState(false);
   const [copyFlash, setCopyFlash] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
 
   useEffect(() => {
     let alive = true;
@@ -18,7 +20,8 @@ export default function GoogleSheets() {
         setSheets(items);
         if (res?.serviceEmail) setServiceEmail(res.serviceEmail);
       })
-      .catch(() => { if (alive) setSheets([]); });
+      .catch(() => { if (alive) setSheets([]); })
+      .finally(() => { if (alive) setInitialLoading(false); });
     return () => { alive = false; };
   }, []);
 
@@ -157,7 +160,11 @@ export default function GoogleSheets() {
               <span className="ch-section-count">{sheets.length}</span>
             </div>
           </div>
-          {sheets.length === 0 ? (
+          {initialLoading ? (
+            <div style={{ padding: '40px 16px', display: 'flex', justifyContent: 'center' }}>
+              <Spinner size={24} />
+            </div>
+          ) : sheets.length === 0 ? (
             <div className="ch-empty inline">
               <div className="ch-empty-title">No sheets connected</div>
               <div className="ch-empty-sub">Paste a URL above to add your first sheet.</div>

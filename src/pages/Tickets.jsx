@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
+import { Spinner } from '../components/Spinner.jsx';
 import { useGlobalSearch } from '../hooks/useGlobalSearch.jsx';
 import CreateTicketModal from '../components/CreateTicketModal.jsx';
 import { api } from '../api.js';
@@ -52,6 +53,7 @@ const channelAvatar = (channel) => {
 export default function Tickets() {
   const [params, setParams] = useSearchParams();
   const [tickets, setTickets] = useState([]);
+  const [ticketsLoading, setTicketsLoading] = useState(true);
   const [selectedId, setSelectedId] = useState(() => {
     const raw = params.get('id');
     if (!raw) return null;
@@ -73,7 +75,8 @@ export default function Tickets() {
         }));
         setSelectedId((cur) => cur ?? items[0]?.id ?? null);
       })
-      .catch(() => { if (alive) setTickets([]); });
+      .catch(() => { if (alive) setTickets([]); })
+      .finally(() => { if (alive) setTicketsLoading(false); });
     return () => { alive = false; };
   }, []);
 
@@ -100,7 +103,7 @@ export default function Tickets() {
   const { query: search } = useGlobalSearch();
   const [sort, setSort] = useState('newest');
   const [sortOpen, setSortOpen] = useState(false);
-  const [filterKey, setFilterKey] = useState('all-open');
+  const [filterKey, setFilterKey] = useState('all');
   const [filterOpen, setFilterOpen] = useState(false);
   const [expandedOpen, setExpandedOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
@@ -309,14 +312,22 @@ export default function Tickets() {
             </div>
 
             <div className="conv-list">
-              {visibleTickets.map((t) => (
-                <TicketCard key={t.id} t={t} selected={t.id === selectedId} onClick={() => setSelectedId(t.id)} />
-              ))}
-              {visibleTickets.length === 0 && (
-                <div className="tickets-empty">
-                  <Icon.InboxEmpty />
-                  <div>No tickets match your search.</div>
+              {ticketsLoading ? (
+                <div style={{ padding: '40px 16px', display: 'flex', justifyContent: 'center' }}>
+                  <Spinner size={24} />
                 </div>
+              ) : (
+                <>
+                  {visibleTickets.map((t) => (
+                    <TicketCard key={t.id} t={t} selected={t.id === selectedId} onClick={() => setSelectedId(t.id)} />
+                  ))}
+                  {visibleTickets.length === 0 && (
+                    <div className="tickets-empty">
+                      <Icon.InboxEmpty />
+                      <div>No tickets match your search.</div>
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </div>

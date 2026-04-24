@@ -10,7 +10,10 @@ export default defineConfig({
     port: 5173,
     open: true,
     proxy: {
-      '/api': {
+      // Match with trailing slash so SPA routes like `/api-playground`
+      // aren't swallowed by this proxy. All real client calls go through
+      // `/api/<path>` (see src/api.js: BASE_URL = '/api'), which still matches.
+      '/api/': {
         target: 'http://localhost:8000',
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api/, ''),

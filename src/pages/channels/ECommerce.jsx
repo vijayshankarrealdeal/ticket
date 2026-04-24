@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Icon } from '../../components/Icons.jsx';
+import { Spinner } from '../../components/Spinner.jsx';
 import { api } from '../../api.js';
 
 const EVENT_ICONS = {
@@ -15,6 +16,8 @@ export default function ECommerce() {
   const [stats, setStats] = useState(null);
   const [busy, setBusy] = useState(null);
   const [toast, setToast] = useState(null);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [addOpen, setAddOpen] = useState(false);
 
   const flash = (msg, tone = 'success') => {
     setToast({ msg, tone });
@@ -32,7 +35,9 @@ export default function ECommerce() {
     setStats(st && typeof st === 'object' ? st : null);
   }
 
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => {
+    refresh().finally(() => setInitialLoading(false));
+  }, []);
 
   const disconnect = async (id) => {
     if (!confirm('Disconnect this store?')) return;
@@ -78,16 +83,14 @@ export default function ECommerce() {
     }
   };
 
-  const addStore = async () => {
-    const name = prompt('Store name?');
-    if (!name) return;
-    const platform = prompt('Platform? (shopify / unicommerce)', 'shopify');
-    try {
-      await api.post('/ecommerce/stores', { name, platform: platform || 'shopify' });
-      await refresh();
-    } catch (e) {
-      alert(`Add failed: ${e.message || e}`);
-    }
+  const createStore = async ({ name, platform, shopDomain }) => {
+    await api.post('/ecommerce/stores', {
+      name,
+      platform: platform || 'shopify',
+      ...(shopDomain ? { config: { shopDomain } } : {}),
+    });
+    await refresh();
+    flash(`Added ${name}`, 'success');
   };
 
   return (
@@ -117,10 +120,26 @@ export default function ECommerce() {
           <button className="btn secondary" onClick={syncAll} disabled={busy === 'all'}>
             <Icon.Refresh /> {busy === 'all' ? 'Syncing…' : 'Sync all'}
           </button>
-          <button className="btn" onClick={addStore}><Icon.Plus /> Add store</button>
+          <button className="btn" onClick={() => setAddOpen(true)}><Icon.Plus /> Add store</button>
         </div>
       </div>
 
+      {addOpen && (
+        <AddStoreModal
+          onClose={() => setAddOpen(false)}
+          onSave={async (vals) => {
+            await createStore(vals);
+            setAddOpen(false);
+          }}
+        />
+      )}
+
+      {initialLoading && stores.length === 0 && !stats ? (
+        <div style={{ padding: '80px 16px', display: 'flex', justifyContent: 'center' }}>
+          <Spinner size={32} />
+        </div>
+      ) : (
+      <>
       <div className="ch-kpi-row">
         <Kpi
           label="Total orders · 30d"
@@ -209,6 +228,8 @@ export default function ECommerce() {
           </div>
         </aside>
       </div>
+      </>
+      )}
     </div>
   );
 }
@@ -219,6 +240,77 @@ function Kpi({ label, value, delta, tone = 'success' }) {
       <div className="ch-kpi-label">{label}</div>
       <div className="ch-kpi-value">{value}</div>
       {delta ? <div className={'ch-kpi-delta tone-' + tone}>{delta}</div> : null}
+    </div>
+  );
+}
+
+function AddStoreModal({ onClose, onSave }) {
+  const [form, setForm] = useState({ name: '', platform: 'shopify', shopDomain: '' });
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const setField = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+
+  async function save() {
+    if (!form.name.trim()) {
+      setErr('Store name is required');
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    try {
+      await onSave({
+        name: form.name.trim(),
+        platform: form.platform,
+        shopDomain: form.shopDomain.trim() || null,
+      });
+    } catch (e) {
+      setErr(e.message || String(e));
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="ch-modal-overlay" onClick={onClose}>
+      <div className="ch-modal" onClick={(e) => e.stopPropagation()}>
+        <h3 className="ch-modal-title">Add store</h3>
+        <div className="ch-modal-body">
+          <label className="ch-modal-field">Store name
+            <input
+              autoFocus
+              value={form.name}
+              onChange={(e) => setField('name', e.target.value)}
+              placeholder="The Sleep Company"
+              onKeyDown={(e) => { if (e.key === 'Enter' && !saving) save(); }}
+            />
+          </label>
+          <label className="ch-modal-field">Platform
+            <select value={form.platform} onChange={(e) => setField('platform', e.target.value)}>
+              <option value="shopify">Shopify</option>
+              <option value="unicommerce">Unicommerce</option>
+              <option value="woocommerce">WooCommerce</option>
+              <option value="magento">Magento</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          {form.platform === 'shopify' && (
+            <label className="ch-modal-field">Shop domain (optional)
+              <input
+                value={form.shopDomain}
+                onChange={(e) => setField('shopDomain', e.target.value)}
+                placeholder="my-shop.myshopify.com"
+              />
+            </label>
+          )}
+          {err && <div className="ch-modal-error">{err}</div>}
+        </div>
+        <div className="ch-modal-foot">
+          <button className="btn secondary" onClick={onClose} disabled={saving}>Cancel</button>
+          <button className="btn" onClick={save} disabled={saving}>
+            {saving ? 'Adding…' : 'Add store'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

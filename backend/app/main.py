@@ -16,6 +16,7 @@ from .tracing import TraceMiddleware
 from .routers import (
     agents,
     analytics,
+    api_playground,
     auth,
     billing,
     channels,
@@ -67,6 +68,7 @@ async def lifespan(app: FastAPI):
             (w._oauth_state_cleanup_tick, 600,  "oauth_cleanup"),
             (w._watch_renewer_tick,     3600.0, "watch_renewer"),
             (w._langflow_publish_poll_tick, 30.0, "langflow_poll"),
+            (w._notification_digest_tick, 3600.0, "notification_digest"),
         ]
         for fn, interval, name in loops:
             worker_tasks.append(asyncio.create_task(
@@ -126,6 +128,10 @@ app.include_router(analytics.csat_router)
 app.include_router(agents.router)
 app.include_router(agents.draft_router)
 app.include_router(channels.router)
+# API Playground (Postman-style folders / endpoints / environments). The
+# `/api-playground/send` route lives under channels.router; this router owns
+# the saved-definition CRUD so the two surfaces stay on the same prefix.
+app.include_router(api_playground.router)
 app.include_router(uploads.router)
 app.include_router(billing.router)
 # Inbound channel webhooks (WA / Gmail / Outlook / IG / Shopify / Slack / Voice /

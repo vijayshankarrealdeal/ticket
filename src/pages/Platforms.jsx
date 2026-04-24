@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
+import { Spinner } from '../components/Spinner.jsx';
 import { api } from '../api.js';
 
 const GROUP_LABELS = {
@@ -24,6 +25,7 @@ export default function Platforms() {
   const [stats, setStats] = useState(null);
   const [manage, setManage] = useState(null); // the platform being managed
   const [busy, setBusy] = useState(null);
+  const [initialLoading, setInitialLoading] = useState(true);
 
   async function refresh() {
     const [list, s] = await Promise.all([
@@ -34,7 +36,9 @@ export default function Platforms() {
     setStats(s || null);
   }
 
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => {
+    refresh().finally(() => setInitialLoading(false));
+  }, []);
 
   // OAuth return: the backend sends us back with ?connected=<provider>, so
   // surface a quick confirmation and scrub the query param.
@@ -125,6 +129,12 @@ export default function Platforms() {
           </div>
         )}
 
+        {initialLoading && platforms.length === 0 ? (
+          <div style={{ padding: '80px 16px', display: 'flex', justifyContent: 'center' }}>
+            <Spinner size={32} />
+          </div>
+        ) : (
+        <>
         <div className="stat-row">
           <div className="stat">
             <div className="label">Connected</div>
@@ -206,6 +216,8 @@ export default function Platforms() {
             </div>
           </div>
         ))}
+        </>
+        )}
       </div>
 
       {manage && (

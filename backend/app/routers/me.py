@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 
+from .. import cache
 from ..db import get_db, jl, js
 from ..deps import AdminOnly, Me
 from ..ws import broker
@@ -93,6 +94,12 @@ async def change_password(body: dict, user: dict = Me) -> dict:
 
 @router.get("/me/unread-counts")
 async def unread_counts(user: dict = Me) -> dict:
+    # Hot-read cache: TopBar badge fires on every navigation, so we serve
+    # this out of Redis with a 15 s TTL. Notification mutations invalidate
+    # the key; cold misses fall through to the real SQL below.
+    cached = await cache.get(cache.k_unread(user["id"]))
+    if cached is not None:
+        return cached
     db = await get_db()
     cur = await db.execute(
         "SELECT COALESCE(SUM(unread_count),0) FROM conversations WHERE workspace_id = ?",
@@ -125,7 +132,9 @@ async def unread_counts(user: dict = Me) -> dict:
         (user["id"], user["id"], user["workspace_id"], user["id"]),
     )
     teams_unread = int((await cur.fetchone())[0] or 0)
-    return {"inbox": int(inbox), "notifications": int(notifs), "teamsUnread": teams_unread}
+    payload = {"inbox": int(inbox), "notifications": int(notifs), "teamsUnread": teams_unread}
+    await cache.set(cache.k_unread(user["id"]), payload, ttl=15)
+    return payload
 
 
 @router.get("/workspace/counters")

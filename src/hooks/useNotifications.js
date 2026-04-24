@@ -4,12 +4,14 @@ import { subscribeTopic } from './useRealtime.js';
 
 let state = [];
 let loaded = false;
+let loading = false;
 let currentUnsub = null;
 const listeners = new Set();
 
 const emit = () => listeners.forEach((l) => l());
 const subscribe = (l) => { listeners.add(l); return () => listeners.delete(l); };
 const getSnapshot = () => state;
+const getLoadingSnapshot = () => loading;
 
 let audioCtx = null;
 function playNotificationSound() {
@@ -58,13 +60,16 @@ function attachRealtime() {
 async function load() {
   if (loaded) return;
   loaded = true;
+  loading = true;
+  emit();
   try {
     const res = await api.get('/notifications');
     const items = Array.isArray(res) ? res : res?.items || [];
     state = items;
-    emit();
   } catch {
     state = [];
+  } finally {
+    loading = false;
     emit();
   }
   attachRealtime();
@@ -73,6 +78,10 @@ async function load() {
 export function useNotifications() {
   useEffect(() => { load(); }, []);
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+export function useNotificationsLoading() {
+  return useSyncExternalStore(subscribe, getLoadingSnapshot, getLoadingSnapshot);
 }
 
 export const notificationsApi = {

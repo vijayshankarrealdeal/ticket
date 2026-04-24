@@ -16,6 +16,7 @@ import ChannelsOverview from './pages/channels/ChannelsOverview.jsx';
 import ECommerce from './pages/channels/ECommerce.jsx';
 import ApiLibrary from './pages/channels/ApiLibrary.jsx';
 import ApiLogs from './pages/channels/ApiLogs.jsx';
+import ApiPlayground from './pages/channels/ApiPlayground.jsx';
 import GoogleSheets from './pages/channels/GoogleSheets.jsx';
 import Health from './pages/channels/Health.jsx';
 import Notifications from './pages/Notifications.jsx';
@@ -64,6 +65,7 @@ export default function App() {
           <Route path="/platforms" element={<Platforms />} />
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/agent-builder" element={<AgentBuilder />} />
+          <Route path="/api-playground" element={<ApiPlayground />} />
           <Route path="/channels" element={<ChannelsLayout />}>
             <Route index element={<ChannelsOverview />} />
             <Route path="ecommerce" element={<ECommerce />} />

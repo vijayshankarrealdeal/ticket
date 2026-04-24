@@ -1,15 +1,41 @@
-/* WorkspaceX — Langflow rebrand stylesheet (minimal).
+/* WorkspaceX — Langflow rebrand stylesheet.
  *
- * Paired with the gutted wx-rebrand.js: the old sheet tried to strip
- * Langflow's chrome (logo, GitHub/Discord chips, welcome splash, avatar
- * badge) but we now embed Langflow in an iframe with WorkspaceX chrome
- * wrapped around it, so Langflow's own chrome should render normally —
- * otherwise the editor has no node library and no save controls.
+ * CSS does the safe, stable chrome removal (logo + social chips). The
+ * sibling `wx-rebrand.js` handles the welcome-splash text + the Version /
+ * Docs rows in the profile dropdown (those don't have stable class hooks).
  *
- * We keep only the dark-mode base so the editor palette matches the
- * WorkspaceX shell when `html.dark` is set by wx-rebrand.js.
+ * Scope is deliberately narrow — the flow editor's left sidebar,
+ * save/publish toolbar, and node library must stay visible. An earlier
+ * version of this sheet used broad `[class*="sidebar"]` / ancestor-walking
+ * patterns and ended up hiding the editor itself.
  */
 
+/* ---- Dark-mode base ------------------------------------------------- */
 html.dark, html.dark body, html.dark #root {
   color-scheme: dark;
 }
+
+/* ---- Top-bar chrome: Langflow logo + GitHub/Discord/X chips --------- */
+/* Social chips — match anchor by href across Langflow versions. Scope to
+   <header> so cards embedded inside the welcome splash (which the JS
+   handles) aren't double-hit. */
+header a[href*="github.com"],
+header a[href*="discord.gg"],
+header a[href*="discord.com/invite"],
+header a[href*="twitter.com"],
+header a[href*="x.com/langflow"] {
+  display: none !important;
+}
+
+/* Langflow logo. It's typically a link back to "/" or "/flows" with a
+   brand SVG / img alt text inside. We hide the whole anchor so the space
+   collapses instead of showing a naked link box. */
+header a[href="/"],
+header a[href="/flows"],
+header a[aria-label*="angflow" i],
+header img[alt*="angflow" i] {
+  display: none !important;
+}
+
+/* ---- Hidden markers set by wx-rebrand.js --------------------------- */
+[data-wx-hidden="1"] { display: none !important; }

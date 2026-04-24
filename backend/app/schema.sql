@@ -793,6 +793,71 @@ CREATE INDEX IF NOT EXISTS agent_flow_snapshots_agent_idx
 -- most managed Postgres offerings; the app's schema-apply runs as a
 -- non-superuser by default.
 
+-- ---------- API Playground (folders / endpoints / environments / variables) ----------
+-- Postman-style workspace for ad-hoc HTTP requests. Folders group related
+-- endpoints; environments hold {{token}} variables the send pipeline
+-- substitutes at call time. `output_schema` is populated on first successful
+-- send via a best-effort JSON-schema inference so agents can bind to it later.
+CREATE TABLE IF NOT EXISTS api_pg_folders (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  name          text NOT NULL,
+  parent_id     uuid REFERENCES api_pg_folders(id) ON DELETE CASCADE,
+  sort_order    int NOT NULL DEFAULT 0,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS api_pg_folders_ws_idx ON api_pg_folders (workspace_id);
+
+CREATE TABLE IF NOT EXISTS api_pg_endpoints (
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id   uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  folder_id      uuid REFERENCES api_pg_folders(id) ON DELETE CASCADE,
+  name           text NOT NULL,
+  description    text NOT NULL DEFAULT '',
+  method         text NOT NULL DEFAULT 'GET',
+  url            text NOT NULL DEFAULT '',
+  headers        jsonb NOT NULL DEFAULT '[]'::jsonb,
+  body           text,
+  output_schema  jsonb,
+  last_status    int,
+  last_run_at    timestamptz,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  updated_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS api_pg_endpoints_ws_idx      ON api_pg_endpoints (workspace_id);
+CREATE INDEX IF NOT EXISTS api_pg_endpoints_folder_idx  ON api_pg_endpoints (folder_id);
+-- Backfill for installs that predate the description column. The SPA + router
+-- treat description as mandatory at the API boundary, so existing rows land
+-- with an empty string until the operator edits them.
+ALTER TABLE api_pg_endpoints ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
+
+-- Snapshot of everything an agent runtime needs to invoke this endpoint as an
+-- LLM tool: {name, description, method, url, headers, body, outputPaths}. Kept
+-- as a denormalized JSONB so tool callers don't have to re-derive the
+-- included-paths list from the larger output_schema on every request.
+ALTER TABLE api_pg_endpoints ADD COLUMN IF NOT EXISTS tool_spec jsonb;
+
+CREATE TABLE IF NOT EXISTS api_pg_environments (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  name          text NOT NULL,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, name)
+);
+CREATE INDEX IF NOT EXISTS api_pg_env_ws_idx ON api_pg_environments (workspace_id);
+
+CREATE TABLE IF NOT EXISTS api_pg_variables (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id    uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  environment_id  uuid NOT NULL REFERENCES api_pg_environments(id) ON DELETE CASCADE,
+  key             text NOT NULL,
+  value           text NOT NULL DEFAULT '',
+  secret          boolean NOT NULL DEFAULT false,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (environment_id, key)
+);
+CREATE INDEX IF NOT EXISTS api_pg_vars_env_idx ON api_pg_variables (environment_id);
+
 -- ---------- Secret encryption wrapper helpers (spec §7 pgp_sym_encrypt) ----------
 -- Thin SQL helpers that use `pgcrypto.pgp_sym_encrypt` when
 -- `WORKSPACEX_SECRET_KEY` is set at the session level. Routers call

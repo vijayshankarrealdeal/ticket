@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react';
 import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
+import { Spinner } from '../components/Spinner.jsx';
 import { api } from '../api.js';
 
-// Build the `/flow/launch` URL the embedded iframe navigates into. The
-// backend logs the user into Langflow and 302s into the flow editor; the
-// `?token=` fallback is needed because the iframe doesn't carry the
-// `wx_session` cookie to a cross-origin backend in every browser.
+// Build the `/flow/launch` URL the new tab navigates into. The backend logs
+// the user into Langflow and 302s into the flow editor. The `?token=`
+// fallback is needed because the new tab is cross-origin in host-mode dev
+// (SPA on :5173, backend on :8000) and the `wx_session` cookie won't
+// follow.
 function launchUrl(agentId) {
   const base = import.meta.env.VITE_API_URL || '/api';
   let token = '';
@@ -20,6 +22,12 @@ function launchUrl(agentId) {
   return `${base}/flow/launch?${params.toString()}`;
 }
 
+function openFlow(agentId) {
+  // `noopener` so the Langflow tab can't reach back into this window via
+  // `window.opener`. Also prevents it from becoming a focus-stealing child.
+  window.open(launchUrl(agentId), '_blank', 'noopener');
+}
+
 function prettyName(d = new Date()) {
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
@@ -29,7 +37,6 @@ function prettyName(d = new Date()) {
 
 export default function AgentBuilder() {
   const [agents, setAgents] = useState([]);
-  const [current, setCurrent] = useState(null);
   const [loadingList, setLoadingList] = useState(true);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -71,7 +78,7 @@ export default function AgentBuilder() {
       // stamp `kind='langflow'` server-side when it provisions the flow.
       const optimistic = { ...created, kind: 'langflow' };
       setAgents((prev) => [optimistic, ...prev]);
-      setCurrent(optimistic);
+      openFlow(created.id);
     } catch (e) {
       setErr(String(e?.message || e));
     } finally {
@@ -79,95 +86,57 @@ export default function AgentBuilder() {
     }
   }
 
-  if (!current) {
-    return (
-      <>
-        <TopBar left={<div className="top-bar-title">Agent Builder</div>} />
-        <div className="page-scroll" style={pageWrap}>
-          <div style={card}>
-            <div style={title}>Build an agent with Langflow</div>
-            <div style={sub}>
-              Start a new flow, then wire up nodes, tools and prompts in the
-              visual editor. Publishing the flow activates the agent for
-              inbound conversations automatically.
-            </div>
-            <button
-              className="btn"
-              onClick={createFlow}
-              disabled={busy}
-              style={ctaBtn}
-            >
-              <Icon.Plus /> {busy ? 'Creating flow…' : 'Create a flow'}
-            </button>
-            {err && <div style={errLine}>{err}</div>}
-
-            {loadingList ? null : agents.length > 0 && (
-              <div style={recentWrap}>
-                <div style={recentLabel}>Recent flows</div>
-                <div style={recentList}>
-                  {agents.slice(0, 6).map((a) => (
-                    <button
-                      key={a.id}
-                      style={recentItem}
-                      onClick={() => setCurrent(a)}
-                      title={`Open ${a.name || 'flow'}`}
-                    >
-                      <div style={recentName}>
-                        {a.name || 'Untitled flow'}
-                        <span style={recentId}>#{String(a.id).slice(0, 6)}</span>
-                      </div>
-                      <div style={recentMeta}>
-                        {a.status === 'published' ? 'Published' : 'Draft'}
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      </>
-    );
-  }
-
   return (
     <>
       <TopBar left={<div className="top-bar-title">Agent Builder</div>} />
-      <div style={chromeRow}>
-        <button
-          className="btn-ghost"
-          onClick={() => setCurrent(null)}
-          style={backBtn}
-        >
-          <Icon.Back /> All flows
-        </button>
-        <div style={chromeTitle}>{current.name || 'Untitled flow'}</div>
-        <a
-          className="btn-ghost"
-          href={launchUrl(current.id)}
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{ ...backBtn, textDecoration: 'none' }}
-          title="Open in new tab"
-        >
-          <Icon.Expand /> Open
-        </a>
-        <button
-          className="btn"
-          onClick={createFlow}
-          disabled={busy}
-          style={{ padding: '6px 12px', fontSize: 13 }}
-        >
-          <Icon.Plus /> New flow
-        </button>
+      <div className="page-scroll" style={pageWrap}>
+        <div style={card}>
+          <div style={title}>Build an agent with Langflow</div>
+          <div style={sub}>
+            Start a new flow, then wire up nodes, tools and prompts in the
+            visual editor. Publishing the flow activates the agent for
+            inbound conversations automatically.
+          </div>
+          <button
+            className="btn"
+            onClick={createFlow}
+            disabled={busy}
+            style={ctaBtn}
+          >
+            <Icon.Plus /> {busy ? 'Creating flow…' : 'Create a flow'}
+          </button>
+          <div style={tabHint}>Opens Langflow in a new tab.</div>
+          {err && <div style={errLine}>{err}</div>}
+
+          {loadingList ? (
+            <div style={{ padding: '24px 0', display: 'flex', justifyContent: 'center' }}>
+              <Spinner size={22} />
+            </div>
+          ) : agents.length > 0 && (
+            <div style={recentWrap}>
+              <div style={recentLabel}>Recent flows</div>
+              <div style={recentList}>
+                {agents.slice(0, 6).map((a) => (
+                  <button
+                    key={a.id}
+                    style={recentItem}
+                    onClick={() => openFlow(a.id)}
+                    title={`Open ${a.name || 'flow'} in a new tab`}
+                  >
+                    <div style={recentName}>
+                      {a.name || 'Untitled flow'}
+                      <span style={recentId}>#{String(a.id).slice(0, 6)}</span>
+                    </div>
+                    <div style={recentMeta}>
+                      {a.status === 'published' ? 'Published' : 'Draft'}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
-      <iframe
-        key={current.id}
-        title="Langflow editor"
-        src={launchUrl(current.id)}
-        style={frame}
-        allow="clipboard-read; clipboard-write"
-      />
     </>
   );
 }
@@ -182,6 +151,9 @@ const sub = { color: 'var(--muted)', marginBottom: 24, lineHeight: 1.55 };
 const ctaBtn = {
   padding: '12px 22px', fontSize: 15, display: 'inline-flex',
   alignItems: 'center', gap: 8,
+};
+const tabHint = {
+  marginTop: 10, fontSize: 12, color: 'var(--muted-2)',
 };
 const errLine = { color: 'var(--danger, #b91c1c)', fontSize: 13, marginTop: 14 };
 const recentWrap = { marginTop: 36, textAlign: 'left' };
@@ -207,25 +179,3 @@ const recentId = {
   fontSize: 11, fontWeight: 400, color: 'var(--muted-2)',
 };
 const recentMeta = { fontSize: 12, color: 'var(--muted)' };
-
-const chromeRow = {
-  display: 'flex', alignItems: 'center', gap: 12,
-  padding: '8px 16px',
-  borderBottom: '1px solid var(--border)',
-  background: 'var(--surface, #fff)',
-};
-const backBtn = {
-  display: 'inline-flex', alignItems: 'center', gap: 6,
-  padding: '6px 10px', fontSize: 13,
-};
-const chromeTitle = {
-  flex: 1, fontSize: 14, fontWeight: 500,
-  color: 'var(--text)', overflow: 'hidden',
-  textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-};
-const frame = {
-  width: '100%',
-  height: 'calc(100vh - 112px)',
-  border: 'none',
-  display: 'block',
-};

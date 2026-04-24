@@ -84,8 +84,13 @@ Sign-out: `clearAuth()` removes the localStorage entry and fires `POST /auth/sig
 | Channel adapters (future) | `POST /conversations/:id/inbound` | [conversations.py](backend/app/routers/conversations.py) — simulates webhook → intent classifier → `attach/reopen/create` |
 | [PublicCsat.jsx](src/pages/PublicCsat.jsx) | `GET /csat/:token`, `POST /csat/:token` (unauth) + `POST /tickets/:id/csat/send` (authed) | [analytics.py](backend/app/routers/analytics.py) — `csat_router` |
 | [channels/*](src/pages/channels/) | `/ecommerce/*`, `/apis`, `/integrations`, `/api-logs*`, `/sheets`, `/health/services`, `/incidents` | [channels.py](backend/app/routers/channels.py) |
+| [channels/ApiPlayground.jsx](src/pages/channels/ApiPlayground.jsx) | `POST /api-playground/send` (ad-hoc proxy), `GET/POST/PATCH/DELETE /api-playground/folders`, `GET/POST/PATCH/DELETE /api-playground/endpoints`, `POST /api-playground/endpoints/:id/infer-schema`, `GET/POST/PATCH/DELETE /api-playground/environments`, `POST /api-playground/environments/:id/variables`, `PATCH/DELETE /api-playground/variables/:id` | [channels.py](backend/app/routers/channels.py) (send proxy) + [api_playground.py](backend/app/routers/api_playground.py) (collections/envs) |
 
-All write endpoints echo the resulting entity, not `{ok:true}` — mirrors spec §8 "Optimistic UI contract", so the client never refetches after a mutation.
+All write endpoints echo the resulting entity, not `{ok:true}` — mirrors spec §8 "Optimistic UI contract", so the client never refetches after a mutation. DELETE routes return `{id, deleted:true}` so callers can confirm the same id they passed.
+
+### API Playground variable substitution
+
+[ApiPlayground.jsx](src/pages/channels/ApiPlayground.jsx) interpolates `{{var}}` tokens in the request URL, header keys/values, and body *client-side* before POSTing to `/api-playground/send` — the backend never sees raw `{{token}}` placeholders, which means secrets held in `api_pg_variables.secret=true` rows stay out of `api_logs` unless a caller explicitly includes them. Unresolved tokens are surfaced inline on the page rather than silently leaking through. The active environment id is persisted in `localStorage['workspacex.apiPlayground.activeEnv']` so the selection survives navigation. Per-endpoint output schemas are inferred on the first successful response via `/api-playground/endpoints/:id/infer-schema` (best-effort JSON-schema-ish descriptor) so downstream agents can bind to the shape.
 
 ### Idempotency keys
 
@@ -163,6 +168,17 @@ Server → client:
 - Exponential backoff reconnect (`1s, 2s, 4s, …, 15s`) — on reconnect, every topic in the subscription map is re-subscribed automatically.
 - Subscribe frames are reference-counted: the server only sees one `subscribe/unsubscribe` per distinct topic, even if several components mount the same topic.
 - `closeRealtime()` is called on sign-out so the next user's socket authenticates with their own token.
+
+### Hot-read cache
+
+[backend/app/cache.py](backend/app/cache.py) is a Redis read-through / invalidation helper that sits in front of endpoints the SPA polls on every navigation (TopBar bell, Tickets badge, Teams badge). Contract:
+
+- Opt-in via `REDIS_URL`. No URL → `cache.get()` always returns `None` and `cache.set()` / `cache.invalidate()` are no-ops, so single-worker dev installs behave exactly as before.
+- Graceful degrade: on any Redis error the module flips to degraded mode for 30 s (doesn't hammer an unhealthy broker) and every read falls through to the DB.
+- Keyspace prefix `wx:` + well-known key helpers `k_me`, `k_unread`, `k_ticket`, `k_conv_head` so callers don't open-code key strings.
+- Write path invalidates in the same HTTP request that mutates the source rows — `create_notification` + every `/notifications/*` mutation calls `cache.invalidate(cache.k_unread(user_id))`, so the next `/me/unread-counts` poll returns truth instead of a stale value.
+
+TTL guidance: 15 s for counters, 60 s (default) for entity reads. Tune per endpoint as they get hot.
 
 ### Scaling the broker
 

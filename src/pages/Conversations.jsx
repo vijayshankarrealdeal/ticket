@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
+import { Spinner } from '../components/Spinner.jsx';
 import { useDelayUnmount } from '../hooks/useDelayUnmount.js';
 import { useGlobalSearch } from '../hooks/useGlobalSearch.jsx';
 import { api, uploadFile } from '../api.js';
@@ -38,6 +39,7 @@ export default function Conversations() {
   const [draft, setDraft] = useState('');
   const [draftLoading, setDraftLoading] = useState(false);
   const [list, setList] = useState([]);
+  const [listLoading, setListLoading] = useState(true);
 
   useEffect(() => {
     let alive = true;
@@ -48,7 +50,8 @@ export default function Conversations() {
         setList(items);
         setSelectedId((cur) => cur ?? items[0]?.id ?? null);
       })
-      .catch(() => { if (alive) setList([]); });
+      .catch(() => { if (alive) setList([]); })
+      .finally(() => { if (alive) setListLoading(false); });
     return () => { alive = false; };
   }, []);
 
@@ -660,13 +663,21 @@ export default function Conversations() {
               </div>
             </div>
             <div className="conv-list">
-              {visible.map((t) => (
-                <ConvItem key={t.id} t={t} selected={t.id === selectedId} onClick={() => setSelectedId(t.id)} />
-              ))}
-              {visible.length === 0 && (
-                <div style={{ padding: 24, textAlign: 'center', color: 'var(--muted)', fontSize: 13 }}>
-                  No conversations in {channel}
+              {listLoading ? (
+                <div style={{ padding: '40px 16px', display: 'flex', justifyContent: 'center' }}>
+                  <Spinner size={24} />
                 </div>
+              ) : (
+                <>
+                  {visible.map((t) => (
+                    <ConvItem key={t.id} t={t} selected={t.id === selectedId} onClick={() => setSelectedId(t.id)} />
+                  ))}
+                  {visible.length === 0 && (
+                    <div style={{ padding: 24, textAlign: 'center', color: 'var(--muted)', fontSize: 13 }}>
+                      No conversations in {channel}
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </div>

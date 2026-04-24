@@ -120,10 +120,19 @@
   ],
   "compounds": [
     {
-      // One-click dev: infra containers + FastAPI (debugger) + Vite (terminal).
-      "name": "Dev: Full Stack (infra + backend + frontend)",
+      // One-click dev — nothing to start manually:
+      //   * `backend: prelaunch` brings up db/redis/minio/langflow via docker
+      //     compose (idempotent — no-op when containers are already healthy),
+      //   * FastAPI launches under debugpy with --reload,
+      //   * Background worker launches under debugpy too (SLA/outbox/langflow-
+      //     poll loops), sharing the same `.env` for Langflow creds,
+      //   * Vite starts the SPA on :5173 with HMR.
+      // Secrets (LANGFLOW_SUPERUSER_PASSWORD, WORKSPACEX_SECRET_KEY, AZURE_*,
+      // Client_*) flow in via `envFile: .env` on the backend/worker configs.
+      "name": "Dev: Full Stack (infra + backend + worker + frontend)",
       "configurations": [
         "Backend: FastAPI (uvicorn --reload)",
+        "Backend: Worker (app.worker)",
         "Frontend: Vite dev (npm run dev)"
       ],
       "stopAll": true,

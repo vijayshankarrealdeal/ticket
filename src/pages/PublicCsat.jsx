@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
+import { Spinner } from '../components/Spinner.jsx';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '/api';
 
@@ -66,7 +67,9 @@ export default function PublicCsat() {
         ) : error ? (
           <div style={{ color: '#dc2626' }}>Survey unavailable: {error}</div>
         ) : !survey ? (
-          <div style={{ color: '#64748b' }}>Loading…</div>
+          <div style={{ color: '#64748b', display: 'flex', alignItems: 'center', gap: 10, padding: '24px 0' }}>
+            <Spinner size={18} /> Loading…
+          </div>
         ) : (
           <>
             {survey.subject && (

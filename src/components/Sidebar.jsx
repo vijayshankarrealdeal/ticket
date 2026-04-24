@@ -31,6 +31,7 @@ const items = [
   { to: '/notifications', icon: Icon.Bell, label: 'Notifications' },
   { to: '/analytics', icon: Icon.Chart, label: 'Insights', expandable: true },
   { to: '/agent-builder', icon: Icon.AiAgent, label: 'Make Agents', expandable: true },
+  { to: '/api-playground', icon: Icon.Bolt, label: 'API Playground' },
   { to: '/channels', icon: Icon.Plug, label: 'Channels', expandable: true },
 ];
 

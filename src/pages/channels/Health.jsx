@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Icon } from '../../components/Icons.jsx';
+import { Spinner } from '../../components/Spinner.jsx';
 import { api } from '../../api.js';
 
 const COMPONENT_FILTERS = [
@@ -17,6 +18,8 @@ export default function Health() {
   const [services, setServices] = useState([]);
   const [incidents, setIncidents] = useState([]);
   const [flash, setFlash] = useState(null);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [subscribeOpen, setSubscribeOpen] = useState(false);
 
   async function refresh() {
     const [s, i] = await Promise.all([
@@ -27,7 +30,9 @@ export default function Health() {
     setIncidents(Array.isArray(i) ? i : i?.items || []);
   }
 
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => {
+    refresh().finally(() => setInitialLoading(false));
+  }, []);
 
   async function reRun() {
     setFlash('Re-running probes…');
@@ -42,17 +47,10 @@ export default function Health() {
     setTimeout(() => setFlash(null), 2000);
   }
 
-  async function subscribe() {
-    const email = prompt('Get notified when status changes — email?');
-    if (!email) return;
-    try {
-      await api.post('/incidents/subscribe', { email });
-      setFlash('Subscribed · check inbox');
-      setTimeout(() => setFlash(null), 2500);
-    } catch (e) {
-      setFlash(`Subscribe failed: ${e.message || e}`);
-      setTimeout(() => setFlash(null), 3500);
-    }
+  async function subscribe(email) {
+    await api.post('/incidents/subscribe', { email });
+    setFlash('Subscribed · check inbox');
+    setTimeout(() => setFlash(null), 2500);
   }
 
   const filtered = useMemo(() => {
@@ -99,7 +97,7 @@ export default function Health() {
         </div>
         <div className="ch-page-head-actions">
           <button className="btn secondary" onClick={reRun}><Icon.Refresh /> Re-run checks</button>
-          <button className="btn secondary" onClick={subscribe}><Icon.Bell /> Subscribe</button>
+          <button className="btn secondary" onClick={() => setSubscribeOpen(true)}><Icon.Bell /> Subscribe</button>
         </div>
       </div>
       {flash && (
@@ -129,6 +127,12 @@ export default function Health() {
         </div>
       </div>
 
+      {initialLoading && services.length === 0 && incidents.length === 0 ? (
+        <div style={{ padding: '80px 16px', display: 'flex', justifyContent: 'center' }}>
+          <Spinner size={32} />
+        </div>
+      ) : (
+      <>
       <div className="ch-kpi-row">
         <Kpi label="Components" value={counts.total} />
         <Kpi
@@ -202,6 +206,73 @@ export default function Health() {
           ))}
         </div>
       </section>
+      </>
+      )}
+      {subscribeOpen && (
+        <SubscribeModal
+          onClose={() => setSubscribeOpen(false)}
+          onSave={async (email) => {
+            try {
+              await subscribe(email);
+              setSubscribeOpen(false);
+            } catch (e) {
+              throw e;
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function SubscribeModal({ onClose, onSave }) {
+  const [email, setEmail] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function save() {
+    const trimmed = email.trim();
+    if (!/^\S+@\S+\.\S+$/.test(trimmed)) {
+      setErr('Enter a valid email address');
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    try {
+      await onSave(trimmed);
+    } catch (e) {
+      setErr(e.message || String(e));
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="ch-modal-overlay" onClick={onClose}>
+      <div className="ch-modal" onClick={(e) => e.stopPropagation()}>
+        <h3 className="ch-modal-title">Subscribe to status updates</h3>
+        <div className="ch-modal-body">
+          <div style={{ fontSize: 13, color: 'var(--muted)' }}>
+            We'll notify this address when a service is degraded or recovers.
+          </div>
+          <label className="ch-modal-field">Email
+            <input
+              autoFocus
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@company.com"
+              onKeyDown={(e) => { if (e.key === 'Enter' && !saving) save(); }}
+            />
+          </label>
+          {err && <div className="ch-modal-error">{err}</div>}
+        </div>
+        <div className="ch-modal-foot">
+          <button className="btn secondary" onClick={onClose} disabled={saving}>Cancel</button>
+          <button className="btn" onClick={save} disabled={saving}>
+            {saving ? 'Subscribing…' : 'Subscribe'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
