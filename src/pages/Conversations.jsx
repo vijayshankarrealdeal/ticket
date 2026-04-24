@@ -1435,9 +1435,21 @@ function SyncInboxButton({ onSynced }) {
       const ingested = r?.ingested ?? 0;
       const fetched = r?.fetched ?? 0;
       const accounts = r?.accounts ?? 0;
-      setTip(accounts === 0
-        ? 'No Gmail connected — connect it from Platforms.'
-        : `Pulled ${ingested} new / ${fetched} unread across ${accounts} account(s).`);
+      // accounts=0 has two very different causes: the user never connected
+      // Gmail, or they did connect but the token now needs a reauth. The
+      // backend tells us which via `connected`/`needs_reauth` so the nudge
+      // actually matches what the operator needs to do.
+      let msg;
+      if (accounts > 0) {
+        msg = `Pulled ${ingested} new / ${fetched} unread across ${accounts} account(s).`;
+      } else if (r?.needs_reauth) {
+        msg = 'Gmail token expired — reconnect from Platforms.';
+      } else if (r?.connected) {
+        msg = 'Gmail is connecting — try again in a moment.';
+      } else {
+        msg = 'No Gmail connected — connect it from Platforms.';
+      }
+      setTip(msg);
       setState(ingested > 0 ? 'done' : 'idle');
       onSynced?.();
     } catch (e) {

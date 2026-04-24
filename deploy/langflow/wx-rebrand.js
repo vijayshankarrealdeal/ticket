@@ -16,6 +16,214 @@
 (function () {
   'use strict';
 
+  // ---- WorkspaceX handshake ----------------------------------------------
+  // `/flow/launch` appends `_wxToken=<session>` + `_wxApi=<backend-origin>`
+  // to the redirect URL. Capture both on first paint so later hooks (Export
+  // save-as-agent) can call WorkspaceX without CORS cookies. We strip the
+  // params from the URL afterwards so they don't leak into history/referer.
+  function captureWorkspaceXHandoff() {
+    try {
+      const url = new URL(window.location.href);
+      const tk = url.searchParams.get('_wxToken');
+      const api = url.searchParams.get('_wxApi');
+      let mutated = false;
+      if (tk) {
+        sessionStorage.setItem('workspacex.token', tk);
+        url.searchParams.delete('_wxToken');
+        mutated = true;
+      }
+      if (api) {
+        sessionStorage.setItem('workspacex.api', api);
+        url.searchParams.delete('_wxApi');
+        mutated = true;
+      }
+      if (mutated) {
+        window.history.replaceState(null, '', url.toString());
+      }
+    } catch (_) { }
+  }
+  captureWorkspaceXHandoff();
+
+  function wxToken() { return sessionStorage.getItem('workspacex.token') || ''; }
+  function wxApi()   { return sessionStorage.getItem('workspacex.api') || ''; }
+
+  function currentFlowId() {
+    // Langflow's editor URL is `/flow/<uuid>` (or `/lf/flow/<uuid>` under
+    // the proxy). Pull the last UUID segment.
+    const m = /\/flow\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i
+      .exec(window.location.pathname);
+    return m ? m[1] : null;
+  }
+
+  function toast(message, kind) {
+    // Minimal toast — reuses Langflow's dark palette. Slides in from bottom
+    // right, auto-dismisses after 3s. Multiple toasts stack.
+    const el = document.createElement('div');
+    el.textContent = message;
+    const stack = document.getElementById('wx-toast-stack') || (() => {
+      const s = document.createElement('div');
+      s.id = 'wx-toast-stack';
+      s.style.cssText = [
+        'position:fixed', 'right:20px', 'bottom:20px', 'z-index:99999',
+        'display:flex', 'flex-direction:column', 'gap:8px',
+        'pointer-events:none',
+      ].join(';');
+      document.body.appendChild(s);
+      return s;
+    })();
+    el.style.cssText = [
+      'padding:10px 16px', 'border-radius:8px',
+      'background:' + (kind === 'error' ? '#7f1d1d' : '#111827'),
+      'color:#f8fafc', 'font:14px system-ui,sans-serif',
+      'border:1px solid ' + (kind === 'error' ? '#b91c1c' : '#1f2937'),
+      'box-shadow:0 10px 25px rgba(0,0,0,0.35)',
+      'pointer-events:auto', 'opacity:0', 'transform:translateY(8px)',
+      'transition:opacity .18s, transform .18s',
+    ].join(';');
+    stack.appendChild(el);
+    requestAnimationFrame(() => {
+      el.style.opacity = '1';
+      el.style.transform = 'translateY(0)';
+    });
+    setTimeout(() => {
+      el.style.opacity = '0';
+      el.style.transform = 'translateY(8px)';
+      setTimeout(() => el.remove(), 220);
+    }, 3000);
+  }
+
+  async function saveFlowToWorkspaceX(overrides) {
+    const token = wxToken();
+    const api = wxApi();
+    if (!token || !api) {
+      console.warn('[wx] save-as-agent: missing token/api from launch handoff');
+      return;
+    }
+    const flowId = currentFlowId();
+    if (!flowId) {
+      console.warn('[wx] save-as-agent: no flow id in URL');
+      return;
+    }
+    // Fetch the flow + variables. Both are same-origin calls on Langflow
+    // itself, so cookies flow automatically.
+    let flow = null;
+    try {
+      const r = await fetch(`/api/v1/flows/${flowId}`, { credentials: 'include' });
+      if (r.ok) flow = await r.json();
+    } catch (_) { }
+    if (!flow) return;
+
+    let variables = [];
+    try {
+      const r = await fetch('/api/v1/variables/', { credentials: 'include' });
+      if (r.ok) {
+        const body = await r.json();
+        variables = Array.isArray(body) ? body : (body.items || body.variables || []);
+      }
+    } catch (_) { }
+
+    // Prefer the values the user typed in the Export dialog (overrides) over
+    // the flow's stored editor name/description. Langflow's Export dialog
+    // lets users rename the download without persisting the rename back to
+    // the flow record, so the dialog inputs are the source of truth for
+    // what the operator actually wants to call this snapshot.
+    const name = (overrides && overrides.name) || flow.name || null;
+    const description = (overrides && overrides.description)
+      || flow.description || '';
+
+    const payload = {
+      flowId,
+      name,
+      description,
+      data: flow.data || {},
+      variables: (variables || [])
+        .filter((v) => v && v.name)
+        .map((v) => ({ name: v.name, value: v.value, type: v.type || null })),
+    };
+
+    try {
+      const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+      const resp = await fetch(`${api}/flow/save-as-agent${qs}`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        toast(`WorkspaceX save failed (${resp.status})`, 'error');
+        console.warn('[wx] save-as-agent response', resp.status, text);
+        return;
+      }
+      const body = await resp.json().catch(() => ({}));
+      const secretsMsg = body.variablesStored
+        ? ` · ${body.variablesStored} secret${body.variablesStored === 1 ? '' : 's'} stored`
+        : '';
+      toast(`Saved to WorkspaceX${secretsMsg}`);
+    } catch (e) {
+      toast('WorkspaceX save failed (network)', 'error');
+      console.warn('[wx] save-as-agent', e);
+    }
+  }
+
+  function readExportDialogOverrides(dialog) {
+    // Langflow's dialog renders the Name/Description using form labels
+    // rather than stable ids, so look them up by associated <label> text
+    // first, then fall back to the first/second input/textarea inside the
+    // dialog. The fallback is fine because the dialog structure has been
+    // Name→Description top-to-bottom since Langflow 1.x.
+    const byLabel = (rx) => {
+      for (const lbl of dialog.querySelectorAll('label')) {
+        if (!rx.test((lbl.textContent || '').trim())) continue;
+        const id = lbl.getAttribute('for');
+        if (id) {
+          const el = dialog.querySelector(`#${CSS.escape(id)}`);
+          if (el) return el;
+        }
+        const sibling = lbl.parentElement
+          && (lbl.parentElement.querySelector('input, textarea'));
+        if (sibling) return sibling;
+      }
+      return null;
+    };
+    const nameEl = byLabel(/^name\b/i) || dialog.querySelector('input');
+    const descEl = byLabel(/^description\b/i) || dialog.querySelector('textarea');
+    return {
+      name: (nameEl && typeof nameEl.value === 'string')
+        ? nameEl.value.trim() : '',
+      description: (descEl && typeof descEl.value === 'string')
+        ? descEl.value.trim() : '',
+    };
+  }
+
+  function hookExportButton() {
+    // Walk every button with the visible text "Export". Only engage inside
+    // Langflow's export dialog, not the Share menu's "Export" row — the
+    // dialog's confirm button is what finalises a download, and that's
+    // where we want the side-effect.
+    const candidates = document.querySelectorAll('button, [role="button"]');
+    candidates.forEach((btn) => {
+      if (btn.dataset.wxSaveHooked === '1') return;
+      const text = (btn.textContent || '').trim();
+      if (text !== 'Export') return;
+      const dialog = btn.closest('[role="dialog"], [data-state="open"]');
+      if (!dialog) return;
+      btn.dataset.wxSaveHooked = '1';
+      btn.addEventListener('click', () => {
+        // Snapshot the dialog inputs BEFORE Langflow tears the dialog down
+        // on its own click handler.
+        const overrides = readExportDialogOverrides(dialog);
+        // Run in parallel with Langflow's own download so the user gets
+        // both the JSON file and a persisted WorkspaceX agent.
+        saveFlowToWorkspaceX(overrides)
+          .catch((e) => console.warn('[wx] save', e));
+      }, { capture: true });
+    });
+  }
+
   function forceDarkTheme() {
     const html = document.documentElement;
     if (!html.classList.contains('dark')) html.classList.add('dark');
@@ -125,6 +333,7 @@
     try { forceDarkTheme(); } catch (_) { }
     try { hideWelcomeSplash(); } catch (_) { }
     try { hideDropdownRows(); } catch (_) { }
+    try { hookExportButton(); } catch (_) { }
   }
 
   let pending = false;

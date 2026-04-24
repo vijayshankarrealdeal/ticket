@@ -69,7 +69,12 @@ S3_PRESIGN_EXPIRES = int(_env("S3_PRESIGN_EXPIRES", "300"))  # seconds
 
 # --- HTTP / auth ---
 CORS_ORIGINS = _env(
-    "CORS_ORIGINS", "http://localhost:5173,http://localhost:3000"
+    "CORS_ORIGINS",
+    # Include the Langflow origin by default so the WorkspaceX rebrand
+    # overlay (deploy/langflow/wx-rebrand.js) can call back to us from the
+    # Langflow tab when the user clicks Export. The `credentials: 'include'`
+    # path needs an explicit origin match, not `*`.
+    "http://localhost:5173,http://localhost:3000,http://localhost:7860",
 ).split(",")
 SESSION_COOKIE = "wx_session"
 SESSION_TTL_DAYS = 30

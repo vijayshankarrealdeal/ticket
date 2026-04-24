@@ -211,6 +211,12 @@ DEFAULT_CATALOG: list[dict] = [
 
 _CATALOG_BY_ID = {e["id"]: e for e in DEFAULT_CATALOG}
 
+# OAuth-backed channels. `platforms.status` stays sticky until the user
+# explicitly disconnects; platform_credentials tell us whether the stored
+# tokens are still usable, which we surface as a separate `needs_reauth` flag
+# so the UI can nudge the admin to reconnect without flipping the card.
+_OAUTH_CHANNEL_PROVIDERS = {"gmail": "gmail", "outlook": "outlook"}
+
 
 async def _workspace_overrides(workspace_id: str) -> dict[str, dict]:
     db = await get_db()
@@ -223,20 +229,62 @@ async def _workspace_overrides(workspace_id: str) -> dict[str, dict]:
     return out
 
 
+async def _oauth_credential_health(workspace_id: str) -> dict[str, dict]:
+    """Per-channel credential health. Returns `{has_active, needs_reauth}` for
+    each OAuth-backed platform id with any credential row in the workspace."""
+    db = await get_db()
+    providers = tuple(_OAUTH_CHANNEL_PROVIDERS.values())
+    placeholders = ",".join(["?"] * len(providers))
+    cur = await db.execute(
+        f"""
+        SELECT provider, status FROM platform_credentials
+         WHERE workspace_id = ? AND provider IN ({placeholders})
+        """,
+        (workspace_id, *providers),
+    )
+    by_provider: dict[str, set[str]] = {}
+    for row in await cur.fetchall():
+        r = dict(row)
+        by_provider.setdefault(r["provider"], set()).add(r["status"])
+    out: dict[str, dict] = {}
+    for pid, provider in _OAUTH_CHANNEL_PROVIDERS.items():
+        statuses = by_provider.get(provider) or set()
+        out[pid] = {
+            "has_active": "active" in statuses,
+            "needs_reauth": (bool(statuses)
+                             and "active" not in statuses
+                             and "reauth_required" in statuses),
+        }
+    return out
+
+
+def _needs_reauth_for(pid: str, status: str,
+                      health: dict[str, dict]) -> bool:
+    """True when the card should show a reauth badge: the user has it marked
+    connected, but no usable credential is available to back it."""
+    if pid not in _OAUTH_CHANNEL_PROVIDERS or status != "connected":
+        return False
+    h = health.get(pid) or {}
+    return not h.get("has_active", False)
+
+
 @router.get("/platforms")
 async def list_platforms(
     include: str | None = Query(None),
     user: dict = Me,
 ) -> list[dict]:
     overrides = await _workspace_overrides(user["workspace_id"])
+    oauth_health = await _oauth_credential_health(user["workspace_id"])
 
     if include == "all":
         merged: list[dict] = []
         for entry in DEFAULT_CATALOG:
             ov = overrides.get(entry["id"])
+            status = (ov or {}).get("status", "available")
             merged.append({
                 **entry,
-                "status": (ov or {}).get("status", "available"),
+                "status": status,
+                "needs_reauth": _needs_reauth_for(entry["id"], status, oauth_health),
                 "tickets": (ov or {}).get("tickets_count", 0),
                 "cls": entry["kind"].lower(),
                 "_group": entry["group"],
@@ -270,6 +318,7 @@ async def list_platforms(
             "desc": r.get("description"),
             "kind": r["kind"],
             "status": r["status"],
+            "needs_reauth": _needs_reauth_for(pid, r["status"], oauth_health),
             "tickets": r["tickets_count"],
             "cls": r["kind"].lower(),
             "category": (entry or {}).get("category", r["kind"].title()),
@@ -334,6 +383,20 @@ async def connect(pid: str, user: dict = Me) -> dict:
 @router.post("/platforms/{pid}/disconnect")
 async def disconnect(pid: str, user: dict = Me) -> dict:
     await _set_status(user["workspace_id"], pid, "disconnected")
+    # OAuth channels key off platform_credentials — deactivate the stored
+    # tokens too, otherwise the poller keeps hitting a "disconnected" mailbox
+    # and list_platforms would flip the card back to connected on next read.
+    provider = _OAUTH_CHANNEL_PROVIDERS.get(pid)
+    if provider:
+        db = await get_db()
+        await db.execute(
+            """
+            UPDATE platform_credentials SET status = 'revoked'
+             WHERE workspace_id = ? AND provider = ?
+            """,
+            (user["workspace_id"], provider),
+        )
+        await db.commit()
     return {"ok": True, "status": "disconnected"}
 
 
@@ -345,4 +408,15 @@ async def gmail_sync(user: dict = Me) -> dict:
     waiting for the next tick."""
     from ..channels.gmail_poller import poll_all_gmail_accounts
     result = await poll_all_gmail_accounts(workspace_id=user["workspace_id"])
+    # Enrich with intent/health so the UI can tell "never connected" apart
+    # from "connected but the stored token needs a reauth" — the two look
+    # identical from the poller's perspective (both return accounts=0) but
+    # mean very different things to an operator.
+    overrides = await _workspace_overrides(user["workspace_id"])
+    health = await _oauth_credential_health(user["workspace_id"])
+    gmail_row = overrides.get("gmail") or {}
+    result["connected"] = gmail_row.get("status") == "connected"
+    result["needs_reauth"] = _needs_reauth_for(
+        "gmail", gmail_row.get("status") or "available", health,
+    )
     return result

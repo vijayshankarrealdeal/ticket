@@ -28,6 +28,18 @@ function openFlow(agentId) {
   window.open(launchUrl(agentId), '_blank', 'noopener');
 }
 
+function formatRelativeTime(iso) {
+  if (!iso) return '';
+  const ts = new Date(iso).getTime();
+  if (!ts || Number.isNaN(ts)) return '';
+  const diff = Date.now() - ts;
+  if (diff < 60_000) return 'just now';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  if (diff < 7 * 86_400_000) return `${Math.floor(diff / 86_400_000)}d ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
 function prettyName(d = new Date()) {
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
@@ -47,10 +59,14 @@ export default function AgentBuilder() {
       try {
         const list = await api.get('/agents');
         if (cancelled) return;
-        // Only Langflow-backed rows make sense in the recent picker — the
-        // default-orchestrator placeholder doesn't have a flow to open.
+        // Only surface flows that have been Exported out of Langflow —
+        // draft rows are placeholders created at first `/flow/launch` and
+        // clutter the list until the user actually saves something. The
+        // `/flow/save-as-agent` hook (deploy/langflow/wx-rebrand.js) flips
+        // `agents.status` to `published` via `apply_flow_publish`.
         const flows = (list || [])
           .filter((a) => (a.kind || 'default') === 'langflow')
+          .filter((a) => (a.status || '').toLowerCase() === 'published')
           .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
         setAgents(flows);
       } catch (e) {
@@ -86,86 +102,125 @@ export default function AgentBuilder() {
     }
   }
 
+  if (loadingList) {
+    return (
+      <>
+        <TopBar left={<div className="top-bar-title">Agent Builder</div>} />
+        <div className="page-scroll" style={emptyWrap}>
+          <Spinner size={22} />
+        </div>
+      </>
+    );
+  }
+
+  // Empty state — centered CTA with the marketing copy. Gets out of the
+  // way as soon as the workspace has at least one exported flow.
+  if (agents.length === 0) {
+    return (
+      <>
+        <TopBar left={<div className="top-bar-title">Agent Builder</div>} />
+        <div className="page-scroll" style={emptyWrap}>
+          <div style={emptyCard}>
+            <div style={title}>Build an agent with Langflow</div>
+            <div style={sub}>
+              Start a new flow, then wire up nodes, tools and prompts in the
+              visual editor. Exporting the flow publishes it to WorkspaceX
+              automatically.
+            </div>
+            <button
+              className="btn"
+              onClick={createFlow}
+              disabled={busy}
+              style={ctaBtn}
+            >
+              <Icon.Plus /> {busy ? 'Creating flow…' : 'Create a flow'}
+            </button>
+            <div style={tabHint}>Opens Langflow in a new tab.</div>
+            {err && <div style={errLine}>{err}</div>}
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  // Populated state — list is the primary content; Create a flow sits in
+  // the top-right corner so the user can keep adding more without hunting
+  // for the CTA.
   return (
     <>
       <TopBar left={<div className="top-bar-title">Agent Builder</div>} />
-      <div className="page-scroll" style={pageWrap}>
-        <div style={card}>
-          <div style={title}>Build an agent with Langflow</div>
-          <div style={sub}>
-            Start a new flow, then wire up nodes, tools and prompts in the
-            visual editor. Publishing the flow activates the agent for
-            inbound conversations automatically.
+      <div className="page-scroll" style={listWrap}>
+        <div style={listInner}>
+          <div style={listHeader}>
+            <div style={recentLabel}>Your flows</div>
+            <button
+              className="btn"
+              onClick={createFlow}
+              disabled={busy}
+              style={cornerBtn}
+            >
+              <Icon.Plus /> {busy ? 'Creating…' : 'Create a flow'}
+            </button>
           </div>
-          <button
-            className="btn"
-            onClick={createFlow}
-            disabled={busy}
-            style={ctaBtn}
-          >
-            <Icon.Plus /> {busy ? 'Creating flow…' : 'Create a flow'}
-          </button>
-          <div style={tabHint}>Opens Langflow in a new tab.</div>
           {err && <div style={errLine}>{err}</div>}
-
-          {loadingList ? (
-            <div style={{ padding: '24px 0', display: 'flex', justifyContent: 'center' }}>
-              <Spinner size={22} />
-            </div>
-          ) : agents.length > 0 && (
-            <div style={recentWrap}>
-              <div style={recentLabel}>Recent flows</div>
-              <div style={recentList}>
-                {agents.slice(0, 6).map((a) => (
-                  <button
-                    key={a.id}
-                    style={recentItem}
-                    onClick={() => openFlow(a.id)}
-                    title={`Open ${a.name || 'flow'} in a new tab`}
-                  >
-                    <div style={recentName}>
-                      {a.name || 'Untitled flow'}
-                      <span style={recentId}>#{String(a.id).slice(0, 6)}</span>
-                    </div>
-                    <div style={recentMeta}>
-                      {a.status === 'published' ? 'Published' : 'Draft'}
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
+          <div style={recentList}>
+            {agents.map((a) => (
+              <button
+                key={a.id}
+                style={recentItem}
+                onClick={() => openFlow(a.id)}
+                title={`Open ${a.name || 'flow'} in a new tab`}
+              >
+                <div style={recentName}>
+                  {a.name || 'Untitled flow'}
+                  <span style={recentId}>#{String(a.id).slice(0, 6)}</span>
+                </div>
+                <div style={recentMeta}>
+                  {formatRelativeTime(a.last_published_at || a.created_at)}
+                </div>
+              </button>
+            ))}
+          </div>
         </div>
       </div>
     </>
   );
 }
 
-const pageWrap = {
+const emptyWrap = {
   display: 'flex', alignItems: 'center', justifyContent: 'center',
   minHeight: 'calc(100vh - 120px)', textAlign: 'center',
 };
-const card = { maxWidth: 460, width: '100%', padding: '0 24px' };
+const emptyCard = { maxWidth: 460, width: '100%', padding: '0 24px' };
+const listWrap = { display: 'flex', justifyContent: 'center', padding: '28px 24px' };
+const listInner = { width: '100%', maxWidth: 760 };
 const title = { fontSize: 22, fontWeight: 600, marginBottom: 8 };
 const sub = { color: 'var(--muted)', marginBottom: 24, lineHeight: 1.55 };
 const ctaBtn = {
   padding: '12px 22px', fontSize: 15, display: 'inline-flex',
   alignItems: 'center', gap: 8,
 };
+const cornerBtn = {
+  padding: '6px 12px', fontSize: 13, display: 'inline-flex',
+  alignItems: 'center', gap: 6,
+};
 const tabHint = {
   marginTop: 10, fontSize: 12, color: 'var(--muted-2)',
 };
 const errLine = { color: 'var(--danger, #b91c1c)', fontSize: 13, marginTop: 14 };
-const recentWrap = { marginTop: 36, textAlign: 'left' };
+const listHeader = {
+  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+  marginBottom: 16,
+};
 const recentLabel = {
   fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase',
-  color: 'var(--muted)', marginBottom: 8,
+  color: 'var(--muted)',
 };
 const recentList = { display: 'grid', gap: 8 };
 const recentItem = {
   display: 'flex', justifyContent: 'space-between', alignItems: 'center',
   gap: 12,
-  padding: '10px 14px', border: '1px solid var(--border)',
+  padding: '12px 16px', border: '1px solid var(--border)',
   borderRadius: 8, background: 'var(--panel)',
   color: 'var(--text)',
   cursor: 'pointer', textAlign: 'left',

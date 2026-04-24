@@ -379,6 +379,20 @@ CREATE TABLE IF NOT EXISTS agent_flow_snapshots (
   UNIQUE (agent_id, version)
 );
 
+-- Per-agent API keys captured at save time. Populated by `/flow/save-as-agent`
+-- when the user triggers Export inside Langflow — we fetch their Langflow
+-- Global Variables and stash the values encrypted so re-importing the agent
+-- restores its secrets without asking for them again. Encryption uses the
+-- Fernet helpers in routers/langflow.py (keyed off WORKSPACEX_SECRET_KEY).
+CREATE TABLE IF NOT EXISTS agent_secrets (
+  agent_id        uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  key             text NOT NULL,
+  encrypted_value text NOT NULL,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  updated_at      timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (agent_id, key)
+);
+
 -- ---------- Password resets / OAuth / Langflow columns (spec §3.1, §3.11.C) ----------
 CREATE TABLE IF NOT EXISTS password_resets (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),

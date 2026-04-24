@@ -29,5 +29,12 @@ RUN set -eux; \
     # Sanity-check the inject landed.
     grep -c 'wx-rebrand' "$INDEX"
 
+# Install our custom components into /app/custom_components and advertise
+# that path via LANGFLOW_COMPONENTS_PATH. The parent folder name under
+# custom_components becomes the sidebar category, so `workspacex/` shows up
+# as its own group (alongside OpenAI, LangChain, etc.).
+COPY components /app/custom_components
+ENV LANGFLOW_COMPONENTS_PATH=/app/custom_components
+
 # Langflow runs as root by default; keep that so the image starts cleanly.
 # (The upstream entrypoint handles dropping privileges if configured.)

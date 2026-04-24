@@ -194,6 +194,15 @@ export default function Platforms() {
                             ? 'Available'
                             : 'Disconnected'}
                     </span>
+                    {p.needs_reauth && (
+                      <span
+                        className="status-badge status-queued"
+                        title="The stored access token can't be refreshed. Click Manage to reconnect."
+                        style={{ fontSize: 11 }}
+                      >
+                        ● Reauth needed
+                      </span>
+                    )}
                     <span style={{ color: 'var(--muted)', fontSize: 12, fontWeight: 500 }}>
                       {p.tickets ?? 0} tickets
                     </span>

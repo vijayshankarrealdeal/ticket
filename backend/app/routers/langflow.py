@@ -34,6 +34,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from ..db import get_db, js
 from ..deps import MaybeMe
 from ..ws import broker
+from .auth import session_user_from_token
 
 log = logging.getLogger(__name__)
 
@@ -382,6 +383,7 @@ async def _mint_access_token(db, user: dict, password_hint: str | None) -> str |
 
 @launch_router.get("/launch")
 async def flow_launch(
+    request: Request,
     agent: str | None = Query(default=None),
     token: str | None = Query(default=None),
     user: dict | None = MaybeMe,
@@ -450,6 +452,38 @@ async def flow_launch(
     public = (LANGFLOW_PUBLIC_URL or LANGFLOW_URL).rstrip("/")
     target_path = f"{public}/flow/{target_flow_id}" if target_flow_id else f"{public}/?folder={lf_folder_id}"
     login_path = f"{public}/api/v1/login"
+
+    # Hand the rebrand overlay enough context to call back into WorkspaceX
+    # without re-authenticating. We inject a fresh session token and the
+    # WorkspaceX API origin into the redirect URL; the overlay grabs both
+    # on first paint, stashes them in sessionStorage, and strips them from
+    # the URL so they don't hang around in history / referer headers.
+    #
+    # The token reuses the caller's existing session if we can find a
+    # bearer in the request — keeping cross-origin flows on one identity.
+    # Otherwise we mint a fresh one via `_create_session`, scoped to the
+    # same user.
+    from .auth import _create_session  # avoid top-level circular on load
+    auth_header = request.headers.get("authorization") or ""
+    wx_token = auth_header.split(" ", 1)[1].strip() if auth_header.lower().startswith("bearer ") else ""
+    # `/flow/launch` accepts `?token=` too; reuse if present to keep a
+    # single-session trail.
+    wx_token = wx_token or (token or "")
+    if not wx_token:
+        try:
+            wx_token = await _create_session(user["id"])
+        except Exception:
+            log.exception("flow_launch: could not mint session token")
+            wx_token = ""
+    backend_origin = str(request.base_url).rstrip("/")
+    extra_q: list[str] = []
+    if wx_token:
+        extra_q.append(f"_wxToken={wx_token}")
+    if backend_origin:
+        from urllib.parse import quote
+        extra_q.append(f"_wxApi={quote(backend_origin, safe='')}")
+    if extra_q:
+        target_path += ("&" if "?" in target_path else "?") + "&".join(extra_q)
 
     import html as _h
     html = f"""<!doctype html>
@@ -692,6 +726,136 @@ async def apply_flow_publish(
                           "version": version, "source": source,
                           "at": datetime.now(timezone.utc).isoformat()})
     return {"agentId": agent_id, "workspaceId": str(ws_id), "version": version}
+
+
+@launch_router.post("/save-as-agent")
+async def save_as_agent(
+    body: dict,
+    request: Request,
+    user: dict | None = MaybeMe,
+) -> dict:
+    """Called by the WorkspaceX rebrand overlay when the operator clicks
+    Langflow's Export button. Takes whatever the browser already has — the
+    current flow JSON + (optionally) the user's Langflow Global Variables —
+    and persists an `agents` row, a `agent_flow_snapshots` row, and one
+    `agent_secrets` row per variable (encrypted with the Fernet helper).
+
+    Payload shape (all fields optional-except-flowId):
+      {
+        "flowId":      "<lf-flow-uuid>",
+        "name":        "Human label",
+        "description": "…",
+        "data":        { nodes, edges, viewport },   // the LF flow JSON
+        "version":     12,                           // optional — we'll
+                                                     //  synthesize a monotonic
+                                                     //  one when missing
+        "variables":   [{ "name": "OPENAI_API_KEY",
+                          "value": "sk-…",
+                          "type":  "CREDENTIAL" }]
+      }
+
+    Authentication matches `/flow/launch`: the SPA session cookie or
+    `Authorization: Bearer <wx-token>`. Fails 401 otherwise — unlike
+    `/flow/api-library/*` we don't expose this via the `Internal <key>`
+    path because the client is always a browser that can carry cookies.
+    """
+    if not user:
+        # Allow the rebrand overlay to pass `?token=` the same way `/flow/launch`
+        # does, so cross-origin browsers without the `wx_session` cookie still
+        # authenticate cleanly.
+        token = (request.query_params.get("token") or "").strip()
+        if token:
+            user = await session_user_from_token(token)
+    if not user:
+        raise HTTPException(401, "not authenticated")
+
+    flow_id = (body.get("flowId") or body.get("flow_id") or "").strip()
+    if not flow_id:
+        raise HTTPException(400, "flowId is required")
+    data = body.get("data") or {}
+    name = (body.get("name") or "").strip() or None
+    provided_version = body.get("version")
+
+    # Read the existing snapshot count so we can synthesize a monotonic
+    # version when the caller doesn't supply one. Langflow's Export dialog
+    # doesn't surface a version number, so this path is the norm.
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT COALESCE(MAX(s.version), 0) AS v "
+        "FROM agent_flow_snapshots s "
+        "JOIN agents a ON a.id = s.agent_id "
+        "WHERE a.langflow_flow_id = ? AND a.workspace_id = ?",
+        (flow_id, user["workspace_id"]),
+    )
+    last = await cur.fetchone()
+    next_version = int((dict(last) if last else {}).get("v") or 0) + 1
+    version = int(provided_version) if provided_version else next_version
+
+    # Read the folder id off the existing agent if we've seen this flow
+    # before; otherwise fall back to the caller's workspace-level folder so
+    # `apply_flow_publish` can stitch them together.
+    cur = await db.execute(
+        "SELECT langflow_folder_id FROM workspaces WHERE id = ? LIMIT 1",
+        (user["workspace_id"],),
+    )
+    row = await cur.fetchone()
+    folder_id = (dict(row) if row else {}).get("langflow_folder_id")
+
+    result = await apply_flow_publish(
+        db,
+        flow_id=flow_id,
+        folder_id=str(folder_id) if folder_id else None,
+        version=version,
+        data=data,
+        name=name,
+        source="export",
+    )
+    if not result:
+        raise HTTPException(
+            502,
+            "could not resolve a workspace for this flow — either pass a "
+            "folderId matching workspaces.langflow_folder_id, or make sure "
+            "an agents row with this langflow_flow_id already exists.",
+        )
+
+    # Persist any API keys the caller sent. Variables land in `agent_secrets`
+    # encrypted with the same Fernet helper we use for per-user Langflow
+    # passwords (WORKSPACEX_SECRET_KEY-derived).
+    variables = body.get("variables") or []
+    stored = 0
+    if isinstance(variables, list):
+        for v in variables:
+            if not isinstance(v, dict):
+                continue
+            k = (v.get("name") or v.get("key") or "").strip()
+            raw = v.get("value")
+            if not k or raw is None:
+                continue
+            try:
+                ciphertext = _encrypt(str(raw))
+            except Exception:
+                continue
+            await db.execute(
+                """
+                INSERT INTO agent_secrets (agent_id, key, encrypted_value)
+                VALUES (?,?,?)
+                ON CONFLICT (agent_id, key)
+                DO UPDATE SET encrypted_value = EXCLUDED.encrypted_value,
+                              updated_at = now()
+                """,
+                (result["agentId"], k, ciphertext),
+            )
+            stored += 1
+    if stored:
+        await db.commit()
+
+    return {
+        "ok": True,
+        "agentId": result["agentId"],
+        "workspaceId": result["workspaceId"],
+        "version": result["version"],
+        "variablesStored": stored,
+    }
 
 
 @webhook_router.post("/webhooks/langflow/published")

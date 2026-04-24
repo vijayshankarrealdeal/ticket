@@ -16,6 +16,7 @@ from .tracing import TraceMiddleware
 from .routers import (
     agents,
     analytics,
+    api_library_tools,
     api_playground,
     auth,
     billing,
@@ -147,6 +148,10 @@ app.include_router(langflow.webhook_router)
 # HTML responses. Needs `LANGFLOW_BASE_URL_PATH=/lf` on the Langflow
 # container so its own frontend emits matching relative URLs.
 app.include_router(langflow_proxy.proxy_router)
+# Surface saved API-Library endpoints as Langflow-importable tools:
+# `/flow/api-library/openapi.json` is consumed by Langflow's OpenAPI component,
+# and `/flow/api-library/invoke/{name}` executes a saved endpoint on callback.
+app.include_router(api_library_tools.router)
 # Widget router includes HTTP (`/widget/bootstrap`, `/widget/messages`,
 # `/widget.js`) and WebSocket (`/widget/ws`) routes — `include_router` mounts
 # all three.
