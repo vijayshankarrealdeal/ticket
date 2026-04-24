@@ -542,30 +542,60 @@ async def tool_issue_refund(ctx: AgentCtx, order_id: str, amount: float, reason:
 async def tool_escalate_to_human(ctx: AgentCtx, reason: str, team: str = "Support") -> dict:
     from ..routers.notifications import create_notification
     db = await get_db()
-    # Find any admin/agent in the workspace as the recipient.
+    # Prefer an admin (they own the queue and route to team members). Fall back
+    # to any agent only if there is no admin in the workspace.
     cur = await db.execute(
-        "SELECT id FROM users WHERE workspace_id = ? AND role IN ('admin','agent') LIMIT 1",
+        "SELECT id FROM users WHERE workspace_id = ? AND role = 'admin' "
+        "ORDER BY last_seen_at DESC NULLS LAST LIMIT 1",
         (ctx.workspace_id,),
     )
     r = await cur.fetchone()
-    if r:
+    if not r:
+        cur = await db.execute(
+            "SELECT id FROM users WHERE workspace_id = ? AND role IN ('admin','agent') LIMIT 1",
+            (ctx.workspace_id,),
+        )
+        r = await cur.fetchone()
+    admin_id = r[0] if r else None
+    if admin_id:
         await create_notification(
-            r[0], "assign",
+            admin_id, "assign",
             title="AI escalated a conversation",
             body=reason,
             link=f"/conversations?id={ctx.conversation_id}" if ctx.conversation_id else "/conversations",
         )
-    # Best-effort: update linked ticket status to 'blocked' so a human picks it up.
+    # Update linked ticket: escalate status + hand the ticket to the admin so
+    # it leaves the "Unassigned" queue and lands in the admin's lap. The admin
+    # can then reassign to the right team member.
     if ctx.conversation_id:
-        await db.execute(
-            """
-            UPDATE tickets SET status = 'blocked', updated_at = now()
-             WHERE conversation_id = ? AND status NOT IN ('resolved','closed')
-            """,
-            (ctx.conversation_id,),
-        )
+        if admin_id:
+            await db.execute(
+                """
+                UPDATE tickets SET status = 'blocked', assignee_id = ?, team = ?, updated_at = now()
+                 WHERE conversation_id = ? AND status NOT IN ('resolved','closed')
+                """,
+                (admin_id, team or "Support", ctx.conversation_id),
+            )
+            cur = await db.execute(
+                "SELECT id FROM tickets WHERE conversation_id = ? AND status NOT IN ('resolved','closed') LIMIT 1",
+                (ctx.conversation_id,),
+            )
+            trow = await cur.fetchone()
+            if trow:
+                await db.execute(
+                    "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'ai', ?)",
+                    (trow[0], f"AI escalated to admin — {reason}"),
+                )
+        else:
+            await db.execute(
+                """
+                UPDATE tickets SET status = 'blocked', updated_at = now()
+                 WHERE conversation_id = ? AND status NOT IN ('resolved','closed')
+                """,
+                (ctx.conversation_id,),
+            )
         await db.commit()
-    return {"ok": True, "team": team, "reason": reason}
+    return {"ok": True, "team": team, "reason": reason, "assignedTo": admin_id}
 
 
 @_guard_tool("run_library_api")

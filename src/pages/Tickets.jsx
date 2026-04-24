@@ -36,12 +36,15 @@ const slaHours = (sla) => {
 
 
 const statusMeta = {
-  assigned: { label: 'Assigned', tone: 'info' },
-  queued:   { label: 'Queued',   tone: 'warning' },
-  blocked:  { label: 'Blocked',  tone: 'danger' },
-  resolved: { label: 'Resolved', tone: 'success' },
-  closed:   { label: 'Closed',   tone: 'muted' },
+  assigned:             { label: 'Assigned',    tone: 'info' },
+  queued:               { label: 'Queued',      tone: 'warning' },
+  in_progress:          { label: 'In Progress', tone: 'info' },
+  waiting_for_customer: { label: 'Waiting',     tone: 'warning' },
+  blocked:              { label: 'Blocked',     tone: 'danger' },
+  resolved:             { label: 'Resolved',    tone: 'success' },
+  closed:               { label: 'Closed',      tone: 'muted' },
 };
+const statusFor = (s) => statusMeta[s] || { label: s || 'Queued', tone: 'info' };
 
 const channelAvatar = (channel) => {
   if (channel === 'WhatsApp') return { bg: '#22c55e', icon: <Icon.WhatsApp /> };
@@ -399,7 +402,7 @@ export default function Tickets() {
 
 function TicketCard({ t, selected, onClick }) {
   const ch = channelAvatar(t.channel);
-  const meta = statusMeta[t.status];
+  const meta = statusFor(t.status);
   return (
     <div className={'ticket-card' + (selected ? ' selected' : '')} onClick={onClick}>
       <div className="ticket-card-top">
@@ -438,7 +441,7 @@ function TicketCard({ t, selected, onClick }) {
 }
 
 function DetailHeader({ t, sidebarCollapsed, onShowSidebar, onPatch }) {
-  const meta = statusMeta[t.status];
+  const meta = statusFor(t.status);
   const [moreOpen, setMoreOpen] = useState(false);
   const [busy, setBusy] = useState(null); // 'refresh' | 'status' | null
   const [flash, setFlash] = useState(null);
@@ -944,7 +947,7 @@ function TicketSidebar({ t, onExpand, onCollapse, onPatch }) {
   const [busy, setBusy] = useState(null);
   const [flash, setFlash] = useState(null);
   const [modal, setModal] = useState(null); // 'merge'|'split'|'attach'|null
-  const meta = statusMeta[t.status] || { label: t.status || 'Queued', tone: 'info' };
+  const meta = statusFor(t.status);
 
   const flashOk = (msg) => { setFlash({ ok: true, msg }); setTimeout(() => setFlash(null), 2500); };
   const flashErr = (msg) => { setFlash({ ok: false, msg }); setTimeout(() => setFlash(null), 3500); };
@@ -1549,7 +1552,7 @@ function CollapsibleSection({ title, icon, defaultOpen = true, children, count }
 }
 
 function TicketDetailModal({ t, onClose }) {
-  const meta = statusMeta[t.status] || { label: t.status || 'Queued', tone: 'info' };
+  const meta = statusFor(t.status);
   const order = t.order || null;
   const items = order?.items || [];
   const cf = t.customFields || {};

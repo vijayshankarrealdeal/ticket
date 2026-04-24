@@ -540,14 +540,12 @@ async def ingest_inbound_message(
         {"conversationId": conversation_id, "text": text}, classifier_user,
     )
     ticket_id = decision.get("ticketId")
-    # AI leads resolution by default. A human is only looped in when intent
-    # confidence is below `AI_CONFIDENCE_THRESHOLD` (classifier doesn't know
-    # what the customer is asking for) or when auto_reply is explicitly off.
-    # At runtime the AI can still fall back to human via `escalate_to_human`
-    # (→ status='blocked') — that's the other human-touch path.
-    AI_CONFIDENCE_THRESHOLD = 0.5
+    # AI-first: every new/reopened ticket goes to the AI agent before any
+    # human. The AI self-escalates via `escalate_to_human` (→ status='blocked'
+    # + ticket assigned to an admin) when it cannot resolve. The classifier's
+    # confidence is kept around for context/telemetry but does not gate AI.
     confidence = float(decision.get("confidence") or 0.0)
-    ai_can_handle = auto_reply and confidence >= AI_CONFIDENCE_THRESHOLD
+    ai_can_handle = bool(auto_reply)
     new_status = "in_progress" if ai_can_handle else "queued"
     if decision["decision"] == "reopen" and ticket_id:
         await db.execute(
@@ -656,6 +654,16 @@ async def ingest_inbound_message(
         await db.commit()
 
     if ai_can_handle:
+        if ticket_id and confidence < 0.5:
+            # Low classifier confidence — note it on the timeline so the admin
+            # sees why the AI's first reply may be tentative, but still let AI
+            # take the first pass (it can self-escalate via `escalate_to_human`).
+            await db.execute(
+                "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'system', ?)",
+                (ticket_id,
+                 f"Low intent confidence ({confidence:.2f}) — AI will attempt a reply and escalate if it cannot resolve"),
+            )
+            await db.commit()
         asyncio.create_task(_run_inbound_ai_reply(
             workspace_id=workspace_id,
             conversation_id=conversation_id,
@@ -664,16 +672,6 @@ async def ingest_inbound_message(
             actor_user_id=actor_user_id,
             prompt=text,
         ))
-    elif auto_reply and ticket_id:
-        # Low-confidence intent: hand off to a human instead of drafting a
-        # reply we can't ground. Leave a trace so agents see why the AI stepped
-        # back.
-        await db.execute(
-            "INSERT INTO ticket_timeline (ticket_id, actor, text) VALUES (?, 'system', ?)",
-            (ticket_id,
-             f"AI held back — intent confidence {confidence:.2f} below {AI_CONFIDENCE_THRESHOLD:.2f}; routed to human"),
-        )
-        await db.commit()
 
     return {"message": msg, "intent": decision, "ticketId": ticket_id}
 
