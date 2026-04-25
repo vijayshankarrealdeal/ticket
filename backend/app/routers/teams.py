@@ -58,7 +58,8 @@ async def channels(user: dict = Me) -> list[dict]:
             "SELECT COUNT(*) FROM teams_messages WHERE channel_id = ?", (c["id"],)
         )
         count = (await cur2.fetchone())[0] or 0
-        out.append({**c, "messageCount": count, "members": members})
+        last = await _last_message_snapshot(db, channel_id=c["id"])
+        out.append({**c, "messageCount": count, "members": members, **last})
     return out
 
 
@@ -94,19 +95,72 @@ async def create_channel(body: dict, user: dict = Me) -> dict:
 @router.get("/dms")
 async def dms(user: dict = Me) -> list[dict]:
     db = await get_db()
+    # Membership filter is load-bearing: without it, the sidebar would list
+    # every DM in the workspace — including other users' self-DMs — so anyone
+    # could open someone's "Notes to self" and post into it. `@>` is used
+    # instead of the `?` jsonb operator because `?` collides with the db
+    # wrapper's qmark→$N placeholder rewrite.
     cur = await db.execute(
-        "SELECT id, member_ids FROM teams_dms WHERE workspace_id = ?", (user["workspace_id"],)
+        "SELECT id, member_ids FROM teams_dms WHERE workspace_id = ? AND member_ids @> ?::jsonb",
+        (user["workspace_id"], js([user["id"]])),
     )
     rows = [dict(r) for r in await cur.fetchall()]
-    return [{"id": r["id"], "members": jl(r["member_ids"], [])} for r in rows]
+
+    # Ensure a self-DM exists for the current user so the sidebar always has a
+    # "(You)" scratchpad pinned at the top, matching the MS Teams pattern.
+    me_ids = [user["id"]]
+    has_self = any(jl(r["member_ids"], []) == me_ids for r in rows)
+    if not has_self:
+        did = str(uuid4())
+        await db.execute(
+            "INSERT INTO teams_dms (id, workspace_id, member_ids) VALUES (?,?,?)",
+            (did, user["workspace_id"], js(me_ids)),
+        )
+        await db.commit()
+        rows.insert(0, {"id": did, "member_ids": js(me_ids)})
+
+    out = []
+    for r in rows:
+        last = await _last_message_snapshot(db, dm_id=r["id"])
+        members = jl(r["member_ids"], [])
+        is_self = len(members) == 1 and members[0] == user["id"]
+        out.append({"id": r["id"], "members": members, "isSelf": is_self, **last})
+    return out
 
 
 @router.post("/dms")
 async def create_dm(body: dict, user: dict = Me) -> dict:
     db = await get_db()
-    members = body.get("members", [])
+    members = list({str(m) for m in body.get("members", []) if m})
     if user["id"] not in members:
         members.append(user["id"])
+    # Every member must be in the caller's workspace — otherwise we'd let one
+    # org DM a user in another org. Verify *all* ids resolve; any stranger is
+    # treated as "not found".
+    others = [m for m in members if m != user["id"]]
+    if others:
+        ph = ",".join(["?"] * len(others))
+        cur = await db.execute(
+            f"SELECT id FROM users WHERE workspace_id = ? AND id IN ({ph})",
+            [user["workspace_id"], *others],
+        )
+        found = {str(r["id"]) if isinstance(r, dict) else str(r[0])
+                 for r in await cur.fetchall()}
+        if found != set(others):
+            raise HTTPException(400, "one or more members are not in your organization")
+    # Find-or-create: if a DM with exactly this member set already exists,
+    # reuse it. Without this, two users each clicking "New chat" with each
+    # other would create two parallel DMs and messages would fork by sender.
+    cur = await db.execute(
+        "SELECT id, member_ids FROM teams_dms "
+        "WHERE workspace_id = ? AND member_ids @> ?::jsonb "
+        "AND jsonb_array_length(member_ids) = ?",
+        (user["workspace_id"], js(sorted(members)), len(members)),
+    )
+    for r in await cur.fetchall():
+        r = dict(r)
+        if set(jl(r.get("member_ids"), [])) == set(members):
+            return {"id": r["id"], "members": members}
     did = str(uuid4())
     await db.execute(
         "INSERT INTO teams_dms (id, workspace_id, member_ids) VALUES (?,?,?)",
@@ -119,6 +173,108 @@ async def create_dm(body: dict, user: dict = Me) -> dict:
 async def _is_channel(db, cid: str) -> bool:
     cur = await db.execute("SELECT 1 FROM teams_channels WHERE id = ?", (cid,))
     return bool(await cur.fetchone())
+
+
+async def _assert_conversation_in_workspace(db, cid: str, workspace_id: str,
+                                             user_id: str | None = None) -> bool:
+    """Verify that a channel or DM id belongs to the caller's workspace and
+    return whether it's a channel. Raises 404 otherwise — we never leak the
+    existence of cross-workspace rows. Every teams endpoint that takes a
+    conversation id as a path param must gate on this check, otherwise a
+    user could read / write into another org's chat.
+
+    When `user_id` is provided, DMs additionally require the caller to be a
+    member. Channels are workspace-open so the membership check does not
+    apply there. Without this, any workspace user could post into anyone
+    else's DM (including their self-DM / Notes-to-self)."""
+    cur = await db.execute(
+        "SELECT 1 FROM teams_channels WHERE id = ? AND workspace_id = ?",
+        (cid, workspace_id),
+    )
+    if await cur.fetchone():
+        return True
+    if user_id:
+        cur = await db.execute(
+            "SELECT 1 FROM teams_dms WHERE id = ? AND workspace_id = ? AND member_ids @> ?::jsonb",
+            (cid, workspace_id, js([user_id])),
+        )
+    else:
+        cur = await db.execute(
+            "SELECT 1 FROM teams_dms WHERE id = ? AND workspace_id = ?",
+            (cid, workspace_id),
+        )
+    if await cur.fetchone():
+        return False
+    raise HTTPException(404, "conversation not found")
+
+
+async def _last_message_snapshot(db, *, channel_id: str | None = None,
+                                  dm_id: str | None = None) -> dict:
+    """Return a `{preview, lastAt, lastUserId}` snapshot for list rendering.
+    Preview falls back to attachment shorthand when the message body is empty."""
+    if channel_id:
+        cur = await db.execute(
+            "SELECT text, blocks, attachments, user_id, at FROM teams_messages "
+            "WHERE channel_id = ? ORDER BY at DESC LIMIT 1", (channel_id,),
+        )
+    elif dm_id:
+        cur = await db.execute(
+            "SELECT text, blocks, attachments, user_id, at FROM teams_messages "
+            "WHERE dm_id = ? ORDER BY at DESC LIMIT 1", (dm_id,),
+        )
+    else:
+        return {"preview": "", "lastAt": None, "lastUserId": None}
+    row = await cur.fetchone()
+    if not row:
+        return {"preview": "", "lastAt": None, "lastUserId": None}
+    r = dict(row)
+    preview = (r.get("text") or "").strip()
+    if not preview:
+        for b in jl(r.get("blocks"), []):
+            if b.get("type") == "text" and b.get("value"):
+                preview = b["value"]; break
+            if b.get("type") == "mention":
+                preview = f"@{b.get('name') or 'mention'}"; break
+    if not preview:
+        atts = jl(r.get("attachments"), [])
+        if atts:
+            a = atts[0]
+            k = a.get("kind")
+            if k == "ticket": preview = f"🎫 Shared ticket"
+            elif k == "customer": preview = f"👤 Shared customer"
+            elif k == "image": preview = f"🖼 {a.get('name') or 'Image'}"
+            elif k == "file": preview = f"📎 {a.get('name') or 'File'}"
+    if len(preview) > 80:
+        preview = preview[:77] + "…"
+    return {
+        "preview": preview,
+        "lastAt": _fmt_sidebar_time(r.get("at")),
+        "lastAtIso": r.get("at"),
+        "lastUserId": r.get("user_id"),
+    }
+
+
+def _fmt_sidebar_time(ts) -> str:
+    """MS Teams-style short timestamp for the chat list — `10:42 AM` today,
+    `Yesterday`, `Mon`, or `5/3` for older."""
+    if not ts:
+        return ""
+    try:
+        dt = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local = dt.astimezone()
+    now = datetime.now(local.tzinfo)
+    if local.date() == now.date():
+        return local.strftime("%I:%M %p").lstrip("0")
+    delta_days = (now.date() - local.date()).days
+    if delta_days == 1:
+        return "Yesterday"
+    if delta_days < 7:
+        return local.strftime("%a")
+    return f"{local.month}/{local.day}"
 
 
 # Matches `@Name` and `@First Last` (a second word must itself be Capitalized
@@ -192,6 +348,7 @@ async def _serialize_tmsg(db, m: dict) -> dict:
         "replyTo": reply_to,
         "at": _fmt_team_time(m.get("at")),
         "ts": m["at"],
+        "editedAt": m.get("edited_at"),
         "reactions": reactions,
     }
 
@@ -265,7 +422,7 @@ async def _resolve_channel_mentions(db, workspace_id: str, text: str | None,
 @router.get("/conversations/{cid}/messages")
 async def conversation_messages(cid: str, user: dict = Me) -> list[dict]:
     db = await get_db()
-    is_channel = await _is_channel(db, cid)
+    is_channel = await _assert_conversation_in_workspace(db, cid, user["workspace_id"], user["id"])
     if is_channel:
         cur = await db.execute(
             "SELECT * FROM teams_messages WHERE channel_id = ? ORDER BY at", (cid,)
@@ -282,7 +439,7 @@ async def conversation_messages(cid: str, user: dict = Me) -> list[dict]:
 async def post_team_message(cid: str, body: TeamMessageIn, user: dict = Me) -> dict:
     db = await get_db()
     mid = str(uuid4())
-    is_channel = await _is_channel(db, cid)
+    is_channel = await _assert_conversation_in_workspace(db, cid, user["workspace_id"], user["id"])
     reply_to_id = None
     if body.replyTo:
         # Clients pass the raw id in `replyTo` (wire.md compat) or a snapshot-object
@@ -306,6 +463,25 @@ async def post_team_message(cid: str, body: TeamMessageIn, user: dict = Me) -> d
         msg["tempId"] = body.tempId
 
     await broker.publish(f"teams:{cid}", "team.message.created", msg)
+
+    # Nudge every conversation participant (except the sender) on their
+    # personal teams feed so their left-rail preview + unread badge refresh
+    # without a reload. For channels this is the full workspace roster; for
+    # DMs it's the member list stored on the row.
+    if is_channel:
+        recipients = await _workspace_member_ids(db, user["workspace_id"])
+    else:
+        cur = await db.execute("SELECT member_ids FROM teams_dms WHERE id = ?", (cid,))
+        row = await cur.fetchone()
+        recipients = jl(row.get("member_ids"), []) if row else []
+    for uid in recipients:
+        if uid == user["id"]:
+            continue
+        await broker.publish(
+            f"teams-nudge:{uid}", "teams.conversation.updated",
+            {"conversationId": cid, "kind": "channel" if is_channel else "dm",
+             "fromUserId": user["id"]},
+        )
 
     # Notify anyone mentioned in the message so their bell lights up (spec §3.7).
     mentioned = await _resolve_mentions(db, user["workspace_id"], body.text, body.blocks)
@@ -337,9 +513,88 @@ async def post_team_message(cid: str, body: TeamMessageIn, user: dict = Me) -> d
     return msg
 
 
+@router.patch("/messages/{message_id}")
+async def edit_team_message(message_id: str, body: dict, user: dict = Me) -> dict:
+    """Edit a message's text/blocks. Only the original author can edit."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM teams_messages WHERE id = ? AND workspace_id = ?",
+        (message_id, user["workspace_id"]),
+    )
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "message not found")
+    row = dict(row)
+    if row["user_id"] != user["id"]:
+        raise HTTPException(403, "you can only edit your own messages")
+    new_text = body.get("text")
+    if new_text is None:
+        new_text = row.get("text") or ""
+    new_blocks = body.get("blocks")
+    if not new_blocks:
+        new_blocks = [{"type": "text", "value": new_text}]
+    await db.execute(
+        "UPDATE teams_messages SET text = ?, blocks = ?, edited_at = now() WHERE id = ?",
+        (new_text, js(new_blocks), message_id),
+    )
+    await db.commit()
+    cur = await db.execute("SELECT * FROM teams_messages WHERE id = ?", (message_id,))
+    fresh = dict(await cur.fetchone())
+    msg = await _serialize_tmsg(db, fresh)
+    topic_id = fresh.get("channel_id") or fresh.get("dm_id")
+    if topic_id:
+        await broker.publish(f"teams:{topic_id}", "team.message.updated", msg)
+    return msg
+
+
+@router.delete("/messages/{message_id}")
+async def delete_team_message(message_id: str, user: dict = Me) -> dict:
+    """Delete a message. Authors can always delete their own. In a DM any
+    participant may delete (DMs are private and small), so anyone affected by
+    a stray message — e.g. one posted into their Notes-to-self by a prior
+    cross-DM leak bug — can clean it up themselves. In channels only the
+    author may delete; an admin override isn't modeled here yet."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT * FROM teams_messages WHERE id = ? AND workspace_id = ?",
+        (message_id, user["workspace_id"]),
+    )
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "message not found")
+    row = dict(row)
+    allowed = row["user_id"] == user["id"]
+    if not allowed and row.get("dm_id"):
+        cur = await db.execute(
+            "SELECT 1 FROM teams_dms WHERE id = ? AND workspace_id = ? AND member_ids @> ?::jsonb",
+            (row["dm_id"], user["workspace_id"], js([user["id"]])),
+        )
+        if await cur.fetchone():
+            allowed = True
+    if not allowed:
+        raise HTTPException(403, "not permitted")
+    topic_id = row.get("channel_id") or row.get("dm_id")
+    await db.execute("DELETE FROM teams_messages WHERE id = ?", (message_id,))
+    await db.commit()
+    if topic_id:
+        await broker.publish(
+            f"teams:{topic_id}", "team.message.deleted",
+            {"messageId": message_id},
+        )
+    return {"ok": True}
+
+
 @router.post("/messages/{message_id}/reactions")
 async def toggle_reaction(message_id: str, body: ReactionIn, user: dict = Me) -> dict:
     db = await get_db()
+    # The reaction target must live in the caller's workspace — otherwise a
+    # user could react to messages in another org and fan a broker event there.
+    cur = await db.execute(
+        "SELECT 1 FROM teams_messages WHERE id = ? AND workspace_id = ?",
+        (message_id, user["workspace_id"]),
+    )
+    if not await cur.fetchone():
+        raise HTTPException(404, "message not found")
     cur = await db.execute(
         "SELECT 1 FROM teams_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?",
         (message_id, user["id"], body.emoji),
@@ -372,6 +627,8 @@ async def toggle_reaction(message_id: str, body: ReactionIn, user: dict = Me) ->
 
 @router.post("/typing/{cid}")
 async def typing(cid: str, body: dict | None = None, user: dict = Me) -> dict:
+    db = await get_db()
+    await _assert_conversation_in_workspace(db, cid, user["workspace_id"], user["id"])
     on = (body or {}).get("on", True) if isinstance(body, dict) else True
     await broker.publish(
         f"teams:{cid}", "team.typing",
@@ -387,7 +644,7 @@ async def mark_read(cid: str, user: dict = Me) -> dict:
     """Record the caller's last-read time on a channel or DM so unread badges
     can be derived without O(messages) scans."""
     db = await get_db()
-    is_channel = await _is_channel(db, cid)
+    is_channel = await _assert_conversation_in_workspace(db, cid, user["workspace_id"], user["id"])
     now = _now()
     if is_channel:
         await db.execute(

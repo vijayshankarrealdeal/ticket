@@ -1,0 +1,50 @@
+name: Deploy Langflow (rebranded image)
+
+# Builds deploy/langflow/Dockerfile (langflow + our CSS/JS overlay) in ACR
+# and rolls a new revision on the langflow Container App.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/langflow/**"
+      - ".github/workflows/deploy-langflow.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-langflow-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ vars.ACR_NAME }}.azurecr.io/workspacex-langflow:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build image in ACR
+        run: |
+          az acr build \
+            --registry "${{ vars.ACR_NAME }}" \
+            --image "workspacex-langflow:${{ github.sha }}" \
+            --image "workspacex-langflow:latest" \
+            --file deploy/langflow/Dockerfile \
+            deploy/langflow
+
+      - name: Roll langflow revision
+        run: |
+          az containerapp update \
+            --name "${{ vars.CONTAINERAPP_LANGFLOW }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --image "$IMAGE"

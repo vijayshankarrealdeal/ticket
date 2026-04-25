@@ -62,6 +62,15 @@ export default function AuthPage({ onAuthenticated }) {
     if (!hash.startsWith(marker)) return;
     const params = new URLSearchParams(hash.slice(marker.length));
     const token = params.get('token');
+    const err = params.get('error');
+    if (err === 'email_not_approved') {
+      setBanner({
+        kind: 'error',
+        message: 'This email hasn’t been approved for any organization. Ask your platform administrator to add you.',
+      });
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      return;
+    }
     if (!token) return;
     (async () => {
       try {
@@ -151,11 +160,13 @@ export default function AuthPage({ onAuthenticated }) {
     } catch (err) {
       const message = err?.status === 401
         ? 'Credentials do not match. Please check your email and password.'
-        : err?.status === 409
-          ? 'That email is already registered — try signing in.'
-          : err?.status
-            ? `Unable to sign ${isSignUp ? 'up' : 'in'} (error ${err.status}).`
-            : 'Network error — unable to reach the server. Please try again.';
+        : err?.status === 403
+          ? 'Your email hasn’t been approved for any organization yet. Ask your platform administrator to add you.'
+          : err?.status === 409
+            ? 'That email is already registered — try signing in.'
+            : err?.status
+              ? `Unable to sign ${isSignUp ? 'up' : 'in'} (error ${err.status}).`
+              : 'Network error — unable to reach the server. Please try again.';
       setBanner({ kind: 'error', message });
     } finally {
       setSubmitting(false);

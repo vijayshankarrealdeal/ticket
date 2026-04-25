@@ -233,8 +233,11 @@ CREATE TABLE IF NOT EXISTS teams_messages (
   blocks        jsonb NOT NULL DEFAULT '[]'::jsonb,
   attachments   jsonb NOT NULL DEFAULT '[]'::jsonb,
   reply_to_id   uuid,
+  edited_at     timestamptz,
   CHECK ((channel_id IS NOT NULL) <> (dm_id IS NOT NULL))
 );
+-- Idempotent migration for pre-existing DBs that predate edited_at.
+ALTER TABLE teams_messages ADD COLUMN IF NOT EXISTS edited_at timestamptz;
 CREATE INDEX IF NOT EXISTS teams_messages_channel_idx ON teams_messages (channel_id, at);
 CREATE INDEX IF NOT EXISTS teams_messages_dm_idx ON teams_messages (dm_id, at);
 
@@ -419,6 +422,41 @@ ALTER TABLE workspaces      ADD COLUMN IF NOT EXISTS ai_force_default boolean NO
 ALTER TABLE workspaces      ADD COLUMN IF NOT EXISTS intent_rules jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE workspaces      ADD COLUMN IF NOT EXISTS langflow_folder_id uuid;
 
+-- ---------- platform admins (super-users) ----------
+-- A super-user lives above any single workspace. They create organizations,
+-- pre-authorize the emails that are allowed to sign in to each, and can eject
+-- members. Separate table from `users` because super-users aren't scoped to a
+-- workspace and must not appear in any workspace-level roster.
+CREATE TABLE IF NOT EXISTS platform_admins (
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name           text NOT NULL,
+  email          citext UNIQUE NOT NULL,
+  password_hash  text NOT NULL,
+  created_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS platform_sessions (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  admin_id      uuid NOT NULL REFERENCES platform_admins(id) ON DELETE CASCADE,
+  token_hash    text NOT NULL UNIQUE,
+  expires_at    timestamptz NOT NULL,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS platform_sessions_tokenh_idx ON platform_sessions (token_hash);
+
+-- Per-workspace email allowlist. An email appears on at most one workspace at
+-- a time (UNIQUE on email). The role is pre-assigned by the super-user so new
+-- signups land with the correct privilege level immediately.
+CREATE TABLE IF NOT EXISTS workspace_allowed_emails (
+  email          citext PRIMARY KEY,
+  workspace_id   uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  role           text NOT NULL DEFAULT 'agent',
+  invited_by     uuid REFERENCES platform_admins(id) ON DELETE SET NULL,
+  created_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS workspace_allowed_emails_ws_idx
+  ON workspace_allowed_emails (workspace_id);
+
 -- Agents: Langflow bindings + schemas.
 ALTER TABLE agents          ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'builtin';
 ALTER TABLE agents          ADD COLUMN IF NOT EXISTS langflow_flow_id uuid;
@@ -427,6 +465,11 @@ ALTER TABLE agents          ADD COLUMN IF NOT EXISTS input_schema  jsonb;
 ALTER TABLE agents          ADD COLUMN IF NOT EXISTS output_schema jsonb;
 ALTER TABLE agents          ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES users(id);
 ALTER TABLE agents          ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true;
+-- MinIO key for the durable flow-config snapshot written by `/flow/save-as-agent`.
+-- The Langflow container's own DB is ephemeral in many deploys, so we treat
+-- MinIO as the source of truth; the AgentBuilder chat playground re-hydrates
+-- the flow into Langflow on demand when `langflow_flow_id` 404s.
+ALTER TABLE agents          ADD COLUMN IF NOT EXISTS flow_s3_key text;
 
 -- Tickets: intent classifier columns (spec §3.4.1).
 ALTER TABLE tickets         ADD COLUMN IF NOT EXISTS intent_confidence numeric(3, 2);

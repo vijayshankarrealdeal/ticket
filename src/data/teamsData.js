@@ -52,7 +52,14 @@ export async function loadTeamsData() {
 
   replaceArray(MEMBERS, ordered);
   replaceArray(CHANNELS, Array.isArray(channels) ? channels : channels?.items || []);
-  replaceArray(DMS, Array.isArray(dms) ? dms : dms?.items || []);
+
+  // The backend guarantees a self-DM (members = [me]) and returns it with
+  // `isSelf: true`. Pin it to the top so the current user always sees their
+  // "(You)" scratchpad first, matching the MS Teams sidebar.
+  const rawDms = Array.isArray(dms) ? dms : dms?.items || [];
+  const orderedDms = rawDms.slice().sort((a, b) => (b.isSelf ? 1 : 0) - (a.isSelf ? 1 : 0));
+  replaceArray(DMS, orderedDms);
+
   replaceArray(SHAREABLE_TICKETS, Array.isArray(tickets) ? tickets : tickets?.items || []);
   replaceArray(SHAREABLE_CUSTOMERS, Array.isArray(customers) ? customers : customers?.items || []);
   return { members: MEMBERS, channels: CHANNELS, dms: DMS };

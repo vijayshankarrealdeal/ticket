@@ -206,6 +206,30 @@ async def _run_migrations(db: DB) -> None:
     log.info("applying schema.sql …")
     await db.executescript(SCHEMA_FILE.read_text())
     log.info("schema applied")
+    await _bootstrap_platform_admin(db)
+
+
+async def _bootstrap_platform_admin(db: DB) -> None:
+    """Ensure at least one super-user exists so the platform console is
+    reachable on a fresh install. Credentials come from env (PLATFORM_ADMIN_*)
+    or fall back to a dev default. Idempotent — does nothing once a row
+    exists."""
+    import os
+    from passlib.hash import argon2
+    cur = await db.execute("SELECT COUNT(*) FROM platform_admins")
+    (n,) = (await cur.fetchone()) or (0,)
+    if int(n or 0) > 0:
+        return
+    email = (os.environ.get("PLATFORM_ADMIN_EMAIL") or "superuser@workspacex.com").lower()
+    password = os.environ.get("PLATFORM_ADMIN_PASSWORD") or "superuser"
+    name = os.environ.get("PLATFORM_ADMIN_NAME") or "Platform Admin"
+    from uuid import uuid4 as _uuid
+    await db.execute(
+        "INSERT INTO platform_admins (id, name, email, password_hash) VALUES (?,?,?,?)",
+        (str(_uuid()), name, email, argon2.hash(password)),
+    )
+    await db.commit()
+    log.info("bootstrapped platform admin %s", email)
 
 
 async def _maybe_seed(db: DB) -> None:

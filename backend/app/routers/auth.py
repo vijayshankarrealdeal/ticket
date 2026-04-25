@@ -30,6 +30,19 @@ def _issue_token() -> tuple[str, str]:
     return t, _hash_token(t)
 
 
+async def resolve_allowed_email(db, email: str) -> dict | None:
+    """Look up an email in the workspace allowlist. Super-users pre-authorize
+    every address that's allowed to sign in and pre-assign its role; anything
+    not on the list cannot create an account at all. Returns the matching
+    `{workspace_id, role}` row or None."""
+    cur = await db.execute(
+        "SELECT workspace_id, role FROM workspace_allowed_emails WHERE email = ?",
+        (email,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -88,17 +101,22 @@ async def _create_session(user_id: str, response: Response | None = None) -> str
 @router.post("/signup", response_model=AuthOut)
 async def signup(body: SignupIn, response: Response) -> AuthOut:
     db = await get_db()
-    cur = await db.execute("SELECT 1 FROM users WHERE email = ?", (str(body.email).lower(),))
+    email = str(body.email).lower()
+    cur = await db.execute("SELECT 1 FROM users WHERE email = ?", (email,))
     if await cur.fetchone():
         raise HTTPException(status_code=409, detail="email already registered")
 
-    # Sign-up creates a fresh workspace for this user (first-admin flow).
-    workspace_id = str(uuid4())
-    slug = str(body.email).split("@")[0].lower() + "-" + secrets.token_hex(3)
-    await db.execute(
-        "INSERT INTO workspaces (id, name, slug) VALUES (?,?,?)",
-        (workspace_id, f"{body.name}'s Workspace", slug),
-    )
+    # Allowlist gate — users can't create their own workspace; the super-user
+    # must have added this email to exactly one org first. Role comes from the
+    # allowlist row so admins are also chosen by the super-user.
+    allowed = await resolve_allowed_email(db, email)
+    if not allowed:
+        raise HTTPException(
+            status_code=403,
+            detail="this email has not been approved for any organization — contact your platform administrator",
+        )
+    workspace_id = allowed["workspace_id"]
+    role = allowed.get("role") or "agent"
 
     user_id = str(uuid4())
     await db.execute(
@@ -106,8 +124,8 @@ async def signup(body: SignupIn, response: Response) -> AuthOut:
         INSERT INTO users (id, workspace_id, name, email, password_hash, provider, role)
         VALUES (?,?,?,?,?,?,?)
         """,
-        (user_id, workspace_id, body.name, str(body.email).lower(),
-         argon2.hash(body.password), "password", "admin"),
+        (user_id, workspace_id, body.name, email,
+         argon2.hash(body.password), "password", role),
     )
     await db.commit()
 

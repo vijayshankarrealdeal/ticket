@@ -259,6 +259,174 @@ async def _provision_user_and_folder(db, user: dict) -> tuple[str, str, str | No
     return str(lf_user_id), str(lf_folder_id), new_password
 
 
+async def ensure_flow_alive(db, *, agent_id: str, workspace_id: str) -> str | None:
+    """Guarantee the agent's Langflow flow actually exists in Langflow.
+
+    Langflow's container DB is ephemeral in most deploys — restarting it wipes
+    every flow, leaving a dangling `agents.langflow_flow_id`. MinIO holds the
+    canonical config (written by `/flow/save-as-agent`), so we:
+
+      1. Resolve the owner's LF user id + folder (provision if missing).
+      2. HEAD the stored flow id. If it's alive, return it unchanged.
+      3. Otherwise pull the latest config from MinIO (falling back to the
+         Postgres `agent_flow_snapshots` row) and re-POST it to
+         `/api/v1/flows/`. Update `agents.langflow_flow_id` with whatever id
+         Langflow hands us back so future calls go straight through.
+
+    Returns the live flow id, or None if we can't resurrect it.
+    """
+    if not LANGFLOW_URL:
+        return None
+    cur = await db.execute(
+        """
+        SELECT a.id, a.name, a.langflow_flow_id, a.flow_s3_key, a.workspace_id,
+               a.created_by, w.langflow_folder_id
+          FROM agents a JOIN workspaces w ON w.id = a.workspace_id
+         WHERE a.id = ? AND a.workspace_id = ?
+        """,
+        (agent_id, workspace_id),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return None
+    r = dict(row)
+    current_flow_id = r.get("langflow_flow_id")
+    folder_id = r.get("langflow_folder_id")
+
+    # Resolve the user that owns this flow. Prefer the agent's `created_by`;
+    # fall back to any workspace admin so chat still works when audit metadata
+    # isn't populated (older agents).
+    owner_id = r.get("created_by")
+    owner: dict | None = None
+    if owner_id:
+        cur = await db.execute(
+            "SELECT id, email, workspace_id, role FROM users WHERE id = ?",
+            (owner_id,),
+        )
+        o = await cur.fetchone()
+        owner = dict(o) if o else None
+    if not owner:
+        cur = await db.execute(
+            "SELECT id, email, workspace_id, role FROM users "
+            "WHERE workspace_id = ? AND role IN ('admin','owner') LIMIT 1",
+            (workspace_id,),
+        )
+        o = await cur.fetchone()
+        owner = dict(o) if o else None
+    if not owner:
+        log.warning("ensure_flow_alive: no owner user for workspace %s", workspace_id)
+        return None
+
+    # Provision (idempotent) so we always have a user+folder even when this is
+    # the first time we've touched this workspace since a Langflow wipe.
+    try:
+        lf_user_id, lf_folder_id, _ = await _provision_user_and_folder(db, owner)
+    except HTTPException:
+        raise
+    except Exception:
+        log.exception("ensure_flow_alive: provisioning raised")
+        return None
+    folder_id = folder_id or lf_folder_id
+
+    admin_bearer = await _superuser_bearer()
+    if not admin_bearer:
+        return current_flow_id
+
+    try:
+        import httpx  # type: ignore
+    except ImportError:
+        return current_flow_id
+
+    async with httpx.AsyncClient(
+        timeout=15,
+        headers={"Authorization": f"Bearer {admin_bearer}",
+                 "Content-Type": "application/json"},
+    ) as client:
+        # HEAD the existing flow; 200 means Langflow still has it.
+        if current_flow_id:
+            try:
+                resp = await client.get(f"{LANGFLOW_URL}/api/v1/flows/{current_flow_id}")
+                if resp.status_code < 400:
+                    return str(current_flow_id)
+            except Exception:
+                pass
+
+        # Load the saved config — MinIO first, DB snapshot as fallback.
+        config = None
+        try:
+            from ..s3 import get_json as _s3_get_json
+            key = r.get("flow_s3_key") or f"flows/{workspace_id}/{agent_id}/latest.json"
+            config = _s3_get_json(key)
+        except Exception:
+            log.exception("ensure_flow_alive: minio read raised")
+
+        if not config:
+            cur = await db.execute(
+                "SELECT flow_json, version FROM agent_flow_snapshots "
+                "WHERE agent_id = ? ORDER BY version DESC LIMIT 1",
+                (agent_id,),
+            )
+            snap = await cur.fetchone()
+            if snap:
+                s = dict(snap)
+                raw = s.get("flow_json")
+                try:
+                    config = {"data": json.loads(raw) if isinstance(raw, str) else raw,
+                              "version": s.get("version")}
+                except Exception:
+                    config = {"data": raw or {}, "version": s.get("version")}
+
+        if not config or not isinstance(config, dict):
+            log.warning("ensure_flow_alive: no stored config for %s", agent_id)
+            return None
+
+        flow_body = {
+            "name": config.get("name") or r.get("name") or f"Flow {agent_id[:8]}",
+            "description": f"Rehydrated from MinIO for agent {agent_id}",
+            "folder_id": folder_id,
+            "user_id": lf_user_id,
+            "data": config.get("data") or {},
+            "is_component": False,
+        }
+
+        # Try restoring at the original id first so the run url stays stable.
+        new_flow_id: str | None = None
+        if current_flow_id:
+            try:
+                put = await client.request(
+                    "POST",
+                    f"{LANGFLOW_URL}/api/v1/flows/",
+                    json={**flow_body, "id": current_flow_id},
+                )
+                if put.status_code < 400:
+                    body = put.json() or {}
+                    new_flow_id = body.get("id") or current_flow_id
+            except Exception:
+                pass
+        if not new_flow_id:
+            try:
+                post = await client.post(f"{LANGFLOW_URL}/api/v1/flows/", json=flow_body)
+                if post.status_code < 400:
+                    new_flow_id = (post.json() or {}).get("id")
+                else:
+                    log.warning("ensure_flow_alive: restore failed %s %s",
+                                post.status_code, post.text[:200])
+            except Exception:
+                log.exception("ensure_flow_alive: restore raised")
+
+        if not new_flow_id:
+            return None
+
+    if new_flow_id != current_flow_id:
+        await db.execute(
+            "UPDATE agents SET langflow_flow_id = ?, langflow_folder_id = ? "
+            "WHERE id = ? AND workspace_id = ?",
+            (new_flow_id, folder_id, agent_id, workspace_id),
+        )
+        await db.commit()
+    return str(new_flow_id)
+
+
 async def _ensure_agent_flow(db, *, agent_id: str, workspace_id: str,
                               lf_user_id: str, lf_folder_id: str) -> str | None:
     """Create a blank Langflow flow for this agent if it doesn't have one
@@ -683,6 +851,33 @@ async def apply_flow_publish(
         (str(uuid4()), agent_id, version, js(data or {}),
          flow_id, folder_id, version),
     )
+
+    # 3b) Durable snapshot in MinIO. Langflow's own DB is ephemeral in most
+    # deploys, so we treat MinIO as the source of truth — the Agent Builder
+    # chat playground rehydrates this back into Langflow on demand when the
+    # stored `langflow_flow_id` 404s. The config blob is small (nodes + edges
+    # + viewport), well under MinIO's object-size limits.
+    try:
+        from ..s3 import put_json as _s3_put_json
+        s3_payload = {
+            "flowId": str(flow_id),
+            "folderId": folder_id,
+            "version": version,
+            "name": name,
+            "data": data or {},
+            "savedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        latest_key = f"flows/{ws_id}/{agent_id}/latest.json"
+        versioned_key = f"flows/{ws_id}/{agent_id}/v{version}.json"
+        _s3_put_json(versioned_key, s3_payload)
+        stored_key = _s3_put_json(latest_key, s3_payload)
+        if stored_key:
+            await db.execute(
+                "UPDATE agents SET flow_s3_key = ? WHERE id = ?",
+                (stored_key, agent_id),
+            )
+    except Exception:
+        log.exception("apply_flow_publish: minio snapshot failed (non-fatal)")
 
     # 4) Flow-as-a-tool: keep an `apis` row pointed at this flow so the
     # orchestrator / other agents can invoke it as `run_library_api("flow:<name>")`

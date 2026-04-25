@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Icon } from '../../components/Icons.jsx';
 import { Spinner } from '../../components/Spinner.jsx';
+import ConnectorModal from '../../components/ConnectorModal.jsx';
 import { api } from '../../api.js';
 
 const CATEGORIES = [
@@ -16,21 +17,27 @@ export default function ChannelsOverview() {
   const [cat, setCat] = useState('all');
   const [items, setItems] = useState([]);
   const [initialLoading, setInitialLoading] = useState(true);
+  // The ConnectorModal handles non-OAuth credential entry. OAuth channels
+  // (Gmail, Outlook) still go through the provider consent redirect below.
+  const [connector, setConnector] = useState(null);
+
+  const reload = async () => {
+    try {
+      const res = await api.get('/platforms?include=all');
+      const rows = Array.isArray(res) ? res : res?.items || [];
+      const normalized = rows.map((r) => ({
+        ...r,
+        _group: r._group || r.group || (r.category?.toLowerCase().includes('ship') ? 'shipping' : r.category?.toLowerCase().includes('commerce') || r.category?.toLowerCase().includes('oms') ? 'ecommerce' : 'messaging'),
+      }));
+      setItems(normalized);
+    } catch {
+      setItems([]);
+    }
+  };
 
   useEffect(() => {
     let alive = true;
-    api.get('/platforms?include=all')
-      .then((res) => {
-        if (!alive) return;
-        const rows = Array.isArray(res) ? res : res?.items || [];
-        const normalized = rows.map((r) => ({
-          ...r,
-          _group: r._group || r.group || (r.category?.toLowerCase().includes('ship') ? 'shipping' : r.category?.toLowerCase().includes('commerce') || r.category?.toLowerCase().includes('oms') ? 'ecommerce' : 'messaging'),
-        }));
-        setItems(normalized);
-      })
-      .catch(() => { if (alive) setItems([]); })
-      .finally(() => { if (alive) setInitialLoading(false); });
+    reload().finally(() => { if (alive) setInitialLoading(false); });
     return () => { alive = false; };
   }, []);
 
@@ -63,35 +70,42 @@ export default function ChannelsOverview() {
 
   const OAUTH_CHANNELS = { gmail: 'google', outlook: 'outlook' };
 
-  const toggle = async (id) => {
-    const p = items.find((x) => x.id === id);
-    if (!p) return;
+  const startOAuth = (id) => {
     // OAuth channels: redirect through /auth/oauth/<provider>/start so the
     // real token exchange happens (Platforms.jsx uses the same flow).
-    if (p.status !== 'connected' && OAUTH_CHANNELS[id]) {
-      // Redirect cross-origin through the OAuth starter. Ship the bearer
-      // token on the URL so the backend can identify which workspace to
-      // bind the channel to (the wx_session cookie is scoped to :5173 and
-      // wouldn't reach :8000).
-      const base = import.meta.env.VITE_API_URL || '/api';
-      let token = '';
-      try {
-        const auth = JSON.parse(localStorage.getItem('workspacex.auth') || '{}');
-        token = auth.token || auth.accessToken || '';
-      } catch {}
-      const returnTo = window.location.origin + window.location.pathname;
-      const qs = new URLSearchParams({ mode: 'connect', return_to: returnTo, token }).toString();
-      window.location.href = `${base}/auth/oauth/${OAUTH_CHANNELS[id]}/start?${qs}`;
+    const base = import.meta.env.VITE_API_URL || '/api';
+    let token = '';
+    try {
+      const auth = JSON.parse(localStorage.getItem('workspacex.auth') || '{}');
+      token = auth.token || auth.accessToken || '';
+    } catch {}
+    const returnTo = window.location.origin + window.location.pathname;
+    const qs = new URLSearchParams({ mode: 'connect', return_to: returnTo, token }).toString();
+    window.location.href = `${base}/auth/oauth/${OAUTH_CHANNELS[id]}/start?${qs}`;
+  };
+
+  const connect = (item) => {
+    // Brand-new OAuth connect (no creds yet) goes straight to the consent
+    // page. Once connected, the Manage button reuses the same modal to show
+    // account details + sync controls.
+    if (OAUTH_CHANNELS[item.id] && item.status !== 'connected') {
+      startOAuth(item.id);
       return;
     }
-    const endpoint = p.status === 'connected' ? 'disconnect' : 'connect';
-    try { await api.post(`/platforms/${encodeURIComponent(id)}/${endpoint}`); } catch {}
+    setConnector(item);
+  };
+
+  const manage = (item) => {
+    // Connected channels — OAuth or API-key — both open the modal. The
+    // backend's /platforms/:id/schema picks the right shape (oauth detail
+    // panel vs. credential form).
+    setConnector(item);
+  };
+
+  const disconnect = async (id) => {
+    try { await api.post(`/platforms/${encodeURIComponent(id)}/disconnect`); } catch {}
     setItems((prev) =>
-      prev.map((q) =>
-        q.id === id
-          ? { ...q, status: q.status === 'connected' ? 'available' : 'connected' }
-          : q,
-      ),
+      prev.map((q) => (q.id === id ? { ...q, status: 'available' } : q)),
     );
   };
 
@@ -166,7 +180,13 @@ export default function ChannelsOverview() {
           hint="Send broadcasts, capture conversations and route tickets from these channels."
         >
           {msgList.map((it) => (
-            <ChannelCard key={it.id} item={it} onToggle={() => toggle(it.id)} />
+            <ChannelCard
+              key={it.id}
+              item={it}
+              onConnect={() => connect(it)}
+              onManage={() => manage(it)}
+              onDisconnect={() => disconnect(it.id)}
+            />
           ))}
         </Section>
       )}
@@ -174,7 +194,13 @@ export default function ChannelsOverview() {
       {(cat === 'all' || cat === 'ecommerce' || cat === 'connected') && ecomList.length > 0 && (
         <Section title="E-commerce Channels" icon={Icon.Store} count={ecomList.length}>
           {ecomList.map((it) => (
-            <ChannelCard key={it.id} item={it} onToggle={() => toggle(it.id)} />
+            <ChannelCard
+              key={it.id}
+              item={it}
+              onConnect={() => connect(it)}
+              onManage={() => manage(it)}
+              onDisconnect={() => disconnect(it.id)}
+            />
           ))}
         </Section>
       )}
@@ -182,7 +208,13 @@ export default function ChannelsOverview() {
       {(cat === 'all' || cat === 'shipping' || cat === 'connected') && shipList.length > 0 && (
         <Section title="Shipping Partners" icon={Icon.Truck} count={shipList.length}>
           {shipList.map((it) => (
-            <ChannelCard key={it.id} item={it} onToggle={() => toggle(it.id)} />
+            <ChannelCard
+              key={it.id}
+              item={it}
+              onConnect={() => connect(it)}
+              onManage={() => manage(it)}
+              onDisconnect={() => disconnect(it.id)}
+            />
           ))}
         </Section>
       )}
@@ -198,6 +230,14 @@ export default function ChannelsOverview() {
             Clear filters
           </button>
         </div>
+      )}
+
+      {connector && (
+        <ConnectorModal
+          platform={connector}
+          onClose={() => setConnector(null)}
+          onSaved={() => { reload(); }}
+        />
       )}
     </div>
   );
@@ -221,7 +261,7 @@ function Section({ title, icon: I, count, children, hint }) {
   );
 }
 
-function ChannelCard({ item, onToggle }) {
+function ChannelCard({ item, onConnect, onManage, onDisconnect }) {
   const connected = item.status === 'connected';
   return (
     <div className={'ch-card' + (connected ? ' is-connected' : '')}>
@@ -255,14 +295,14 @@ function ChannelCard({ item, onToggle }) {
       <div className="ch-card-actions">
         {connected ? (
           <>
-            <button className="btn secondary sm">Manage</button>
-            <button className="btn ghost sm" onClick={onToggle}>
+            <button className="btn secondary sm" onClick={onManage}>Manage</button>
+            <button className="btn ghost sm" onClick={onDisconnect}>
               Disconnect
             </button>
           </>
         ) : (
           <>
-            <button className="btn sm" onClick={onToggle}>
+            <button className="btn sm" onClick={onConnect}>
               Connect
             </button>
             <button className="btn ghost sm">

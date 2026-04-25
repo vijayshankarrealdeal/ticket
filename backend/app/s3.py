@@ -83,6 +83,38 @@ def ensure_bucket() -> None:
         log.warning("could not ensure minio bucket: %s", e)
 
 
+def put_json(key: str, payload: Any) -> str | None:
+    """PUT a JSON payload directly via the server-side S3 client. Returns the
+    bucket key on success, None on any failure (MinIO unreachable, auth, etc).
+    Used for durable flow-config storage — the Agent Builder chat playground
+    re-hydrates these back into Langflow when a restart wipes its DB.
+    """
+    try:
+        c = _client()
+        body = json.dumps(payload or {}).encode("utf-8")
+        c.put_object(
+            Bucket=S3_BUCKET, Key=key, Body=body,
+            ContentType="application/json",
+        )
+        return key
+    except (BotoCoreError, ClientError, Exception) as e:
+        log.warning("s3 put_json(%s) failed: %s", key, e)
+        return None
+
+
+def get_json(key: str) -> Any | None:
+    """GET a JSON payload previously written with `put_json`. Returns the
+    parsed object or None if missing / unreadable."""
+    try:
+        c = _client()
+        obj = c.get_object(Bucket=S3_BUCKET, Key=key)
+        body = obj["Body"].read()
+        return json.loads(body.decode("utf-8"))
+    except (BotoCoreError, ClientError, Exception) as e:
+        log.info("s3 get_json(%s) miss: %s", key, e)
+        return None
+
+
 def presign_put(key: str, content_type: str | None = None) -> dict:
     """Return {upload_url, public_url, key, expires_in} for a direct browser PUT.
 

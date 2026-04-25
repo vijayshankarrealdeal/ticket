@@ -73,9 +73,32 @@ async def search(q: str = Query(""), limit: int = 8, user: dict = Me) -> dict:
             "subtitle": r["email"] or r["phone"] or "",
         })
 
+    # Teammates (workspace members) so the top-bar search can start a DM with
+    # anyone in the org. We exclude the caller — searching yourself and then
+    # hitting Enter would just open your own notes-to-self, which is not what
+    # people expect from this action.
+    cur = await db.execute(
+        """
+        SELECT id, name, email, role FROM users
+        WHERE workspace_id = ? AND id <> ? AND (name ILIKE ? OR email ILIKE ?)
+        ORDER BY name
+        LIMIT ?
+        """,
+        (user["workspace_id"], user["id"], like, like, limit),
+    )
+    teammates = []
+    for r in [dict(x) for x in await cur.fetchall()]:
+        teammates.append({
+            "type": "teammate",
+            "id": r["id"],
+            "title": r["name"] or r["email"] or "Teammate",
+            "subtitle": r["role"] or r["email"] or "",
+        })
+
     return {
         "conversations": conversations,
         "tickets": tickets,
         "contacts": contacts,
-        "total": len(conversations) + len(tickets) + len(contacts),
+        "teammates": teammates,
+        "total": len(conversations) + len(tickets) + len(contacts) + len(teammates),
     }

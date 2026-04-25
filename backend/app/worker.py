@@ -261,33 +261,59 @@ async def _send_gmail(db, payload: dict) -> tuple[bool, str | None]:
 
 async def _send_outlook(db, payload: dict) -> tuple[bool, str | None]:
     """Microsoft Graph `/me/sendMail`. Requires a connected Outlook credential
-    with `Mail.Send` scope."""
-    creds = await _load_credentials(db, payload.get("workspace_id"), "outlook")
-    token = (creds.get("secrets") or {}).get("access_token")
+    with `Mail.Send` scope. Auto-refreshes the access token on 401 using the
+    stored refresh_token (matches the Gmail self-healing path)."""
+    cur = await db.execute(
+        """
+        SELECT id, secrets, meta FROM platform_credentials
+         WHERE workspace_id = ? AND provider = 'outlook' AND status = 'active'
+         ORDER BY created_at DESC LIMIT 1
+        """,
+        (payload.get("workspace_id"),),
+    )
+    cred_row = dict(await cur.fetchone() or {})
+    secrets_blob = jl(cred_row.get("secrets"), {}) or {}
+    meta = jl(cred_row.get("meta"), {}) or {}
+    token = secrets_blob.get("access_token")
+    refresh = secrets_blob.get("refresh_token")
     to = payload.get("to") or payload.get("email")
     if not to:
         return False, "missing recipient"
     if not token or token.startswith("dev_"):
         return await _smtp_send({**payload, "to": to})
-    try:
+
+    sender = meta.get("email")
+    msg = {
+        "message": {
+            "subject": payload.get("subject") or "",
+            "body": {"contentType": "Text", "content": payload.get("body") or ""},
+            "toRecipients": [{"emailAddress": {"address": to}}],
+        },
+        "saveToSentItems": True,
+    }
+    if sender:
+        msg["message"]["from"] = {"emailAddress": {"address": sender}}
+
+    async def _do_send(access_token: str) -> tuple[int, str]:
         import httpx  # type: ignore
-        msg = {
-            "message": {
-                "subject": payload.get("subject") or "",
-                "body": {"contentType": "Text", "content": payload.get("body") or ""},
-                "toRecipients": [{"emailAddress": {"address": to}}],
-            },
-            "saveToSentItems": True,
-        }
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 "https://graph.microsoft.com/v1.0/me/sendMail",
-                headers={"Authorization": f"Bearer {token}",
+                headers={"Authorization": f"Bearer {access_token}",
                          "Content-Type": "application/json"},
                 json=msg,
             )
-        if resp.status_code >= 400:
-            return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        return resp.status_code, resp.text
+
+    try:
+        status, txt = await _do_send(token)
+        if status == 401 and refresh and cred_row.get("id"):
+            from .channels.outlook_poller import _refresh_access_token
+            new_token = await _refresh_access_token(db, cred_row["id"], refresh)
+            if new_token:
+                status, txt = await _do_send(new_token)
+        if status >= 400:
+            return False, f"HTTP {status}: {txt[:200]}"
         return True, None
     except ImportError:
         return True, "httpx not installed"
@@ -389,6 +415,113 @@ async def _send_sms(db, payload: dict) -> tuple[bool, str | None]:
         return False, repr(e)[:300]
 
 
+async def _send_telegram(db, payload: dict) -> tuple[bool, str | None]:
+    """Telegram Bot API `/sendMessage`. Bot token + target chat id come from
+    `platform_credentials(provider='telegram')` and the payload's `to` field
+    (customer.psid stores the chat id on inbound ingest)."""
+    creds = await _load_credentials(db, payload.get("workspace_id"), "telegram")
+    token = (creds.get("secrets") or {}).get("bot_token")
+    to = payload.get("to") or payload.get("psid") or payload.get("chat_id")
+    text = payload.get("text") or payload.get("body") or ""
+    if not to or not text:
+        return False, "missing to/text"
+    if not token:
+        return True, "telegram creds missing (logged to delivery_log)"
+    try:
+        import httpx  # type: ignore
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": to, "text": text,
+                      "parse_mode": payload.get("parse_mode") or None,
+                      "disable_web_page_preview": True},
+            )
+        if resp.status_code >= 400:
+            return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        return True, None
+    except ImportError:
+        return True, "httpx not installed"
+    except Exception as e:
+        return False, repr(e)[:300]
+
+
+async def _send_messenger(db, payload: dict) -> tuple[bool, str | None]:
+    """Facebook Messenger `/messages` endpoint. Uses the stored Page access
+    token + recipient PSID."""
+    creds = await _load_credentials(db, payload.get("workspace_id"), "messenger")
+    token = ((creds.get("secrets") or {}).get("page_access_token")
+             or os.environ.get("MESSENGER_PAGE_ACCESS_TOKEN"))
+    page_id = ((creds.get("meta") or {}).get("page_id")
+               or creds.get("account_id")
+               or os.environ.get("MESSENGER_PAGE_ID"))
+    to = payload.get("to") or payload.get("psid")
+    text = payload.get("text") or payload.get("body") or ""
+    if not to or not text:
+        return False, "missing to/text"
+    if not token or not page_id:
+        return True, "messenger creds missing (logged to delivery_log)"
+    try:
+        import httpx  # type: ignore
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://graph.facebook.com/v18.0/{page_id}/messages",
+                params={"access_token": token},
+                json={"recipient": {"id": to},
+                      "message": {"text": text},
+                      "messaging_type": "RESPONSE"},
+            )
+        if resp.status_code >= 400:
+            return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        return True, None
+    except ImportError:
+        return True, "httpx not installed"
+    except Exception as e:
+        return False, repr(e)[:300]
+
+
+async def _send_imap_smtp(db, payload: dict) -> tuple[bool, str | None]:
+    """SMTP outbound for the generic IMAP/SMTP connector. Reads host / port /
+    credentials from `platform_credentials(provider='imap_smtp')`. Falls back
+    to the env-configured relay when there's no connector row."""
+    creds = await _load_credentials(db, payload.get("workspace_id"), "imap_smtp")
+    meta = creds.get("meta") or {}
+    secrets_blob = creds.get("secrets") or {}
+    host = meta.get("smtp_host")
+    port = int(meta.get("smtp_port") or 587)
+    email_addr = meta.get("email")
+    password = secrets_blob.get("password")
+    use_ssl = meta.get("use_ssl", True)
+    if not host or not email_addr or not password:
+        return await _smtp_send(payload)
+    to = payload.get("to") or payload.get("email")
+    subject = payload.get("subject") or ""
+    body = payload.get("body") or payload.get("text") or ""
+    if not to:
+        return False, "missing recipient"
+    try:
+        import aiosmtplib  # type: ignore
+        from email.message import EmailMessage
+        msg = EmailMessage()
+        msg["From"] = email_addr
+        msg["To"] = to
+        msg["Subject"] = subject
+        if payload.get("in_reply_to"):
+            msg["In-Reply-To"] = payload["in_reply_to"]
+            msg["References"] = payload["in_reply_to"]
+        msg.set_content(body)
+        await aiosmtplib.send(
+            msg, hostname=host, port=port,
+            username=email_addr, password=password,
+            start_tls=port == 587 and use_ssl,
+            use_tls=port == 465 and use_ssl,
+        )
+        return True, None
+    except ImportError:
+        return True, "aiosmtplib not installed (logged to delivery_log)"
+    except Exception as e:
+        return False, repr(e)[:300]
+
+
 async def _dispatch_outbox_row(db, row: dict) -> tuple[bool, str | None]:
     """Return (sent_ok, error). Each `kind` maps to an adapter; unknown kinds
     fail-fast so the dispatcher routes them to the dead-letter pile after the
@@ -433,6 +566,21 @@ async def _dispatch_outbox_row(db, row: dict) -> tuple[bool, str | None]:
 
     if kind == "send_sms":
         ok, err = await _send_sms(db, payload)
+        await _record_delivery(db, kind, payload, ok, err)
+        return ok, err
+
+    if kind == "send_telegram":
+        ok, err = await _send_telegram(db, payload)
+        await _record_delivery(db, kind, payload, ok, err)
+        return ok, err
+
+    if kind == "send_messenger":
+        ok, err = await _send_messenger(db, payload)
+        await _record_delivery(db, kind, payload, ok, err)
+        return ok, err
+
+    if kind == "send_imap_smtp":
+        ok, err = await _send_imap_smtp(db, payload)
         await _record_delivery(db, kind, payload, ok, err)
         return ok, err
 
@@ -946,6 +1094,53 @@ async def _gmail_poller_tick() -> None:
         log.exception("gmail poller tick crashed")
 
 
+async def _outlook_poller_tick() -> None:
+    """Pull unread mail from every connected Outlook mailbox every 30 s.
+    Same rationale as the Gmail poller — Graph push subscriptions need a
+    public HTTPS URL we don't have on localhost dev. Self-heals 401s by
+    exchanging the stored refresh_token for a fresh access token."""
+    try:
+        from .channels.outlook_poller import poll_all_outlook_accounts
+        result = await poll_all_outlook_accounts()
+        if result.get("ingested"):
+            log.info("outlook poller: ingested=%s fetched=%s",
+                     result["ingested"], result["fetched"])
+        for err in result.get("errors") or []:
+            log.warning("outlook poller error: %s", err)
+    except Exception:
+        log.exception("outlook poller tick crashed")
+
+
+async def _telegram_poller_tick() -> None:
+    """Pull updates from every connected Telegram bot every 10 s. Bots that
+    opted into webhook delivery (`meta.webhook_secret` set) are skipped so we
+    don't double-ingest."""
+    try:
+        from .channels.telegram_poller import poll_all_telegram_bots
+        result = await poll_all_telegram_bots()
+        if result.get("ingested"):
+            log.info("telegram poller: ingested=%s fetched=%s",
+                     result["ingested"], result["fetched"])
+        for err in result.get("errors") or []:
+            log.warning("telegram poller error: %s", err)
+    except Exception:
+        log.exception("telegram poller tick crashed")
+
+
+async def _imap_poller_tick() -> None:
+    """Pull unread mail from every IMAP/SMTP mailbox every 60 s."""
+    try:
+        from .channels.imap_poller import poll_all_imap_mailboxes
+        result = await poll_all_imap_mailboxes()
+        if result.get("ingested"):
+            log.info("imap poller: ingested=%s fetched=%s",
+                     result["ingested"], result["fetched"])
+        for err in result.get("errors") or []:
+            log.warning("imap poller error: %s", err)
+    except Exception:
+        log.exception("imap poller tick crashed")
+
+
 async def _watch_renewer_tick() -> None:
     """Hourly sweep that keeps Gmail / Outlook / Shopify push subscriptions
     alive. Real provider calls only fire when the relevant env vars are set
@@ -1251,6 +1446,9 @@ async def main() -> None:
         asyncio.create_task(_run_loop(_idempotency_cleanup_tick, 900,  stop, "idem_cleanup")),
         asyncio.create_task(_run_loop(_oauth_state_cleanup_tick, 600,  stop, "oauth_cleanup")),
         asyncio.create_task(_run_loop(_gmail_poller_tick,         30,  stop, "gmail_poller")),
+        asyncio.create_task(_run_loop(_outlook_poller_tick,       30,  stop, "outlook_poller")),
+        asyncio.create_task(_run_loop(_telegram_poller_tick,      10,  stop, "telegram_poller")),
+        asyncio.create_task(_run_loop(_imap_poller_tick,          60,  stop, "imap_poller")),
         asyncio.create_task(_run_loop(_shopify_backfill_tick,   3600,  stop, "shopify_backfill")),
         asyncio.create_task(_run_loop(_embedding_indexer_tick,    60,  stop, "embedding_indexer")),
         asyncio.create_task(_run_loop(_watch_renewer_tick,      3600,  stop, "watch_renewer")),

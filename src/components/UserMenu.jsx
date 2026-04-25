@@ -5,6 +5,7 @@ import { Icon } from './Icons.jsx';
 import { useDelayUnmount } from '../hooks/useDelayUnmount.js';
 import { clearAuth, loadAuth } from '../pages/AuthPage.jsx';
 import { closeRealtime } from '../hooks/useRealtime.js';
+import { usePresenceStatus, PRESENCE_LABELS } from '../hooks/usePresenceStatus.js';
 
 const AVATAR_PALETTE = [
   { bg: '#eef2ff', fg: '#4338ca' },
@@ -43,10 +44,13 @@ export default function UserMenu({
   email = email || stored?.email || 'jane@thesleepcompany.in';
   const [open, setOpen] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [statusOpen, setStatusOpen] = useState(false);
+  const [status, setStatus] = usePresenceStatus();
   const wrapRef = useRef(null);
   const navigate = useNavigate();
   const panel = useDelayUnmount(open, 200);
   const confirmPanel = useDelayUnmount(confirming, 200);
+  const statusPanel = useDelayUnmount(statusOpen, 160);
   const confirmBtnRef = useRef(null);
 
   const initials = getInitials(name);
@@ -55,15 +59,27 @@ export default function UserMenu({
   useEffect(() => {
     if (!open) return;
     const onDown = (e) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) {
+        setOpen(false);
+        setStatusOpen(false);
+      }
     };
-    const onKey = (e) => e.key === 'Escape' && setOpen(false);
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        if (statusOpen) setStatusOpen(false);
+        else setOpen(false);
+      }
+    };
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
     return () => {
       document.removeEventListener('mousedown', onDown);
       document.removeEventListener('keydown', onKey);
     };
+  }, [open, statusOpen]);
+
+  useEffect(() => {
+    if (!open) setStatusOpen(false);
   }, [open]);
 
   useEffect(() => {
@@ -98,6 +114,11 @@ export default function UserMenu({
     window.location.reload();
   };
 
+  const pickStatus = (next) => {
+    setStatus(next);
+    setStatusOpen(false);
+  };
+
   return (
     <div className="user-menu-wrap" ref={wrapRef}>
       <button
@@ -109,6 +130,10 @@ export default function UserMenu({
         aria-haspopup="menu"
       >
         <Avatar name={name} initials={initials} image={image} color={color} size={30} />
+        <span
+          className={`user-avatar-status-dot team-status-${status}`}
+          aria-hidden="true"
+        />
       </button>
       {panel.mounted && (
         <div
@@ -124,6 +149,44 @@ export default function UserMenu({
               {role && <div className="user-menu-role">{role}</div>}
             </div>
           </div>
+          <div className="user-menu-sep" />
+          <button
+            className="user-menu-item user-menu-status-trigger"
+            onClick={() => setStatusOpen((v) => !v)}
+            role="menuitem"
+            aria-haspopup="menu"
+            aria-expanded={statusOpen}
+          >
+            <span className={`user-menu-status-dot team-status-${status}`} />
+            <span className="user-menu-item-label">{PRESENCE_LABELS[status]}</span>
+            <ChevronIcon open={statusOpen} />
+          </button>
+          {statusPanel.mounted && (
+            <div
+              className={
+                'user-menu-status-list' +
+                (statusPanel.state === 'exiting' ? ' closing' : '')
+              }
+              role="menu"
+            >
+              {Object.entries(PRESENCE_LABELS).map(([key, label]) => (
+                <button
+                  key={key}
+                  className={
+                    'user-menu-item user-menu-status-option' +
+                    (status === key ? ' active' : '')
+                  }
+                  onClick={() => pickStatus(key)}
+                  role="menuitemradio"
+                  aria-checked={status === key}
+                >
+                  <span className={`user-menu-status-dot team-status-${key}`} />
+                  <span className="user-menu-item-label">{label}</span>
+                  {status === key && <CheckIcon />}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="user-menu-sep" />
           <button className="user-menu-item" onClick={goProfile} role="menuitem">
             <Icon.User />
@@ -208,6 +271,42 @@ function Avatar({ name, initials, image, color, size }) {
     >
       {initials}
     </span>
+  );
+}
+
+function ChevronIcon({ open }) {
+  return (
+    <svg
+      className={'user-menu-chevron' + (open ? ' open' : '')}
+      viewBox="0 0 24 24"
+      width="14"
+      height="14"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M9 18l6-6-6-6" />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg
+      className="user-menu-check"
+      viewBox="0 0 24 24"
+      width="14"
+      height="14"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M20 6L9 17l-5-5" />
+    </svg>
   );
 }
 

@@ -324,6 +324,166 @@ async def instagram_inbound(
 
 
 # ============================================================================
+# Facebook Messenger (spec §6.4) — Meta Page webhook `messaging` field
+# ============================================================================
+
+@router.get("/webhooks/messenger")
+async def messenger_verify(
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+) -> Response:
+    expected = _env("MESSENGER_VERIFY_TOKEN", "META_VERIFY_TOKEN") or "workspacex"
+    if hub_mode == "subscribe" and hub_verify_token == expected:
+        return Response(content=hub_challenge or "", media_type="text/plain")
+    raise HTTPException(403, "verify token mismatch")
+
+
+@router.post("/webhooks/messenger")
+async def messenger_inbound(
+    request: Request,
+    x_hub_signature_256: str | None = Header(default=None, alias="X-Hub-Signature-256"),
+) -> dict:
+    raw = await request.body()
+    secret = _env("MESSENGER_APP_SECRET", "META_APP_SECRET")
+    if secret and not _verify_hmac(secret, raw, x_hub_signature_256 or ""):
+        raise HTTPException(403, "invalid signature")
+    payload = json.loads(raw or b"{}")
+    delivered = []
+    for entry in payload.get("entry", []) or []:
+        page_id = entry.get("id")
+        ws_id = await _default_workspace_for("messenger", page_id)
+        if not ws_id:
+            continue
+        await _rl_guard("messenger", ws_id)
+        for m in entry.get("messaging", []) or []:
+            sender = (m.get("sender") or {}).get("id")
+            text = (m.get("message") or {}).get("text") or ""
+            if not sender or not text:
+                continue
+            customer_id = await resolve_or_create_customer(
+                workspace_id=ws_id, psid=sender, name=f"FB {sender[-4:]}",
+            )
+            conv_id = await resolve_or_create_conversation(
+                workspace_id=ws_id, customer_id=customer_id, channel="messenger",
+            )
+            res = await ingest_inbound_message(
+                workspace_id=ws_id, conversation_id=conv_id, text=text,
+                from_name=f"Messenger {sender[-4:]}",
+                external_message_id=(m.get("message") or {}).get("mid"),
+            )
+            delivered.append(res["message"]["id"])
+    return {"ok": True, "received": len(delivered)}
+
+
+# ============================================================================
+# Telegram Bot (spec §6) — setWebhook → POST {update}
+# ============================================================================
+
+@router.post("/webhooks/telegram")
+async def telegram_inbound(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(
+        default=None, alias="X-Telegram-Bot-Api-Secret-Token"
+    ),
+) -> dict:
+    """Telegram webhook delivery. The secret token the bot was registered with
+    is passed in the `X-Telegram-Bot-Api-Secret-Token` header; we compare it
+    against `platform_credentials.meta.webhook_secret` to pick the workspace
+    and validate the call in one step."""
+    raw = await request.body()
+    payload = json.loads(raw or b"{}")
+    # Resolve workspace by matching the secret header to a saved credential.
+    ws_id = None
+    cred = None
+    if x_telegram_bot_api_secret_token:
+        db = await get_db()
+        cur = await db.execute(
+            """
+            SELECT workspace_id, secrets, meta
+              FROM platform_credentials
+             WHERE provider = 'telegram' AND status = 'active'
+            """,
+            (),
+        )
+        for r in [dict(x) for x in await cur.fetchall()]:
+            meta = jl(r.get("meta"), {}) or {}
+            if meta.get("webhook_secret") == x_telegram_bot_api_secret_token:
+                ws_id = r["workspace_id"]
+                cred = r
+                break
+    if not ws_id:
+        ws_id = await _default_workspace_for("telegram", None)
+    if not ws_id:
+        return {"ok": True, "ignored": True}
+    await _rl_guard("telegram", ws_id)
+
+    msg = payload.get("message") or payload.get("edited_message") or {}
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    if not text:
+        return {"ok": True, "ignored": True}
+    chat = msg.get("chat") or {}
+    sender = msg.get("from") or {}
+    name = (
+        (sender.get("first_name") or "") + " " + (sender.get("last_name") or "")
+    ).strip() or (sender.get("username") or f"TG {chat.get('id')}")
+    customer_id = await resolve_or_create_customer(
+        workspace_id=ws_id,
+        psid=str(chat.get("id")) if chat.get("id") else None, name=name,
+    )
+    conv_id = await resolve_or_create_conversation(
+        workspace_id=ws_id, customer_id=customer_id, channel="telegram",
+        external_thread_id=str(chat.get("id")),
+    )
+    res = await ingest_inbound_message(
+        workspace_id=ws_id, conversation_id=conv_id, text=text,
+        from_name=name,
+        external_message_id=f"tg_{chat.get('id')}_{msg.get('message_id')}",
+    )
+    return {"ok": True, "messageId": res["message"]["id"]}
+
+
+# ============================================================================
+# Twilio SMS inbound (spec §6)
+# ============================================================================
+
+@router.post("/webhooks/twilio/sms")
+async def twilio_sms_inbound(request: Request) -> Response:
+    """Twilio posts form-encoded SMS payloads with `From`, `To`, `Body`,
+    `MessagingServiceSid` / `AccountSid`. We respond with an empty TwiML so
+    Twilio doesn't queue an auto-reply — the AI orchestrator handles the
+    actual send through the outbox pipeline."""
+    try:
+        form = await request.form()
+    except Exception:
+        raise HTTPException(400, "form body required")
+    body = dict(form)
+    ws_id = await _default_workspace_for("twilio", body.get("AccountSid"))
+    if not ws_id:
+        return Response(
+            content="<Response/>", media_type="application/xml",
+        )
+    await _rl_guard("twilio", ws_id)
+    text = (body.get("Body") or "").strip()
+    from_num = body.get("From") or ""
+    if not text or not from_num:
+        return Response(content="<Response/>", media_type="application/xml")
+    customer_id = await resolve_or_create_customer(
+        workspace_id=ws_id, phone=from_num, name=from_num,
+    )
+    conv_id = await resolve_or_create_conversation(
+        workspace_id=ws_id, customer_id=customer_id, channel="sms",
+        external_thread_id=from_num,
+    )
+    await ingest_inbound_message(
+        workspace_id=ws_id, conversation_id=conv_id, text=text,
+        from_name=from_num,
+        external_message_id=body.get("SmsMessageSid") or body.get("MessageSid"),
+    )
+    return Response(content="<Response/>", media_type="application/xml")
+
+
+# ============================================================================
 # Shopify (spec §6 e-commerce, §3.9.2) — orders/*, refunds/*, products/*
 # ============================================================================
 

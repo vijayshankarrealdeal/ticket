@@ -28,6 +28,7 @@ from .routers import (
     me,
     notifications,
     oauth,
+    platform as platform_admin,
     platforms,
     search,
     teams,
@@ -114,6 +115,7 @@ app.add_middleware(TraceMiddleware)
 # Auth + session
 app.include_router(auth.router)
 app.include_router(oauth.router)
+app.include_router(platform_admin.router)
 app.include_router(me.router)
 
 # Core app surface

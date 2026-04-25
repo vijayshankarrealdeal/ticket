@@ -22,6 +22,7 @@ import Health from './pages/channels/Health.jsx';
 import Notifications from './pages/Notifications.jsx';
 import PublicCsat from './pages/PublicCsat.jsx';
 import AuthPage, { loadAuth, saveAuth } from './pages/AuthPage.jsx';
+import PlatformConsole from './pages/PlatformConsole.jsx';
 import './animations.css';
 import './App.css';
 
@@ -38,6 +39,12 @@ export default function App() {
         <Route path="/csat/:token" element={<PublicCsat />} />
       </Routes>
     );
+  }
+
+  // Platform console runs above all workspaces — super-users sign in with
+  // their own credentials (never a workspace user token).
+  if (location.pathname.startsWith('/platform')) {
+    return <PlatformConsole />;
   }
 
   if (!user) {

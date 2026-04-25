@@ -3,8 +3,9 @@ import TopBar from '../components/TopBar.jsx';
 import { Icon } from '../components/Icons.jsx';
 import { useDelayUnmount } from '../hooks/useDelayUnmount.js';
 import { useRealtimeTopic } from '../hooks/useRealtime.js';
-import { api } from '../api.js';
+import { api, uploadFile } from '../api.js';
 import { loadAuth } from './AuthPage.jsx';
+import { getPresenceStatus } from '../hooks/usePresenceStatus.js';
 import {
   MEMBERS,
   CHANNELS,
@@ -62,8 +63,36 @@ function Avatar({ userId, size = 32, hideStatus = false }) {
 }
 
 function dmTitle(dm, currentUserId = CURRENT_USER_ID) {
+  if (dm.isSelf) {
+    const me = memberById(currentUserId);
+    return me?.name ? `${me.name} (You)` : 'You';
+  }
   const others = dm.members.filter((id) => id !== currentUserId).map((id) => memberById(id)?.name).filter(Boolean);
   return others.join(', ') || 'Direct message';
+}
+
+function dmSubtitle(dm, currentUserId = CURRENT_USER_ID) {
+  if (dm.preview) {
+    const lastUser = dm.lastUserId;
+    if (lastUser && lastUser === currentUserId) return `You: ${dm.preview}`;
+    if (lastUser) {
+      const first = memberById(lastUser)?.name?.split(' ')?.[0];
+      if (first) return `${first}: ${dm.preview}`;
+    }
+    return dm.preview;
+  }
+  if (dm.isSelf) return 'Notes to self · nobody else can see this';
+  const other = dm.members.find((id) => id !== currentUserId);
+  const m = memberById(other);
+  return m?.role || 'Start the conversation';
+}
+
+function channelSubtitle(ch) {
+  if (ch.preview) {
+    const first = ch.lastUserId ? memberById(ch.lastUserId)?.name?.split(' ')?.[0] : null;
+    return first ? `${first}: ${ch.preview}` : ch.preview;
+  }
+  return ch.description || 'No messages yet';
 }
 
 function renderBlocks(blocks = []) {
@@ -79,6 +108,7 @@ function renderBlocks(blocks = []) {
 }
 
 const LEFT_COLLAPSED_KEY = 'teams-left-collapsed';
+const LEFT_TAB_KEY = 'teams-left-tab';
 
 export default function Teams() {
   const [dataVersion, setDataVersion] = useState(0);
@@ -86,11 +116,18 @@ export default function Teams() {
 
   useEffect(() => {
     let alive = true;
+    // Honour `?id=<conversation-id>` so deep links (e.g. from the global
+    // search "Teammates" row or from mention notifications) land on the
+    // right thread instead of the default channel.
+    const urlId = (() => {
+      try { return new URLSearchParams(window.location.search).get('id'); }
+      catch { return null; }
+    })();
     loadTeamsData().then(async () => {
       if (!alive) return;
       await Promise.all([refreshTeamsPresence(), refreshTeamsUnread()]);
       if (!alive) return;
-      setActiveId((cur) => cur || CHANNELS[0]?.id || DMS[0]?.id || null);
+      setActiveId((cur) => cur || urlId || CHANNELS[0]?.id || DMS[0]?.id || null);
       setDataVersion((v) => v + 1);
     });
     return () => { alive = false; };
@@ -102,7 +139,7 @@ export default function Teams() {
     let alive = true;
     const tick = async () => {
       if (!alive) return;
-      try { await api.post('/teams/presence/heartbeat', { status: 'online' }); } catch {}
+      try { await api.post('/teams/presence/heartbeat', { status: getPresenceStatus() }); } catch {}
       try { await refreshTeamsPresence(); } catch {}
       if (alive) setDataVersion((v) => v + 1);
     };
@@ -120,8 +157,14 @@ export default function Teams() {
   useEffect(() => {
     try { localStorage.setItem(LEFT_COLLAPSED_KEY, String(leftCollapsed)); } catch {}
   }, [leftCollapsed]);
+  const [leftTab, setLeftTab] = useState(() => {
+    try { return localStorage.getItem(LEFT_TAB_KEY) || 'chat'; } catch { return 'chat'; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(LEFT_TAB_KEY, leftTab); } catch {}
+  }, [leftTab]);
   const [threadsByConv, setThreadsByConv] = useState({});
-  const [showInfo, setShowInfo] = useState(true);
+  const [showInfo, setShowInfo] = useState(false);
   const [replyTo, setReplyTo] = useState(null);
   const [draft, setDraft] = useState('');
   const [draftMentions, setDraftMentions] = useState([]); // [{at, userId, name}]
@@ -134,6 +177,12 @@ export default function Teams() {
   const [attachSheet, setAttachSheet] = useState(null); // 'ticket' | 'customer'
   const [typingNames, setTypingNames] = useState([]);
   const [dialog, setDialog] = useState(null); // 'channel' | 'dm' | null
+  const [moreMenuFor, setMoreMenuFor] = useState(null); // msgId
+  const [editingMsgId, setEditingMsgId] = useState(null);
+  const [editDraft, setEditDraft] = useState('');
+  const fileInputRef = useRef(null);
+  const filePickerKindRef = useRef('file'); // remembers which menu option was clicked
+  const [uploadingAttach, setUploadingAttach] = useState(false);
 
   const inputRef = useRef(null);
   const chatBodyRef = useRef(null);
@@ -230,6 +279,27 @@ export default function Teams() {
             [activeId]: prior.map((m) => (m.id === messageId ? { ...m, reactions: reactions || [] } : m)),
           };
         });
+      } else if (evt.type === 'team.message.updated' && evt.data) {
+        const data = evt.data;
+        setThreadsByConv((prev) => {
+          const prior = prev[activeId] || [];
+          if (!prior.some((m) => m.id === data.id)) return prev;
+          return {
+            ...prev,
+            [activeId]: prior.map((m) => (m.id === data.id ? { ...m, ...data } : m)),
+          };
+        });
+      } else if (evt.type === 'team.message.deleted' && evt.data) {
+        const { messageId } = evt.data;
+        if (!messageId) return;
+        setThreadsByConv((prev) => {
+          const prior = prev[activeId] || [];
+          if (!prior.some((m) => m.id === messageId)) return prev;
+          return {
+            ...prev,
+            [activeId]: prior.filter((m) => m.id !== messageId),
+          };
+        });
       } else if (evt.type === 'team.typing' && evt.data) {
         const who = evt.data.userName;
         if (!who || evt.data.userId === CURRENT_USER_ID) return;
@@ -252,8 +322,33 @@ export default function Teams() {
     },
   );
 
-  const filteredChannels = CHANNELS.filter((c) => c.name.toLowerCase().includes(query.toLowerCase()));
-  const filteredDMs = DMS.filter((d) => dmTitle(d).toLowerCase().includes(query.toLowerCase()));
+  // Per-user nudge topic: the server pings us here whenever a teams message
+  // lands in a conversation we're part of but don't currently have open. We
+  // reload the DM/channel list (to refresh the last-message preview) and the
+  // unread counts so the left rail updates without a page reload. Sequenced
+  // (loadTeamsData then refreshTeamsUnread) because refreshTeamsUnread
+  // mutates the CHANNELS/DMS arrays in place and would race a concurrent
+  // replace from loadTeamsData.
+  const meUserId = CURRENT_USER_ID;
+  useRealtimeTopic(
+    meUserId ? `teams-nudge:${meUserId}` : null,
+    (evt) => {
+      if (evt?.type !== 'teams.conversation.updated') return;
+      (async () => {
+        try {
+          await loadTeamsData();
+          await refreshTeamsUnread();
+          setDataVersion((v) => v + 1);
+        } catch {}
+      })();
+    },
+  );
+
+  const q = query.toLowerCase();
+  const filteredChannels = CHANNELS.filter((c) => c.name.toLowerCase().includes(q));
+  const filteredDMs = DMS.filter((d) => dmTitle(d).toLowerCase().includes(q));
+  const pinnedDMs = filteredDMs.filter((d) => d.isSelf);
+  const otherDMs = filteredDMs.filter((d) => !d.isSelf);
 
   const sendMessage = () => {
     const text = draft.trim();
@@ -401,14 +496,78 @@ export default function Teams() {
       .catch(() => {});
   };
 
+  const startEditMessage = (msg) => {
+    setEditingMsgId(msg.id);
+    // Reconstruct editable text from blocks so the user sees the same thing
+    // they originally typed (mentions will re-tokenize on save via parseDraftToBlocks).
+    setEditDraft(blocksToEditableText(msg.blocks));
+    setMoreMenuFor(null);
+  };
+
+  const cancelEdit = () => {
+    setEditingMsgId(null);
+    setEditDraft('');
+  };
+
+  const saveEdit = (msg) => {
+    const nextText = editDraft.trim();
+    if (!nextText) return;
+    // No mention list in scope for edit — treat @-tokens as plain text for
+    // now. Keeping it simple; richer edit-time mention tracking can come later.
+    const blocks = [{ type: 'text', value: nextText }];
+    setThreadsByConv((prev) => ({
+      ...prev,
+      [activeId]: (prev[activeId] || []).map((m) =>
+        m.id === msg.id ? { ...m, text: nextText, blocks, editedAt: new Date().toISOString() } : m
+      ),
+    }));
+    setEditingMsgId(null);
+    setEditDraft('');
+    api.patch(`/teams/messages/${encodeURIComponent(msg.id)}`, { text: nextText, blocks })
+      .catch(() => {});
+  };
+
+  const deleteMessage = (msg) => {
+    if (typeof msg.id === 'string' && msg.id.startsWith('tmp-')) return;
+    if (!window.confirm('Delete this message? This cannot be undone.')) return;
+    setMoreMenuFor(null);
+    setThreadsByConv((prev) => ({
+      ...prev,
+      [activeId]: (prev[activeId] || []).filter((m) => m.id !== msg.id),
+    }));
+    api.del(`/teams/messages/${encodeURIComponent(msg.id)}`)
+      .catch(() => {});
+  };
+
   const attachImageOrFile = (kind) => {
-    // Simulated file picker — we just attach a fake file pill.
-    const mock =
-      kind === 'image'
-        ? { kind: 'image', name: 'screenshot.png', size: '218 KB' }
-        : { kind: 'file', name: 'shared-notes.pdf', size: '94 KB' };
-    setAttachDraft(mock);
+    filePickerKindRef.current = kind;
+    if (!fileInputRef.current) return;
+    fileInputRef.current.accept = kind === 'image' ? 'image/*' : '';
+    fileInputRef.current.value = ''; // reset so selecting the same file twice still fires change
+    fileInputRef.current.click();
     setShowPlusMenu(false);
+  };
+
+  const onFileChosen = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const kind = filePickerKindRef.current || (file.type.startsWith('image/') ? 'image' : 'file');
+    setUploadingAttach(true);
+    try {
+      const up = await uploadFile(file);
+      setAttachDraft({
+        kind,
+        url: up.url,
+        name: up.name,
+        mime: up.mime,
+        size: formatBytes(up.size),
+        bytes: up.size,
+      });
+    } catch (err) {
+      alert(`Upload failed: ${err?.message || 'unknown error'}`);
+    } finally {
+      setUploadingAttach(false);
+    }
   };
 
   const onPickTicket = (t) => {
@@ -437,24 +596,82 @@ export default function Teams() {
     <>
       <TopBar left={titleLeft} />
       <div className="main team-layout">
-        {/* Left pane: channels + DMs */}
+        {/* Left pane: tabbed Chat / Channels */}
         <aside className={'left-pane team-left' + (leftCollapsed ? ' collapsed' : '')}>
           <div className="team-left-header">
-            {!leftCollapsed && <div className="team-left-header-title">Chats</div>}
-            <button
-              className="team-left-toggle"
-              onClick={() => {
-                setLeftCollapsed((v) => {
-                  if (!v) setSearchOpen(false);
-                  return !v;
-                });
-              }}
-              title={leftCollapsed ? 'Expand chat list' : 'Collapse chat list'}
-              aria-label={leftCollapsed ? 'Expand chat list' : 'Collapse chat list'}
-            >
-              <Icon.Chevron className={'team-left-toggle-caret' + (leftCollapsed ? ' collapsed' : '')} />
-            </button>
+            {!leftCollapsed && (
+              <div className="team-left-header-title">
+                {leftTab === 'chat' ? 'Chat' : 'Channels'}
+              </div>
+            )}
+            <div className="team-left-header-actions">
+              {!leftCollapsed && (
+                <>
+                  <button
+                    className={'team-left-action' + (searchOpen ? ' active' : '')}
+                    onClick={() => setSearchOpen((v) => !v)}
+                    title={searchOpen ? 'Close search' : 'Filter'}
+                    aria-label="Filter"
+                  >
+                    <Icon.Search />
+                  </button>
+                  <button
+                    className="team-left-action"
+                    onClick={() => setDialog(leftTab === 'chat' ? 'dm' : 'channel')}
+                    title={leftTab === 'chat' ? 'New chat' : 'New channel'}
+                    aria-label={leftTab === 'chat' ? 'New chat' : 'New channel'}
+                  >
+                    <Icon.Pencil />
+                  </button>
+                </>
+              )}
+              <button
+                className="team-left-toggle"
+                onClick={() => {
+                  setLeftCollapsed((v) => {
+                    if (!v) setSearchOpen(false);
+                    return !v;
+                  });
+                }}
+                title={leftCollapsed ? 'Expand chat list' : 'Collapse chat list'}
+                aria-label={leftCollapsed ? 'Expand chat list' : 'Collapse chat list'}
+              >
+                <Icon.Chevron className={'team-left-toggle-caret' + (leftCollapsed ? ' collapsed' : '')} />
+              </button>
+            </div>
           </div>
+
+          {!leftCollapsed && (
+            <div className="team-left-tabs" role="tablist">
+              <button
+                role="tab"
+                aria-selected={leftTab === 'chat'}
+                className={'team-left-tab' + (leftTab === 'chat' ? ' active' : '')}
+                onClick={() => setLeftTab('chat')}
+              >
+                <span>Chat</span>
+                {otherDMs.reduce((n, d) => n + (d.unread || 0), 0) > 0 && (
+                  <span className="team-left-tab-badge">
+                    {otherDMs.reduce((n, d) => n + (d.unread || 0), 0)}
+                  </span>
+                )}
+              </button>
+              <button
+                role="tab"
+                aria-selected={leftTab === 'channels'}
+                className={'team-left-tab' + (leftTab === 'channels' ? ' active' : '')}
+                onClick={() => setLeftTab('channels')}
+              >
+                <span>Channels</span>
+                {filteredChannels.reduce((n, c) => n + (c.unread || 0), 0) > 0 && (
+                  <span className="team-left-tab-badge">
+                    {filteredChannels.reduce((n, c) => n + (c.unread || 0), 0)}
+                  </span>
+                )}
+              </button>
+            </div>
+          )}
+
           {!leftCollapsed && searchMount.mounted && (
             <div className={'team-search-collapse' + (searchMount.state === 'exiting' ? ' closing' : '')}>
               <div className="search-box">
@@ -463,7 +680,7 @@ export default function Teams() {
                   ref={searchInputRef}
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Search channels & people"
+                  placeholder={leftTab === 'chat' ? 'Search chats' : 'Search channels'}
                   onKeyDown={(e) => {
                     if (e.key === 'Escape') { setSearchOpen(false); setQuery(''); }
                   }}
@@ -481,49 +698,71 @@ export default function Teams() {
           )}
 
           <div className="team-left-body">
-            <TeamGroup
-              label="Channels"
-              count={filteredChannels.length}
-              onAdd={() => setDialog('channel')}
-              onSearch={() => setSearchOpen((v) => !v)}
-              searchActive={searchOpen}
-            >
-              {filteredChannels.map((c) => (
-                <button
-                  key={c.id}
-                  className={'team-row' + (activeId === c.id ? ' active' : '') + (c.unread > 0 ? ' has-unread' : '')}
-                  onClick={() => setActiveId(c.id)}
-                  title={leftCollapsed ? `#${c.name}${c.unread ? ` · ${c.unread} unread` : ''}` : undefined}
+            {leftTab === 'chat' && (
+              <>
+                {pinnedDMs.length > 0 && (
+                  <TeamGroup label="Pinned" count={pinnedDMs.length}>
+                    {pinnedDMs.map((d) => (
+                      <ChatListRow
+                        key={d.id}
+                        kind="dm"
+                        entry={d}
+                        active={activeId === d.id}
+                        collapsed={leftCollapsed}
+                        onClick={() => setActiveId(d.id)}
+                      />
+                    ))}
+                  </TeamGroup>
+                )}
+                <TeamGroup
+                  label="Recent"
+                  count={otherDMs.length}
+                  onAdd={() => setDialog('dm')}
                 >
-                  <Icon.Hash />
-                  <span className="team-row-label">{c.name}</span>
-                  {c.unread > 0 && <span className="team-unread">{c.unread}</span>}
-                </button>
-              ))}
-            </TeamGroup>
+                  {otherDMs.length === 0 && (
+                    <div className="team-left-empty">
+                      <div className="team-left-empty-title">No chats yet</div>
+                      <div className="team-left-empty-sub">Start a direct message with a teammate.</div>
+                    </div>
+                  )}
+                  {otherDMs.map((d) => (
+                    <ChatListRow
+                      key={d.id}
+                      kind="dm"
+                      entry={d}
+                      active={activeId === d.id}
+                      collapsed={leftCollapsed}
+                      onClick={() => setActiveId(d.id)}
+                    />
+                  ))}
+                </TeamGroup>
+              </>
+            )}
 
-            <TeamGroup
-              label="Direct messages"
-              count={filteredDMs.length}
-              onAdd={() => setDialog('dm')}
-            >
-              {filteredDMs.map((d) => {
-                const other = d.members.find((id) => id !== CURRENT_USER_ID);
-                const m = memberById(other);
-                return (
-                  <button
-                    key={d.id}
-                    className={'team-row' + (activeId === d.id ? ' active' : '') + (d.unread > 0 ? ' has-unread' : '')}
-                    onClick={() => setActiveId(d.id)}
-                    title={leftCollapsed ? `${m?.name || 'Direct'}${d.unread ? ` · ${d.unread} unread` : ''}` : undefined}
-                  >
-                    <Avatar userId={other} size={22} />
-                    <span className="team-row-label">{m?.name || 'Direct'}</span>
-                    {d.unread > 0 && <span className="team-unread">{d.unread}</span>}
-                  </button>
-                );
-              })}
-            </TeamGroup>
+            {leftTab === 'channels' && (
+              <TeamGroup
+                label="All channels"
+                count={filteredChannels.length}
+                onAdd={() => setDialog('channel')}
+              >
+                {filteredChannels.length === 0 && (
+                  <div className="team-left-empty">
+                    <div className="team-left-empty-title">No channels yet</div>
+                    <div className="team-left-empty-sub">Create a channel for your team.</div>
+                  </div>
+                )}
+                {filteredChannels.map((c) => (
+                  <ChatListRow
+                    key={c.id}
+                    kind="channel"
+                    entry={c}
+                    active={activeId === c.id}
+                    collapsed={leftCollapsed}
+                    onClick={() => setActiveId(c.id)}
+                  />
+                ))}
+              </TeamGroup>
+            )}
           </div>
         </aside>
 
@@ -542,6 +781,11 @@ export default function Teams() {
             {channelMessages.map((m, i) => {
               const prev = channelMessages[i - 1];
               const compact = prev && prev.userId === m.userId && sameTimeGroup(prev.at, m.at);
+              const isAuthor = m.userId === CURRENT_USER_ID;
+              // In a DM, any participant can delete (matches the backend rule
+              // so the "Hey welcome onboard" stray from the old DM-leak bug
+              // can be cleaned up by the recipient).
+              const canDelete = isAuthor || (active?.kind === 'dm');
               return (
                 <MessageRow
                   key={m.id}
@@ -552,6 +796,18 @@ export default function Teams() {
                   onOpenPicker={() => setShowEmojiPicker(m.id)}
                   pickerOpen={showEmojiPicker === m.id}
                   onClosePicker={() => setShowEmojiPicker(null)}
+                  moreOpen={moreMenuFor === m.id}
+                  onOpenMore={() => setMoreMenuFor((v) => (v === m.id ? null : m.id))}
+                  onCloseMore={() => setMoreMenuFor(null)}
+                  canEdit={isAuthor && !(typeof m.id === 'string' && m.id.startsWith('tmp-'))}
+                  canDelete={canDelete && !(typeof m.id === 'string' && m.id.startsWith('tmp-'))}
+                  onEdit={() => startEditMessage(m)}
+                  onDelete={() => deleteMessage(m)}
+                  editing={editingMsgId === m.id}
+                  editValue={editDraft}
+                  onEditChange={setEditDraft}
+                  onEditCancel={cancelEdit}
+                  onEditSave={() => saveEdit(m)}
                 />
               );
             })}
@@ -577,8 +833,23 @@ export default function Teams() {
             </div>
           )}
 
+          {/* Hidden input that powers the Image / File menu items. */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            style={{ display: 'none' }}
+            onChange={onFileChosen}
+          />
+
           {/* Attachment preview */}
-          {attachDraft && (
+          {uploadingAttach && (
+            <div className="team-attach-preview">
+              <div className="team-attach-card compact" style={{ padding: '8px 12px' }}>
+                <span>Uploading…</span>
+              </div>
+            </div>
+          )}
+          {attachDraft && !uploadingAttach && (
             <div className="team-attach-preview">
               <AttachmentCard a={attachDraft} compact />
               <button
@@ -892,6 +1163,49 @@ function StartDmDialog({ onClose, onCreated }) {
   );
 }
 
+function ChatListRow({ kind, entry, active, collapsed, onClick }) {
+  const isChannel = kind === 'channel';
+  const title = isChannel ? entry.name : dmTitle(entry);
+  const subtitle = isChannel ? channelSubtitle(entry) : dmSubtitle(entry);
+  const time = entry.lastAt || '';
+  const unread = entry.unread || 0;
+  const otherId = !isChannel && !entry.isSelf
+    ? entry.members.find((id) => id !== CURRENT_USER_ID)
+    : null;
+
+  const avatar = isChannel ? (
+    <span className="chat-row-avatar chat-row-avatar-channel"><Icon.Hash /></span>
+  ) : entry.isSelf ? (
+    <Avatar userId={CURRENT_USER_ID} size={40} />
+  ) : (
+    <Avatar userId={otherId} size={40} />
+  );
+
+  return (
+    <button
+      className={'chat-row' + (active ? ' active' : '') + (unread > 0 ? ' unread' : '') + (collapsed ? ' collapsed' : '')}
+      onClick={onClick}
+      title={collapsed ? `${title}${unread ? ` · ${unread} unread` : ''}` : undefined}
+    >
+      <span className="chat-row-bar" aria-hidden />
+      <span className="chat-row-avatar-wrap">{avatar}</span>
+      {!collapsed && (
+        <span className="chat-row-body">
+          <span className="chat-row-head">
+            <span className="chat-row-title">{title}</span>
+            {time && <span className="chat-row-time">{time}</span>}
+          </span>
+          <span className="chat-row-sub">
+            <span className="chat-row-preview">{subtitle}</span>
+            {unread > 0 && <span className="chat-row-unread">{unread}</span>}
+          </span>
+        </span>
+      )}
+      {collapsed && unread > 0 && <span className="chat-row-dot" aria-hidden />}
+    </button>
+  );
+}
+
 function TeamGroup({ label, count, onAdd, children, onSearch, searchActive }) {
   const [open, setOpen] = useState(true);
   const listMount = useDelayUnmount(open, 260);
@@ -961,6 +1275,29 @@ function ChatHeader({ active, onToggleInfo, infoOpen }) {
     );
   }
   const { dm } = active;
+  if (dm.isSelf) {
+    const me = memberById(CURRENT_USER_ID);
+    return (
+      <div className="team-chat-head">
+        <div className="team-chat-head-left">
+          <Avatar userId={CURRENT_USER_ID} size={36} />
+          <div className="team-chat-head-body">
+            <div className="team-chat-head-title">{me?.name} (You)</div>
+            <div className="team-chat-head-sub">Notes to self · only you can see this</div>
+          </div>
+        </div>
+        <div className="team-chat-head-right">
+          <button
+            className={'icon-btn' + (infoOpen ? ' active' : '')}
+            title={infoOpen ? 'Hide details' : 'Show details'}
+            onClick={onToggleInfo}
+          >
+            <Icon.Info />
+          </button>
+        </div>
+      </div>
+    );
+  }
   const otherId = dm.members.find((id) => id !== CURRENT_USER_ID);
   const m = memberById(otherId);
   return (
@@ -970,12 +1307,12 @@ function ChatHeader({ active, onToggleInfo, infoOpen }) {
         <div className="team-chat-head-body">
           <div className="team-chat-head-title">{m?.name}</div>
           <div className="team-chat-head-sub">
-            <span className={`team-status-dot team-status-${m?.status}`} /> {m?.status} · {m?.role}
+            <span className={`team-status-dot team-status-${m?.status || 'offline'}`} />
+            {' '}{m?.role}
           </div>
         </div>
       </div>
       <div className="team-chat-head-right">
-        <button className="icon-btn" title="Call"><Icon.CallOutline /></button>
         <button
           className={'icon-btn' + (infoOpen ? ' active' : '')}
           title={infoOpen ? 'Hide details' : 'Show details'}
@@ -988,10 +1325,16 @@ function ChatHeader({ active, onToggleInfo, infoOpen }) {
   );
 }
 
-function MessageRow({ msg, compact, onReply, onReact, onOpenPicker, pickerOpen, onClosePicker }) {
+function MessageRow({
+  msg, compact, onReply, onReact, onOpenPicker, pickerOpen, onClosePicker,
+  moreOpen, onOpenMore, onCloseMore, canEdit, canDelete, onEdit, onDelete,
+  editing, editValue, onEditChange, onEditCancel, onEditSave,
+}) {
   const m = memberById(msg.userId);
   const isMe = msg.userId === CURRENT_USER_ID;
   const pickerRef = useRef(null);
+  const moreRef = useRef(null);
+  const editInputRef = useRef(null);
 
   useEffect(() => {
     if (!pickerOpen) return;
@@ -1001,6 +1344,24 @@ function MessageRow({ msg, compact, onReply, onReact, onOpenPicker, pickerOpen, 
     document.addEventListener('mousedown', onDown);
     return () => document.removeEventListener('mousedown', onDown);
   }, [pickerOpen, onClosePicker]);
+
+  useEffect(() => {
+    if (!moreOpen) return;
+    const onDown = (e) => {
+      if (moreRef.current && !moreRef.current.contains(e.target)) onCloseMore?.();
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [moreOpen, onCloseMore]);
+
+  useEffect(() => {
+    if (editing) editInputRef.current?.focus();
+  }, [editing]);
+
+  const onEditKey = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); onEditCancel?.(); }
+    else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onEditSave?.(); }
+  };
 
   return (
     <div className={'team-msg' + (compact ? ' compact' : '') + (isMe ? ' me' : '')}>
@@ -1022,11 +1383,33 @@ function MessageRow({ msg, compact, onReply, onReact, onOpenPicker, pickerOpen, 
           </div>
         )}
         <div className="team-msg-bubble">
-          <div className="team-msg-text">{renderBlocks(msg.blocks)}</div>
-          {msg.attachments?.length > 0 && (
-            <div className="team-msg-attachments">
-              {msg.attachments.map((a, i) => <AttachmentCard key={i} a={a} />)}
+          {editing ? (
+            <div className="team-msg-edit">
+              <textarea
+                ref={editInputRef}
+                className="chat-input team-chat-input"
+                rows={1}
+                value={editValue}
+                onChange={(e) => onEditChange?.(e.target.value)}
+                onKeyDown={onEditKey}
+              />
+              <div className="team-msg-edit-actions">
+                <button className="btn secondary" onClick={onEditCancel}>Cancel</button>
+                <button className="btn" onClick={onEditSave} disabled={!editValue.trim()}>Save</button>
+              </div>
             </div>
+          ) : (
+            <>
+              <div className="team-msg-text">
+                {renderBlocks(msg.blocks)}
+                {msg.editedAt && <span className="team-msg-edited" title="Edited"> (edited)</span>}
+              </div>
+              {msg.attachments?.length > 0 && (
+                <div className="team-msg-attachments">
+                  {msg.attachments.map((a, i) => <AttachmentCard key={i} a={a} />)}
+                </div>
+              )}
+            </>
           )}
         </div>
         {msg.reactions?.length > 0 && (
@@ -1052,7 +1435,27 @@ function MessageRow({ msg, compact, onReply, onReact, onOpenPicker, pickerOpen, 
         <div className="team-msg-actions">
           <button className="team-msg-action" onClick={onOpenPicker} title="Add reaction"><Icon.Smile /></button>
           <button className="team-msg-action" onClick={onReply} title="Reply"><Icon.Reply /></button>
-          <button className="team-msg-action" title="More"><Icon.More /></button>
+          <div className="team-msg-more" ref={moreRef}>
+            <button className="team-msg-action" onClick={onOpenMore} title="More"><Icon.More /></button>
+            {moreOpen && (canEdit || canDelete) && (
+              <div className="team-msg-more-menu anim-slide-down">
+                {canEdit && (
+                  <button className="team-menu-item" onClick={onEdit}>
+                    <div className="team-menu-item-body">
+                      <div className="team-menu-item-title">Edit message</div>
+                    </div>
+                  </button>
+                )}
+                {canDelete && (
+                  <button className="team-menu-item danger" onClick={onDelete}>
+                    <div className="team-menu-item-body">
+                      <div className="team-menu-item-title">Delete message</div>
+                    </div>
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         </div>
 
         {pickerOpen && (
@@ -1098,25 +1501,52 @@ function AttachmentCard({ a, compact = false }) {
     );
   }
   if (a.kind === 'image') {
+    // With a real upload, `a.url` is set and we show the actual image.
+    // Pre-upload drafts (and legacy mocks) fall back to the generic thumb.
+    if (a.url && !compact) {
+      return (
+        <a className="team-attach-image-full" href={a.url} target="_blank" rel="noreferrer">
+          <img src={a.url} alt={a.name || 'image'} />
+        </a>
+      );
+    }
     return (
       <div className={'team-attach-card team-attach-image' + (compact ? ' compact' : '')}>
-        <div className="team-attach-thumb"><Icon.Image /></div>
+        <div className="team-attach-thumb">
+          {a.url ? <img src={a.url} alt={a.name || 'image'} /> : <Icon.Image />}
+        </div>
         <div className="team-attach-body">
           <div className="team-attach-title">{a.name}</div>
-          <div className="team-attach-sub">Image · {a.size}</div>
+          <div className="team-attach-sub">Image{a.size ? ` · ${a.size}` : ''}</div>
         </div>
       </div>
     );
   }
   if (a.kind === 'file') {
-    return (
-      <div className={'team-attach-card' + (compact ? ' compact' : '')}>
+    const body = (
+      <>
         <div className="team-attach-icon"><Icon.Document /></div>
         <div className="team-attach-body">
           <div className="team-attach-title">{a.name}</div>
-          <div className="team-attach-sub">File · {a.size}</div>
+          <div className="team-attach-sub">File{a.size ? ` · ${a.size}` : ''}</div>
         </div>
-      </div>
+      </>
+    );
+    if (a.url) {
+      return (
+        <a
+          className={'team-attach-card team-attach-file-link' + (compact ? ' compact' : '')}
+          href={a.url}
+          target="_blank"
+          rel="noreferrer"
+          download={a.name}
+        >
+          {body}
+        </a>
+      );
+    }
+    return (
+      <div className={'team-attach-card' + (compact ? ' compact' : '')}>{body}</div>
     );
   }
   return null;
@@ -1160,7 +1590,33 @@ function InfoPane({ active }) {
       </aside>
     );
   }
-  const otherId = active.dm.members.find((id) => id !== CURRENT_USER_ID);
+  const { dm } = active;
+  if (dm.isSelf) {
+    const me = memberById(CURRENT_USER_ID);
+    return (
+      <aside className="right-sidebar team-info">
+        <div className="team-info-head tall">
+          <Avatar userId={CURRENT_USER_ID} size={56} />
+          <div>
+            <div className="team-info-title">{me?.name} (You)</div>
+            <div className="team-info-sub">Notes to self</div>
+          </div>
+        </div>
+        <div className="team-info-section">
+          <div className="team-info-section-title">About</div>
+          <div className="team-info-row"><span>Visibility</span><b>Only you</b></div>
+          <div className="team-info-row"><span>Role</span><b>{me?.role}</b></div>
+        </div>
+        <div className="team-info-section">
+          <div className="team-info-section-title">Tip</div>
+          <div className="team-info-empty">
+            Jot down reminders, draft replies, or pin tickets & customers here for later.
+          </div>
+        </div>
+      </aside>
+    );
+  }
+  const otherId = dm.members.find((id) => id !== CURRENT_USER_ID);
   const m = memberById(otherId);
   return (
     <aside className="right-sidebar team-info">
@@ -1174,7 +1630,15 @@ function InfoPane({ active }) {
       <div className="team-info-section">
         <div className="team-info-section-title">Contact</div>
         <div className="team-info-row"><span>Email</span><b>{m?.email}</b></div>
-        <div className="team-info-row"><span>Status</span><b className={`team-status-text team-status-${m?.status}`}>{m?.status}</b></div>
+        <div className="team-info-row">
+          <span>Status</span>
+          <b className="team-status-inline">
+            <span className={`team-status-dot team-status-${m?.status || 'offline'}`} />
+            <span className={`team-status-text team-status-${m?.status || 'offline'}`}>
+              {m?.status || 'offline'}
+            </span>
+          </b>
+        </div>
       </div>
       <div className="team-info-section">
         <div className="team-info-section-title">Shared</div>
@@ -1241,4 +1705,23 @@ function parseDraftToBlocks(draft, mentions) {
 function sameTimeGroup(a, b) {
   // Very loose — treat "Just now" and same label as same group.
   return a === b;
+}
+
+function formatBytes(n) {
+  if (n == null || Number.isNaN(n)) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function blocksToEditableText(blocks = []) {
+  return blocks.map((b) => {
+    if (b.type === 'text') return b.value || '';
+    if (b.type === 'mention') {
+      if (b.channel) return `#${b.name}`;
+      return `@${memberById(b.userId)?.name || ''}`;
+    }
+    return '';
+  }).join('');
 }

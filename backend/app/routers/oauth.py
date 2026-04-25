@@ -316,22 +316,26 @@ async def oauth_callback(
         row = await cur.fetchone()
 
     if not row:
-        # First time — create a fresh workspace named after the user.
-        ws_id = str(uuid4())
-        slug = (email.split("@")[0] + "-" + secrets.token_hex(3)).lower()
+        # First time — the email must be pre-authorized by the super-user for
+        # exactly one workspace. No allowlist row ⇒ no auto-provisioned org.
+        from .auth import resolve_allowed_email
+        allowed = await resolve_allowed_email(db, email)
+        if not allowed:
+            # Bounce back to the sign-in screen with a readable error rather
+            # than a raw 403 page from the OAuth callback.
+            return_to = rec.get("return_to") or SPA_ORIGIN
+            err = urllib.parse.quote("email_not_approved")
+            return RedirectResponse(f"{return_to}/#/oauth-landing?error={err}", status_code=302)
         name = userinfo.get("name") or email.split("@")[0]
-        await db.execute(
-            "INSERT INTO workspaces (id, name, slug) VALUES (?,?,?)",
-            (ws_id, f"{name}'s Workspace", slug),
-        )
         uid = str(uuid4())
         await db.execute(
             """
             INSERT INTO users (id, workspace_id, name, email, provider, oauth_sub,
                                role, avatar_url, password_hash)
-            VALUES (?,?,?,?,?,?, 'admin', ?, ?)
+            VALUES (?,?,?,?,?,?, ?, ?, ?)
             """,
-            (uid, ws_id, name, email, provider, sub,
+            (uid, allowed["workspace_id"], name, email, provider, sub,
+             allowed.get("role") or "agent",
              userinfo.get("picture"),
              argon2.hash(secrets.token_urlsafe(16))),
         )

@@ -1,10 +1,24 @@
 """Platforms (spec §3.8)."""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+import logging
+import os
+from datetime import datetime, timezone
+from uuid import uuid4
 
-from ..db import get_db, jl
+from fastapi import APIRouter, Body, HTTPException, Query, Request
+
+from ..channels.connectors import (
+    CONNECTORS,
+    mask_secret,
+    schema_for,
+    split_payload,
+    validate_values,
+)
+from ..db import get_db, jl, js
 from ..deps import Me
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["platforms"])
 
@@ -383,21 +397,319 @@ async def connect(pid: str, user: dict = Me) -> dict:
 @router.post("/platforms/{pid}/disconnect")
 async def disconnect(pid: str, user: dict = Me) -> dict:
     await _set_status(user["workspace_id"], pid, "disconnected")
-    # OAuth channels key off platform_credentials — deactivate the stored
-    # tokens too, otherwise the poller keeps hitting a "disconnected" mailbox
-    # and list_platforms would flip the card back to connected on next read.
-    provider = _OAUTH_CHANNEL_PROVIDERS.get(pid)
-    if provider:
+    # OAuth *and* API-key channels key off platform_credentials. Deactivate
+    # the stored tokens too, otherwise the poller keeps hitting a "disconnected"
+    # mailbox and list_platforms would flip the card back to connected on next
+    # read. Covers gmail/outlook (OAuth) as well as whatsapp/telegram/imap
+    # (API-key) — anything that landed in platform_credentials under a known
+    # provider slug.
+    providers: set[str] = set()
+    if pid in _OAUTH_CHANNEL_PROVIDERS:
+        providers.add(_OAUTH_CHANNEL_PROVIDERS[pid])
+    conn_cfg = CONNECTORS.get(pid)
+    if conn_cfg:
+        providers.add(conn_cfg["provider"])
+    if providers:
         db = await get_db()
+        placeholders = ",".join(["?"] * len(providers))
         await db.execute(
-            """
+            f"""
             UPDATE platform_credentials SET status = 'revoked'
-             WHERE workspace_id = ? AND provider = ?
+             WHERE workspace_id = ? AND provider IN ({placeholders})
             """,
-            (user["workspace_id"], provider),
+            (user["workspace_id"], *providers),
         )
         await db.commit()
     return {"ok": True, "status": "disconnected"}
+
+
+# ---------------------------------------------------------------------------
+# Connector credential schema + configure endpoints
+# ---------------------------------------------------------------------------
+# These two routes drive the "Connect" modal on the Channels page for any
+# non-OAuth provider. The UI asks `GET /platforms/:id/schema` for the field
+# list, renders a form, and POSTs `{credentials: {...}}` back here. We write
+# the values into `platform_credentials` so the adapters in worker.py + the
+# pollers under channels/ pick them up without the operator editing .env.
+
+
+# OAuth-managed platforms have no credential form — the modal renders an
+# account summary + sync controls instead. Map keeps the UI in sync with the
+# provider/scopes used in routers/oauth.py.
+_OAUTH_PLATFORM_INFO = {
+    "gmail": {
+        "provider": "gmail",
+        "oauth_provider": "google",
+        "scopes_summary": "Read + send mail (gmail.modify, gmail.send)",
+        "supports_sync": True,
+        "docs_url": "https://developers.google.com/gmail/api/auth/scopes",
+    },
+    "outlook": {
+        "provider": "outlook",
+        "oauth_provider": "outlook",
+        "scopes_summary": "Read + send mail (Mail.Read, Mail.Send, Mail.ReadWrite)",
+        "supports_sync": True,
+        "docs_url": "https://learn.microsoft.com/graph/permissions-reference",
+    },
+}
+
+
+async def _oauth_account_summary(workspace_id: str, pid: str) -> dict | None:
+    """Account-level details the Manage modal renders for OAuth-backed cards:
+    linked email, when it was connected, when the access token expires, and
+    whether the stored refresh token is still healthy."""
+    info = _OAUTH_PLATFORM_INFO.get(pid)
+    if not info:
+        return None
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT account_id, meta, status, expires_at, created_at, installed_by
+          FROM platform_credentials
+         WHERE workspace_id = ? AND provider = ?
+         ORDER BY (status = 'active') DESC, created_at DESC
+         LIMIT 1
+        """,
+        (workspace_id, info["provider"]),
+    )
+    r = await cur.fetchone()
+    if not r:
+        return {
+            "kind": "oauth",
+            "provider": info["provider"],
+            "oauth_provider": info["oauth_provider"],
+            "scopes_summary": info["scopes_summary"],
+            "supports_sync": info["supports_sync"],
+            "docs_url": info["docs_url"],
+            "connected": False,
+        }
+    row = dict(r)
+    meta = jl(row.get("meta"), {}) or {}
+    installer_email = None
+    if row.get("installed_by"):
+        cur2 = await db.execute(
+            "SELECT email, name FROM users WHERE id = ?", (row["installed_by"],),
+        )
+        u = await cur2.fetchone()
+        if u:
+            ud = dict(u)
+            installer_email = ud.get("email")
+    return {
+        "kind": "oauth",
+        "provider": info["provider"],
+        "oauth_provider": info["oauth_provider"],
+        "scopes_summary": info["scopes_summary"],
+        "supports_sync": info["supports_sync"],
+        "docs_url": info["docs_url"],
+        "connected": row.get("status") == "active",
+        "needs_reauth": row.get("status") == "reauth_required",
+        "linked_email": meta.get("email") or row.get("account_id"),
+        "linked_name": meta.get("name"),
+        "linked_sub": meta.get("sub"),
+        "account_id": row.get("account_id"),
+        "expires_at": row.get("expires_at"),
+        "connected_at": row.get("created_at"),
+        "installed_by_email": installer_email,
+    }
+
+
+@router.get("/platforms/{pid}/schema")
+async def platform_schema(pid: str, request: Request, user: dict = Me) -> dict:
+    """Return the credential form schema for this platform.
+
+    Three response shapes:
+    - **OAuth-managed** (Gmail/Outlook): `{kind: "oauth", connected, linked_email, …}`.
+      The modal renders a status panel with sync + reconnect buttons.
+    - **Form-driven** (everything else in CONNECTORS): the field list + any
+      stored values masked.
+    - **404**: unknown platform.
+    """
+    backend_base = os.environ.get("BACKEND_ORIGIN") or str(request.base_url).rstrip("/")
+    if pid in _OAUTH_PLATFORM_INFO:
+        return await _oauth_account_summary(user["workspace_id"], pid) or {}
+
+    sch = schema_for(pid)
+    if not sch:
+        raise HTTPException(404, "connector not found")
+    if sch.get("webhook_instructions"):
+        sch["webhook_instructions"] = sch["webhook_instructions"].replace(
+            "{backend}", backend_base,
+        )
+    # Surface the current stored values (masked) + account id so the modal
+    # can show "Reconfigure" instead of blank fields on re-open.
+    existing = await _load_credential_for_ui(user["workspace_id"], pid)
+    if existing:
+        sch["existing"] = existing
+    # Live chat: inject the workspace slug so the UI can render the embed snippet.
+    if pid == "live-chat":
+        db = await get_db()
+        cur = await db.execute(
+            "SELECT slug FROM workspaces WHERE id = ?", (user["workspace_id"],),
+        )
+        row = await cur.fetchone()
+        slug = dict(row)["slug"] if row else None
+        sch["workspace_slug"] = slug
+        sch["embed_url"] = f"{backend_base}/widget.js?workspace={slug}" if slug else None
+    return sch
+
+
+@router.post("/platforms/{pid}/configure")
+async def configure_platform(
+    pid: str,
+    request: Request,
+    body: dict = Body(...),
+    user: dict = Me,
+) -> dict:
+    """Save the credential values the user entered in the modal and flip the
+    card to `connected`. The adapter layer (worker.py `_send_*`, channels/*
+    pollers) reads from `platform_credentials` on every send/tick, so the
+    connector becomes functional the moment this returns."""
+    cfg = CONNECTORS.get(pid)
+    if not cfg:
+        raise HTTPException(404, "connector not found")
+    values = (body or {}).get("credentials") or {}
+    if not isinstance(values, dict):
+        raise HTTPException(400, "credentials must be an object")
+    # Apply defaults from the schema so required fields like imap_host /
+    # smtp_port don't need to be retyped when the user just wants Gmail IMAP.
+    for f in cfg.get("fields") or []:
+        k = f["key"]
+        if (values.get(k) in (None, "")) and f.get("default") is not None:
+            values[k] = f["default"]
+    errors = validate_values(pid, values)
+    if errors:
+        raise HTTPException(400, "; ".join(errors))
+    secrets, meta, account_id = split_payload(pid, values)
+    provider = cfg["provider"]
+    ws_id = user["workspace_id"]
+    db = await get_db()
+
+    # Upsert the credential row. Account_id fallback: the provider slug itself
+    # so single-account connectors (twilio, imap) don't need one.
+    acct = account_id or provider
+    expires_at = None
+    await db.execute(
+        """
+        INSERT INTO platform_credentials (workspace_id, provider, account_id,
+                                          status, secrets, meta, installed_by, expires_at)
+        VALUES (?,?,?,?,?,?,?,?)
+        ON CONFLICT (workspace_id, provider, account_id) DO UPDATE SET
+          secrets = EXCLUDED.secrets, meta = EXCLUDED.meta,
+          status = 'active', expires_at = EXCLUDED.expires_at,
+          installed_by = EXCLUDED.installed_by
+        """,
+        (ws_id, provider, acct, "active", js(secrets), js(meta), user["id"], expires_at),
+    )
+    # Flip the card to connected in `platforms` so the UI updates in place.
+    entry = _CATALOG_BY_ID.get(pid) or {
+        "kind": "messaging", "name": pid.title(),
+        "desc": f"{pid} connector",
+    }
+    await db.execute(
+        """
+        INSERT INTO platforms (id, workspace_id, kind, name, description,
+                               status, tickets_count, config)
+        VALUES (?,?,?,?,?, 'connected', 0, ?)
+        ON CONFLICT (workspace_id, id) DO UPDATE SET
+          status = 'connected', config = EXCLUDED.config
+        """,
+        (pid, ws_id, entry["kind"], entry["name"], entry["desc"], js(meta)),
+    )
+    await db.commit()
+
+    # For Telegram we can register a webhook as a one-time setup so messages
+    # flow even without the polling loop — best effort, not fatal.
+    if provider == "telegram":
+        try:
+            from ..channels.telegram_poller import register_webhook_if_configured
+            request_origin = os.environ.get("BACKEND_ORIGIN") or str(request.base_url).rstrip("/")
+            await register_webhook_if_configured(
+                bot_token=secrets.get("bot_token"),
+                webhook_base=request_origin,
+                webhook_secret=meta.get("webhook_secret") or secrets.get("webhook_secret"),
+            )
+        except Exception:
+            log.exception("telegram webhook register failed")
+
+    return {"ok": True, "status": "connected",
+            "existing": await _load_credential_for_ui(ws_id, pid)}
+
+
+async def _load_credential_for_ui(workspace_id: str, pid: str) -> dict | None:
+    """Return a safe-to-render representation of the stored credential: the
+    account id, the meta blob, and every secret key masked with `••••tail`.
+    Nothing sensitive leaves the backend — the modal just uses this to show
+    which fields have a value so the admin can edit selectively."""
+    cfg = CONNECTORS.get(pid)
+    if not cfg:
+        return None
+    provider = cfg["provider"]
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT account_id, secrets, meta, status, expires_at, created_at
+          FROM platform_credentials
+         WHERE workspace_id = ? AND provider = ? AND status = 'active'
+         ORDER BY created_at DESC LIMIT 1
+        """,
+        (workspace_id, provider),
+    )
+    r = await cur.fetchone()
+    if not r:
+        return None
+    row = dict(r)
+    secrets_blob = jl(row.get("secrets"), {}) or {}
+    meta = jl(row.get("meta"), {}) or {}
+    masked = {k: mask_secret(v) for k, v in secrets_blob.items() if v}
+    return {
+        "account_id": row.get("account_id"),
+        "meta": meta,
+        "secrets_masked": masked,
+        "status": row.get("status"),
+        "expires_at": row.get("expires_at"),
+    }
+
+
+@router.get("/platforms/{pid}/config")
+async def platform_config(pid: str, user: dict = Me) -> dict:
+    """Manage-view counterpart of /schema: masked credentials only, no field
+    list. Used by the Manage modal to show what is currently stored."""
+    existing = await _load_credential_for_ui(user["workspace_id"], pid)
+    return {"existing": existing}
+
+
+@router.post("/platforms/{pid}/test")
+async def test_platform(pid: str, user: dict = Me) -> dict:
+    """Best-effort liveness check — each adapter hits the provider with a
+    cheap read-only call so the admin knows the credentials actually work
+    before they leave the Channels page."""
+    cfg = CONNECTORS.get(pid)
+    if not cfg:
+        raise HTTPException(404, "connector not found")
+    provider = cfg["provider"]
+    db = await get_db()
+    cur = await db.execute(
+        """
+        SELECT secrets, meta, account_id FROM platform_credentials
+         WHERE workspace_id = ? AND provider = ? AND status = 'active'
+         ORDER BY created_at DESC LIMIT 1
+        """,
+        (user["workspace_id"], provider),
+    )
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "no credentials saved for this connector")
+    rd = dict(row)
+    secrets_blob = jl(rd.get("secrets"), {}) or {}
+    meta = jl(rd.get("meta"), {}) or {}
+    try:
+        from ..channels.health_probes import probe
+        result = await probe(provider, secrets=secrets_blob, meta=meta,
+                             account_id=rd.get("account_id"))
+    except Exception as e:
+        log.exception("connector test failed for %s", pid)
+        return {"ok": False, "error": repr(e)[:200]}
+    return result
 
 
 @router.post("/platforms/gmail/sync")
@@ -418,5 +730,22 @@ async def gmail_sync(user: dict = Me) -> dict:
     result["connected"] = gmail_row.get("status") == "connected"
     result["needs_reauth"] = _needs_reauth_for(
         "gmail", gmail_row.get("status") or "available", health,
+    )
+    return result
+
+
+@router.post("/platforms/outlook/sync")
+async def outlook_sync(user: dict = Me) -> dict:
+    """Force an Outlook pull right now. Mirrors the Gmail sync endpoint —
+    background poller still runs every 30 s, this just lets the operator
+    skip the wait."""
+    from ..channels.outlook_poller import poll_all_outlook_accounts
+    result = await poll_all_outlook_accounts(workspace_id=user["workspace_id"])
+    overrides = await _workspace_overrides(user["workspace_id"])
+    health = await _oauth_credential_health(user["workspace_id"])
+    outlook_row = overrides.get("outlook") or {}
+    result["connected"] = outlook_row.get("status") == "connected"
+    result["needs_reauth"] = _needs_reauth_for(
+        "outlook", outlook_row.get("status") or "available", health,
     )
     return result

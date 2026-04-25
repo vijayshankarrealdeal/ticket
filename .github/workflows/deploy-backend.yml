@@ -1,0 +1,75 @@
+name: Deploy backend (api + worker)
+
+# Builds backend/Dockerfile in ACR and rolls a new revision on both
+# Container Apps (api, worker). Same image, different APP_ROLE env var
+# is set once on each app — we only update the image tag here.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/deploy-backend.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # for OIDC federated login to Azure
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ vars.ACR_NAME }}.azurecr.io/workspacex-backend:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Build happens inside ACR (no docker daemon on the runner needed).
+      # Tag with commit SHA for traceability; also tag :latest for humans.
+      - name: Build image in ACR
+        run: |
+          az acr build \
+            --registry "${{ vars.ACR_NAME }}" \
+            --image "workspacex-backend:${{ github.sha }}" \
+            --image "workspacex-backend:latest" \
+            --file backend/Dockerfile \
+            backend
+
+      - name: Roll api revision
+        run: |
+          az containerapp update \
+            --name "${{ vars.CONTAINERAPP_API }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --image "$IMAGE"
+
+      - name: Roll worker revision
+        run: |
+          az containerapp update \
+            --name "${{ vars.CONTAINERAPP_WORKER }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --image "$IMAGE"
+
+      - name: Wait for api to become healthy
+        run: |
+          FQDN=$(az containerapp show \
+            --name "${{ vars.CONTAINERAPP_API }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "Probing https://$FQDN/healthz"
+          for i in $(seq 1 30); do
+            if curl -fsS "https://$FQDN/healthz" > /dev/null; then
+              echo "api healthy"; exit 0
+            fi
+            sleep 5
+          done
+          echo "api did not become healthy in time"; exit 1

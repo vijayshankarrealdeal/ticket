@@ -4,13 +4,15 @@ import { Icon } from './Icons.jsx';
 import { useDelayUnmount } from '../hooks/useDelayUnmount.js';
 import { useGlobalSearch } from '../hooks/useGlobalSearch.jsx';
 import { runGlobalSearch } from '../data/globalSearchData.js';
+import { api } from '../api.js';
 
-const EMPTY_RESULTS = { conversations: [], tickets: [], contacts: [], total: 0 };
+const EMPTY_RESULTS = { conversations: [], tickets: [], contacts: [], teammates: [], total: 0 };
 
 const TYPE_META = {
   conversation: { label: 'Conversations', icon: Icon.Inbox,  tone: 'info'    },
   ticket:       { label: 'Tickets',       icon: Icon.Ticket, tone: 'primary' },
   contact:      { label: 'Contacts',      icon: Icon.User,   tone: 'success' },
+  teammate:     { label: 'Teammates',     icon: Icon.Teams,  tone: 'primary' },
 };
 
 export default function GlobalSearch() {
@@ -38,6 +40,7 @@ export default function GlobalSearch() {
       ...results.conversations.map((r) => ({ ...r, _group: 'conversation' })),
       ...results.tickets.map((r) => ({ ...r, _group: 'ticket' })),
       ...results.contacts.map((r) => ({ ...r, _group: 'contact' })),
+      ...(results.teammates || []).map((r) => ({ ...r, _group: 'teammate' })),
     ];
   }, [results]);
 
@@ -72,6 +75,16 @@ export default function GlobalSearch() {
     if (item.type === 'conversation') navigate(`/conversations?id=${encodeURIComponent(item.id)}`);
     else if (item.type === 'ticket')  navigate(`/tickets?id=${encodeURIComponent(item.id)}`);
     else if (item.type === 'contact') navigate(`/customers?id=${encodeURIComponent(item.id)}`);
+    else if (item.type === 'teammate') {
+      // Find-or-create a DM with this teammate, then jump into it. The
+      // backend dedupes on member set so repeated clicks reuse the same DM.
+      api.post('/teams/dms', { members: [item.id] })
+        .then((dm) => {
+          if (dm?.id) navigate(`/teams?id=${encodeURIComponent(dm.id)}`);
+          else navigate('/teams');
+        })
+        .catch(() => navigate('/teams'));
+    }
   };
 
   const onKeyDown = (e) => {
@@ -175,6 +188,7 @@ export default function GlobalSearch() {
               {renderGroup('conversation', results.conversations)}
               {renderGroup('ticket',       results.tickets)}
               {renderGroup('contact',      results.contacts)}
+              {renderGroup('teammate',     results.teammates || [])}
             </>
           )}
         </div>

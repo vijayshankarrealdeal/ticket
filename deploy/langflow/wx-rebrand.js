@@ -162,7 +162,7 @@
       const secretsMsg = body.variablesStored
         ? ` · ${body.variablesStored} secret${body.variablesStored === 1 ? '' : 's'} stored`
         : '';
-      toast(`Saved to WorkspaceX${secretsMsg}`);
+      toast(`Saved to WorkspaceX — open the Agent Builder to chat${secretsMsg}`);
     } catch (e) {
       toast('WorkspaceX save failed (network)', 'error');
       console.warn('[wx] save-as-agent', e);
@@ -204,6 +204,13 @@
     // Langflow's export dialog, not the Share menu's "Export" row — the
     // dialog's confirm button is what finalises a download, and that's
     // where we want the side-effect.
+    //
+    // We STOP the native JSON file download. In WorkspaceX, Export is
+    // rebranded as "Save to WorkspaceX" — the user's mental model is
+    // publish-the-flow, not download-a-file. The Save As dialog confused
+    // operators and the JSON file was rarely what they wanted. The flow
+    // still persists to WorkspaceX via /flow/save-as-agent below, and the
+    // AgentBuilder chat playground picks it up immediately.
     const candidates = document.querySelectorAll('button, [role="button"]');
     candidates.forEach((btn) => {
       if (btn.dataset.wxSaveHooked === '1') return;
@@ -212,14 +219,56 @@
       const dialog = btn.closest('[role="dialog"], [data-state="open"]');
       if (!dialog) return;
       btn.dataset.wxSaveHooked = '1';
-      btn.addEventListener('click', () => {
-        // Snapshot the dialog inputs BEFORE Langflow tears the dialog down
-        // on its own click handler.
+
+      // Rename the button in-place so the UX matches what actually happens.
+      try {
+        // Walk text nodes so we don't stomp any child <svg> icons.
+        const walker = document.createTreeWalker(btn, NodeFilter.SHOW_TEXT);
+        let node;
+        while ((node = walker.nextNode())) {
+          if ((node.nodeValue || '').trim() === 'Export') {
+            node.nodeValue = 'Save to WorkspaceX';
+            break;
+          }
+        }
+      } catch (_) { }
+
+      btn.addEventListener('click', (ev) => {
+        // Snapshot the dialog inputs BEFORE Langflow tears the dialog down.
         const overrides = readExportDialogOverrides(dialog);
-        // Run in parallel with Langflow's own download so the user gets
-        // both the JSON file and a persisted WorkspaceX agent.
+        // Suppress Langflow's own click handler so the browser doesn't get
+        // a Blob URL download + native Save As prompt.
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        ev.stopPropagation();
         saveFlowToWorkspaceX(overrides)
-          .catch((e) => console.warn('[wx] save', e));
+          .catch((e) => console.warn('[wx] save', e))
+          .finally(() => {
+            // Close the Export dialog so the operator sees the toast and
+            // lands back on the editor. Prefer the dialog's own close
+            // button; fall back to Escape for builds that don't render one.
+            const close = dialog.querySelector(
+              '[data-testid="close-dialog"], button[aria-label="Close"], [aria-label="Close"]'
+            );
+            if (close) {
+              try { close.click(); return; } catch (_) { }
+            }
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+          });
+      }, { capture: true });
+    });
+
+    // Belt-and-braces: if a download still slips through (e.g. a future
+    // Langflow version wires Export to a plain <a download> anchor), swallow
+    // the click on any dynamically-created `a[download][href^="blob:"]`
+    // issued inside the export dialog.
+    document.querySelectorAll('a[download][href^="blob:"]').forEach((a) => {
+      if (a.dataset.wxBlockHooked === '1') return;
+      if (!a.closest('[role="dialog"], [data-state="open"]')) return;
+      a.dataset.wxBlockHooked = '1';
+      a.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
       }, { capture: true });
     });
   }

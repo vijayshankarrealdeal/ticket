@@ -884,12 +884,17 @@ def _render_template(src: str, args: dict) -> str:
     return _TEMPLATE_RE.sub(sub, src)
 
 
-async def _invoke_langflow_flow(spec: dict, args: dict) -> tuple[int, Any]:
-    """POST to Langflow's `/api/v1/run/<flowId>` as the WorkspaceX superuser.
+async def _invoke_langflow_flow(
+    spec: dict, args: dict, *, bearer: str | None = None,
+) -> tuple[int, Any]:
+    """POST to Langflow's `/api/v1/run/<flowId>`.
 
-    `args` is the orchestrator's tool-call payload; we pass it as the `tweaks`
-    block Langflow expects. Returns `(status_code, response_body)` so the
-    caller can write the same `api_logs` row shape as the HTTP branch.
+    By default authenticates as the WorkspaceX superuser. Callers that hold
+    a user-scoped Langflow token (e.g. the Agent Builder chat playground,
+    where Langflow's RBAC rejects the superuser for user-owned flows) can
+    pass `bearer=` to use their own token instead. Returns
+    `(status_code, response_body)` so the caller can write the same
+    `api_logs` row shape as the HTTP branch.
     """
     import os as _os
     flow_id = spec.get("flowId") or spec.get("flow_id")
@@ -902,9 +907,10 @@ async def _invoke_langflow_flow(spec: dict, args: dict) -> tuple[int, Any]:
         import httpx  # type: ignore
     except ImportError:
         return 501, {"ok": False, "error": "httpx not installed"}
-    # Lazy import so channels.py doesn't pull langflow module at module load.
-    from .langflow import _superuser_bearer
-    bearer = await _superuser_bearer()
+    if bearer is None:
+        # Lazy import so channels.py doesn't pull langflow module at module load.
+        from .langflow import _superuser_bearer
+        bearer = await _superuser_bearer()
     headers = {"Content-Type": "application/json"}
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
