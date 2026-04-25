@@ -361,7 +361,10 @@ _csv_join() {
 # PUBLIC_*_URL are populated.
 _backend_env_vars() {
   local role="$1"
-  DATABASE_URL="postgresql+asyncpg://${PG_ADMIN}:${PG_PASSWORD}@${PG_HOST}:5432/workspacex?ssl=require"
+  # `sslmode=require` (libpq-style) — asyncpg parses this as a connection
+  # option. `ssl=require` makes asyncpg pass it through as a server_setting
+  # and Postgres errors with "parameter \"ssl\" cannot be changed now".
+  DATABASE_URL="postgresql+asyncpg://${PG_ADMIN}:${PG_PASSWORD}@${PG_HOST}:5432/workspacex?sslmode=require"
   local cors
   cors="$(_csv_join "$PUBLIC_SPA_URLS" "$PUBLIC_LANGFLOW_URL" "$PUBLIC_API_URL")"
   cat <<EOF

@@ -41,8 +41,14 @@ def _env(name: str, default: str) -> str:
     return val if val is not None and val != "" else default
 
 
+import re as _re_db
+
 # --- Database (Postgres 16 via asyncpg) ---
 # Accept both asyncpg and SQLAlchemy-style DSNs; normalize to vanilla postgres://.
+# Also rewrite `?ssl=...` to `?sslmode=...` — asyncpg parses sslmode as a
+# connection option but treats raw `ssl` as a server_setting which Postgres
+# rejects with `parameter "ssl" cannot be changed now`. Hits Azure Database
+# for PostgreSQL Flexible Server which mandates TLS.
 _RAW_DB_URL = _env(
     "DATABASE_URL",
     "postgresql://workspacex:workspacex@localhost:5432/workspacex",
@@ -51,6 +57,7 @@ DATABASE_URL = (
     _RAW_DB_URL.replace("postgresql+asyncpg://", "postgresql://")
                .replace("postgres+asyncpg://", "postgres://")
 )
+DATABASE_URL = _re_db.sub(r"([?&])ssl=", r"\1sslmode=", DATABASE_URL)
 
 
 # --- Redis (optional — in-proc broker falls back if unset) ---
