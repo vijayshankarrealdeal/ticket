@@ -41,6 +41,10 @@ export CA_MINIO="workspacex-minio"         # MinIO shim — remove once s3.py us
 export SWA_NAME="workspacex-web"
 # Free SKU is fine until you bind workspacex.com — bump to Standard then.
 export SWA_SKU="Free"
+# Static Web Apps is only available in:
+#   westus2, centralus, eastus2, westeurope, eastasia
+# Pick whichever is closest to your $LOCATION (compute can be elsewhere).
+export SWA_LOCATION="eastus2"
 
 # --- Custom domain ---
 # Toggle: "0" = ship on Azure-provided FQDNs only (*.azurecontainerapps.io,

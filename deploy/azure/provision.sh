@@ -408,6 +408,10 @@ fn_containerapps() {
   # --- MinIO (S3 shim) ---
   log "Container App: $CA_MINIO (S3 shim)"
   if ! az containerapp show -g "$RG" -n "$CA_MINIO" >/dev/null 2>&1; then
+    local minio_pw
+    minio_pw="$(openssl rand -base64 24 | tr -d '=+/' | head -c 24)"
+    # --secrets and --env-vars must go together in the same create call —
+    # otherwise secretref resolution fails before the secret is set.
     az containerapp create -g "$RG" -n "$CA_MINIO" \
       --environment "$CAE_NAME" \
       --image minio/minio:latest \
@@ -416,12 +420,11 @@ fn_containerapps() {
       --cpu 0.5 --memory 1Gi \
       --command "/bin/sh" \
       --args "-c,minio server /data" \
+      --secrets "minio-pw=$minio_pw" \
       --env-vars \
         "MINIO_ROOT_USER=workspacex" \
         "MINIO_ROOT_PASSWORD=secretref:minio-pw" \
       -o none
-    az containerapp secret set -g "$RG" -n "$CA_MINIO" \
-      --secrets "minio-pw=$(openssl rand -base64 24 | tr -d '=+/' | head -c 24)" -o none
   else skip "$CA_MINIO"; fi
 
   # --- api ---
@@ -458,13 +461,13 @@ fn_containerapps() {
   # --- worker ---
   log "Container App: $CA_WORKER"
   if ! az containerapp show -g "$RG" -n "$CA_WORKER" >/dev/null 2>&1; then
+    # No --ingress flag = no inbound traffic (worker-style).
     az containerapp create -g "$RG" -n "$CA_WORKER" \
       --environment "$CAE_NAME" \
       --image "$ACR_NAME.azurecr.io/workspacex-backend:latest" \
       --registry-server "$ACR_NAME.azurecr.io" \
       --registry-identity system \
       --system-assigned \
-      --ingress disabled \
       --min-replicas 1 --max-replicas 2 \
       --cpu 0.5 --memory 1Gi \
       -o none
@@ -524,8 +527,10 @@ fn_containerapps() {
 
 fn_swa() {
   log "Static Web App: $SWA_NAME"
+  # SWA isn't available in every Azure region — has its own location var.
+  local swa_loc="${SWA_LOCATION:-$LOCATION}"
   if ! az staticwebapp show -g "$RG" -n "$SWA_NAME" >/dev/null 2>&1; then
-    az staticwebapp create -g "$RG" -n "$SWA_NAME" -l "$LOCATION" --sku "$SWA_SKU" -o none
+    az staticwebapp create -g "$RG" -n "$SWA_NAME" -l "$swa_loc" --sku "$SWA_SKU" -o none
   else skip "$SWA_NAME"; fi
   SWA_HOSTNAME="$(az staticwebapp show -g "$RG" -n "$SWA_NAME" --query defaultHostname -o tsv)"
   SWA_TOKEN="$(az staticwebapp secrets list -g "$RG" -n "$SWA_NAME" \
@@ -543,6 +548,11 @@ fn_github_sync() {
     return
   fi
 
+  # Resolve PUBLIC_API_URL and friends. Required when this fn is invoked
+  # via the `github-sync` subcommand without a full provision having run
+  # in this shell (compute_public_urls would otherwise be skipped).
+  compute_public_urls
+
   for pair in \
       "AZURE_CLIENT_ID=$APP_ID" \
       "AZURE_TENANT_ID=$TENANT_ID" \
@@ -554,10 +564,18 @@ fn_github_sync() {
       "CONTAINERAPP_LANGFLOW=$CA_LANGFLOW" \
       "VITE_API_URL=$PUBLIC_API_URL"; do
     k="${pair%%=*}"; v="${pair#*=}"
+    if [[ -z "$v" ]]; then
+      echo "  WARNING: $k has no value — skipping (fn_containerapps may not have run yet)" >&2
+      continue
+    fi
     gh variable set "$k" --body "$v" --repo "$GITHUB_REPO"
   done
 
-  gh secret set AZURE_STATIC_WEB_APPS_API_TOKEN --body "$SWA_TOKEN" --repo "$GITHUB_REPO"
+  if [[ -n "${SWA_TOKEN:-}" ]]; then
+    gh secret set AZURE_STATIC_WEB_APPS_API_TOKEN --body "$SWA_TOKEN" --repo "$GITHUB_REPO"
+  else
+    echo "  WARNING: SWA_TOKEN empty — fn_swa may not have run; skipping secret" >&2
+  fi
 }
 
 fn_domains_stage() {
@@ -725,6 +743,19 @@ dispatch() {
     domains-bind)   az_account; fn_domains_bind ;;
     github-sync)    az_account; fn_oidc; fn_swa; fn_github_sync ;;
     images)         az_account; fn_images ;;
+    containerapps)  # provisions just the 4 Container Apps (api, worker,
+                    # langflow, minio) + SWA + final CORS update. Use when
+                    # the rest of the stack is in place but apps failed.
+                    az_account
+                    # fn_redis sets REDIS_URL/PG_HOST referenced by env vars.
+                    PG_HOST="$PG_SERVER.postgres.database.azure.com"
+                    REDIS_HOST="$(az redis show -g "$RG" -n "$REDIS_NAME" --query hostName -o tsv)"
+                    REDIS_KEY="$(az redis list-keys -g "$RG" -n "$REDIS_NAME" --query primaryKey -o tsv)"
+                    REDIS_URL="rediss://:${REDIS_KEY}@${REDIS_HOST}:6380"
+                    fn_containerapps
+                    fn_swa
+                    fn_finalize_cors
+                    ;;
     summary)        az_account; fn_summary ;;
     *) echo "Unknown subcommand: $1" >&2; exit 2 ;;
   esac
