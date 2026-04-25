@@ -1,5 +1,7 @@
 """Redis-backed hot-read cache (spec §9 "Cache layer").
 
+
+
 Rationale
 ---------
 The /auth/me → /workspace → /me/unread-counts → /conversations/:id/messages
