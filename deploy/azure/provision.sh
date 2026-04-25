@@ -237,25 +237,50 @@ fn_postgres() {
     -g "$RG" -n "$PG_SERVER" -r "client-$(date +%s)" \
     --start-ip-address "$MY_IP" --end-ip-address "$MY_IP" -o none 2>/dev/null || true
 
-  # Enable pgvector on the server parameter (requires restart).
+  # Allow-list every extension our schema CREATEs. Azure Database for
+  # PostgreSQL Flexible Server blocks `CREATE EXTENSION` unless the name
+  # is on the `azure.extensions` server parameter — pgcrypto, citext and
+  # pg_trgm are all required by backend/app/schema.sql; VECTOR is for the
+  # opt-in pgvector migration. Setting the parameter restarts the server,
+  # so we only set when the desired set isn't already present.
+  REQUIRED_EXTS="VECTOR,PGCRYPTO,CITEXT,PG_TRGM"
   EXISTING="$(az postgres flexible-server parameter show \
     -g "$RG" -s "$PG_SERVER" --name azure.extensions --query value -o tsv 2>/dev/null || echo '')"
-  if [[ "$EXISTING" != *VECTOR* ]]; then
+  NEEDS_UPDATE=0
+  for ext in ${REQUIRED_EXTS//,/ }; do
+    if [[ ",${EXISTING^^}," != *",${ext}," ]]; then NEEDS_UPDATE=1; break; fi
+  done
+  if [[ "$NEEDS_UPDATE" == "1" ]]; then
+    log "  enabling extensions: $REQUIRED_EXTS (server will restart)"
     az postgres flexible-server parameter set \
-      -g "$RG" -s "$PG_SERVER" --name azure.extensions --value VECTOR -o none
-    # The set above restarts the server.
+      -g "$RG" -s "$PG_SERVER" --name azure.extensions --value "$REQUIRED_EXTS" -o none
+    # `parameter set` restarts the server. Wait for it to come back so the
+    # psql calls below don't race the restart.
+    for _ in $(seq 1 30); do
+      state="$(az postgres flexible-server show -g "$RG" -n "$PG_SERVER" \
+        --query state -o tsv 2>/dev/null || echo '')"
+      [[ "$state" == "Ready" ]] && break
+      sleep 5
+    done
   fi
 
   PG_HOST="$PG_SERVER.postgres.database.azure.com"
   export PGPASSWORD="$PG_PASSWORD"
 
-  # Create DBs + pgvector extension idempotently.
+  # Create DBs idempotently.
   psql "host=$PG_HOST port=5432 dbname=postgres user=$PG_ADMIN sslmode=require" <<SQL
 SELECT 'CREATE DATABASE workspacex OWNER $PG_ADMIN' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='workspacex')\gexec
 SELECT 'CREATE DATABASE langflow OWNER $PG_ADMIN'   WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='langflow')\gexec
 SQL
-  psql "host=$PG_HOST port=5432 dbname=workspacex user=$PG_ADMIN sslmode=require" \
-    -c "CREATE EXTENSION IF NOT EXISTS vector;"
+  # Pre-create the extensions while connected as the admin role. The app
+  # boot still runs `CREATE EXTENSION IF NOT EXISTS …`, but doing it here
+  # under the admin avoids a permissions edge case on first startup.
+  psql "host=$PG_HOST port=5432 dbname=workspacex user=$PG_ADMIN sslmode=require" <<SQL
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS citext;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS vector;
+SQL
   unset PGPASSWORD
 }
 
