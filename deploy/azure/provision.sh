@@ -403,8 +403,15 @@ S3_BUCKET=workspacex
 LANGFLOW_URL=https://${CA_LANGFLOW}.internal
 LANGFLOW_PUBLIC_URL=$PUBLIC_LANGFLOW_URL
 LANGFLOW_SUPERUSER=$LANGFLOW_SUPERUSER
-AUTO_MIGRATE=1
-AUTO_SEED=$( [[ "$role" == "api" ]] && echo 1 || echo 0 )
+# AUTO_MIGRATE=1 reapplies schema.sql on every container start. Safe because
+# every statement is IF NOT EXISTS, but a CI-driven one-shot migration job is
+# preferred for prod. Override AUTO_MIGRATE=0 once schema is stable in the
+# target environment to avoid a partial-deploy race where the new schema
+# lands before the new code does. Numbered migrations under
+# backend/app/migrations/ run only when RUN_NUMBERED_MIGRATIONS=1.
+AUTO_MIGRATE=${AUTO_MIGRATE:-1}
+AUTO_SEED=0
+RUN_NUMBERED_MIGRATIONS=${RUN_NUMBERED_MIGRATIONS:-0}
 CORS_ORIGINS=$cors
 AZURE_ENDPOINT=${AZURE_ENDPOINT:-}
 GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-${Client_ID:-}}
