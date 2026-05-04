@@ -5,7 +5,10 @@ import { PRODUCT_NAME } from '../config.js';
 import { useTheme } from '../hooks/useTheme.js';
 import { api } from '../api.js';
 
-// Must match the key read by api.js — otherwise every request goes out unauthenticated.
+// Auth uses the httponly `wx_session` cookie. The localStorage entry only
+// holds the *user profile* (id, name, email, role, workspaceId, …) so the
+// SPA can render without flashing the auth page on every refresh; the
+// session secret is NOT stored client-side and is never reachable from JS.
 const AUTH_KEY = 'workspacex.auth';
 const HERO_IMAGE =
   'https://images.pexels.com/photos/30770668/pexels-photo-30770668.jpeg';
@@ -20,8 +23,12 @@ export function loadAuth() {
 }
 
 export function saveAuth(user) {
+  // Strip any bearer-style fields that older versions may have written or
+  // that signin responses still echo for backwards compatibility. The cookie
+  // is the only credential we keep client-side now.
+  const { token, accessToken, refreshToken, ...profile } = user || {};
   try {
-    localStorage.setItem(AUTH_KEY, JSON.stringify(user));
+    localStorage.setItem(AUTH_KEY, JSON.stringify(profile));
   } catch {}
 }
 

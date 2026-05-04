@@ -138,18 +138,15 @@ export default function ConnectorModal({ platform, onClose, onSaved }) {
     }
   };
 
-  const reconnectOAuth = () => {
+  const reconnectOAuth = async () => {
     if (!isOAuth) return;
     const base = import.meta.env.VITE_API_URL || '/api';
-    let token = '';
-    try {
-      const auth = JSON.parse(localStorage.getItem('workspacex.auth') || '{}');
-      token = auth.token || auth.accessToken || '';
-    } catch {}
+    const { getHandoffToken } = await import('../api.js');
+    const token = (await getHandoffToken()) || '';
     const returnTo = window.location.origin + window.location.pathname;
-    const qs = new URLSearchParams({
-      mode: 'connect', return_to: returnTo, token,
-    }).toString();
+    const params = { mode: 'connect', return_to: returnTo };
+    if (token) params.token = token;
+    const qs = new URLSearchParams(params).toString();
     window.location.href = `${base}/auth/oauth/${schema.oauth_provider}/start?${qs}`;
   };
 

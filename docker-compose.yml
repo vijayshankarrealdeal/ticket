@@ -192,7 +192,10 @@ services:
       # can authenticate back without asking the end-user for a bearer.
       WORKSPACEX_INTERNAL_KEY: ${WORKSPACEX_INTERNAL_KEY:-dev-internal-key-change-me}
       AUTO_MIGRATE: "1"
-      AUTO_SEED: "1"
+      # AUTO_SEED is opt-in. Set to "1" only on a fresh dev DB to load the
+      # demo workspace. Never enable in any internet-reachable deployment —
+      # the seed inserts an admin user (demo@workspacex.com / demo).
+      AUTO_SEED: ${AUTO_SEED:-0}
       CORS_ORIGINS: http://localhost:3000,http://localhost:5173,http://localhost:7860
       # Secrets — override via .env, never commit real values.
       AZURE_OPEN_AI_KEY: ${AZURE_OPEN_AI_KEY:-}

@@ -749,3 +749,34 @@ async def outlook_sync(user: dict = Me) -> dict:
         "outlook", outlook_row.get("status") or "available", health,
     )
     return result
+
+
+# Connector ids that have a real `sync` implementation. Any other id falls
+# through to the generic 422 below so the UI doesn't 404 silently when an
+# operator clicks "Sync" on a connector that's webhook-driven (and so has
+# nothing to "pull" on demand) or simply not yet implemented.
+_SYNC_SUPPORTED = {"gmail", "outlook"}
+
+
+@router.post("/platforms/{pid}/sync")
+async def generic_sync(pid: str, user: dict = Me) -> dict:
+    """Catch-all for sync requests on connectors without a per-id route.
+
+    Returns 422 with a structured `{supported: false, reason}` response so
+    the frontend can render a clear "Sync isn't applicable here" message
+    instead of a generic 404 toast. Webhook-driven channels (WhatsApp,
+    Telegram, Shopify) deliberately don't expose pull semantics."""
+    if pid in _SYNC_SUPPORTED:
+        # Should be unreachable — the per-id routes above match first — but
+        # keep it explicit so a future router refactor can't slip through.
+        raise HTTPException(500, "sync route shadowed; this is a bug")
+    if pid not in _CATALOG_BY_ID:
+        raise HTTPException(404, "platform not found")
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "supported": False,
+            "platform": pid,
+            "reason": "sync not supported for this connector",
+        },
+    )

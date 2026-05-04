@@ -174,6 +174,61 @@ broker = _make_broker()
 Broker = InProcessBroker
 
 
+async def _authorize_topic(user: dict, topic: str) -> bool:
+    """Verify the authenticated user is allowed to subscribe to `topic`.
+
+    A user with a valid session would otherwise be able to subscribe to any
+    `conv:<uuid>` / `ticket:<uuid>` / `inbox:<ws>` and stream another
+    workspace's traffic. Each topic kind below resolves the underlying entity
+    and confirms it belongs to the user's workspace (or, for `notif:`, that
+    the id matches the user themselves).
+    """
+    if not topic or ":" not in topic:
+        return False
+    kind, _, key = topic.partition(":")
+    if not key:
+        return False
+    user_ws = user.get("workspace_id")
+    user_id = user.get("id")
+
+    if kind in ("inbox", "presence", "agents"):
+        return key == user_ws
+    if kind == "notif":
+        return key == user_id
+    if kind in ("conv", "ticket", "teams"):
+        from .db import get_db  # local to avoid cycles
+        db = await get_db()
+        if kind == "conv":
+            cur = await db.execute(
+                "SELECT 1 FROM conversations WHERE id = ? AND workspace_id = ?",
+                (key, user_ws),
+            )
+            return (await cur.fetchone()) is not None
+        if kind == "ticket":
+            cur = await db.execute(
+                "SELECT 1 FROM tickets WHERE id = ? AND workspace_id = ?",
+                (key, user_ws),
+            )
+            return (await cur.fetchone()) is not None
+        # teams: channel (workspace-open) OR DM (membership-gated).
+        cur = await db.execute(
+            "SELECT 1 FROM teams_channels WHERE id = ? AND workspace_id = ?",
+            (key, user_ws),
+        )
+        if await cur.fetchone():
+            return True
+        cur = await db.execute(
+            """
+            SELECT 1 FROM teams_dms
+             WHERE id = ? AND workspace_id = ? AND member_ids @> ?::jsonb
+            """,
+            (key, user_ws, json.dumps([user_id])),
+        )
+        return (await cur.fetchone()) is not None
+    # Unknown topic kinds are denied by default.
+    return False
+
+
 async def ws_endpoint(ws: WebSocket) -> None:
     """Client protocol:
 
@@ -202,9 +257,22 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 continue
             action = msg.get("action")
             if action == "subscribe":
-                topics = [t for t in (msg.get("topics") or []) if isinstance(t, str)]
-                await broker.subscribe(ws, topics)
-                await ws.send_text(json.dumps({"type": "subscribed", "topics": topics}))
+                requested = [t for t in (msg.get("topics") or []) if isinstance(t, str)]
+                allowed: list[str] = []
+                denied: list[str] = []
+                for t in requested:
+                    try:
+                        ok = await _authorize_topic(user, t)
+                    except Exception:
+                        ok = False
+                    (allowed if ok else denied).append(t)
+                if allowed:
+                    await broker.subscribe(ws, allowed)
+                await ws.send_text(json.dumps({
+                    "type": "subscribed",
+                    "topics": allowed,
+                    "denied": denied,
+                }))
             elif action == "unsubscribe":
                 topics = msg.get("topics")
                 await broker.unsubscribe(ws, topics if isinstance(topics, list) else None)

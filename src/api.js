@@ -1,20 +1,14 @@
 const BASE_URL = import.meta.env.VITE_API_URL || '/api';
 
-function authHeader() {
-  try {
-    const raw = localStorage.getItem('workspacex.auth');
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    const token = parsed?.token || parsed?.accessToken;
-    return token ? { Authorization: `Bearer ${token}` } : {};
-  } catch {
-    return {};
-  }
-}
-
+// Auth uses an httponly `wx_session` cookie set by /auth/signin and /auth/signup.
+// Browsers send it automatically when we pass `credentials: 'include'`. There
+// is no token in localStorage — XSS that lands cannot exfiltrate the session
+// because the cookie is httponly. Keep `credentials: 'include'` on every
+// request: same-origin sends the cookie either way, but cross-origin (dev
+// proxy, separate domains) needs the explicit opt-in.
 async function request(method, path, body, { signal } = {}) {
-  const headers = { Accept: 'application/json', ...authHeader() };
-  const opts = { method, headers, signal };
+  const headers = { Accept: 'application/json' };
+  const opts = { method, headers, signal, credentials: 'include' };
   if (body !== undefined) {
     headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
@@ -41,10 +35,31 @@ export const api = {
 };
 
 /**
+ * Mint a short-lived bearer for places where the session cookie can't
+ * follow — namely full-tab navigations to a different origin (cross-origin
+ * dev: SPA on :5173 → backend on :8000) and the WS handshake. Returns null
+ * on failure; callers should fall back to a same-origin redirect that
+ * carries the cookie.
+ */
+export async function getHandoffToken() {
+  try {
+    const res = await api.post('/auth/handoff-token');
+    return res?.token || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Upload a File via the presigned MinIO/S3 URL flow (see wire.md §5).
- *   1. POST /uploads → {uploadUrl, publicUrl, key}
+ *   1. POST /uploads → {uploadUrl, key}
  *   2. PUT <uploadUrl> with the file bytes + matching Content-Type
- *   3. return {publicUrl, name, size, mime} — drop into messages.attachments
+ *   3. return {url, name, size, mime, key} — drop into messages.attachments
+ *
+ * `url` points at the backend `/uploads/sign?key=…` proxy, which 302-redirects
+ * to a freshly-minted presigned GET. The bucket itself is private; never store
+ * a direct MinIO URL in messages because it would either 403 or — if the
+ * bucket policy ever flips public — leak globally.
  */
 export async function uploadFile(file) {
   const pre = await api.post('/uploads', {
@@ -53,7 +68,6 @@ export async function uploadFile(file) {
     size: file.size,
   });
   const uploadUrl = pre.uploadUrl || pre.upload_url;
-  const publicUrl = pre.publicUrl || pre.public_url;
   const res = await fetch(uploadUrl, {
     method: 'PUT',
     headers: { 'Content-Type': file.type || 'application/octet-stream' },
@@ -63,7 +77,7 @@ export async function uploadFile(file) {
     throw new Error(`upload failed: ${res.status} ${res.statusText}`);
   }
   return {
-    url: publicUrl,
+    url: `${BASE_URL}/uploads/sign?key=${encodeURIComponent(pre.key)}`,
     name: file.name,
     size: file.size,
     mime: file.type || 'application/octet-stream',

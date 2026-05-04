@@ -100,6 +100,7 @@ load_or_generate PG_PASSWORD                'openssl rand -base64 32 | tr -d "=+
 load_or_generate LANGFLOW_SUPERUSER_PASSWORD 'openssl rand -base64 32 | tr -d "=+/" | head -c 32'
 load_or_generate WORKSPACEX_SECRET_KEY       'openssl rand -hex 32'
 load_or_generate WORKSPACEX_INTERNAL_KEY     'openssl rand -hex 32'
+load_or_generate S3_SECRET_KEY               'openssl rand -base64 24 | tr -d "=+/" | head -c 24'
 LANGFLOW_SUPERUSER="${LANGFLOW_SUPERUSER:-admin}"
 
 # ---------- helpers ----------
@@ -420,6 +421,10 @@ EOF
 
 _set_backend_secrets() {
   local app="$1"
+  # S3_SECRET_KEY is generated once via load_or_generate and persisted in
+  # $STATE_FILE so re-running this script doesn't rotate the value on every
+  # call — earlier versions minted a fresh key per run, which piled up
+  # unused entries in the secrets table and caused MinIO ↔ backend drift.
   az containerapp secret set -g "$RG" -n "$app" --secrets \
     "pg-password=$PG_PASSWORD" \
     "redis-url=$REDIS_URL" \
@@ -429,7 +434,7 @@ _set_backend_secrets() {
     "azure-openai-key=${AZURE_OPEN_AI_KEY:-unset}" \
     "google-client-secret=${GOOGLE_CLIENT_SECRET:-${Client_Secret:-unset}}" \
     "s3-access-key=workspacex" \
-    "s3-secret-key=$(openssl rand -base64 24 | tr -d '=+/' | head -c 24)" \
+    "s3-secret-key=$S3_SECRET_KEY" \
     -o none
 }
 
@@ -441,10 +446,11 @@ fn_containerapps() {
   ACR_ID="$(az acr show -n "$ACR_NAME" --query id -o tsv)"
 
   # --- MinIO (S3 shim) ---
+  # MinIO's MINIO_ROOT_PASSWORD must match the backend's S3_SECRET_KEY or
+  # boto3 calls fail with SignatureDoesNotMatch. Both now read the same
+  # `$S3_SECRET_KEY` from $STATE_FILE so re-runs don't drift the values.
   log "Container App: $CA_MINIO (S3 shim)"
   if ! az containerapp show -g "$RG" -n "$CA_MINIO" >/dev/null 2>&1; then
-    local minio_pw
-    minio_pw="$(openssl rand -base64 24 | tr -d '=+/' | head -c 24)"
     # --secrets and --env-vars must go together in the same create call —
     # otherwise secretref resolution fails before the secret is set.
     az containerapp create -g "$RG" -n "$CA_MINIO" \
@@ -455,7 +461,7 @@ fn_containerapps() {
       --cpu 0.5 --memory 1Gi \
       --command "/bin/sh" \
       --args "-c,minio server /data" \
-      --secrets "minio-pw=$minio_pw" \
+      --secrets "minio-pw=$S3_SECRET_KEY" \
       --env-vars \
         "MINIO_ROOT_USER=workspacex" \
         "MINIO_ROOT_PASSWORD=secretref:minio-pw" \

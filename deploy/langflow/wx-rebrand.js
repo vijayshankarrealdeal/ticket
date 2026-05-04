@@ -143,9 +143,12 @@
 
     try {
       const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+      // No `credentials: 'include'`: WorkspaceX intentionally does not allow
+      // credentialed cross-origin requests from the Langflow tab (Langflow
+      // runs untrusted Python components). Auth is via the bearer token
+      // handed off when the operator launched Langflow.
       const resp = await fetch(`${api}/flow/save-as-agent${qs}`, {
         method: 'POST',
-        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`,

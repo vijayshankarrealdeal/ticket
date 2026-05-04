@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import contextlib
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .config import CORS_ORIGINS
 from .db import get_db, close_db
@@ -99,6 +100,36 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="WorkspaceX API", version="0.1.0", lifespan=lifespan)
 
+
+# Narrow CORS allowance for the Langflow rebrand callback. Bearer-token-auth
+# only — no cookies — so we can grant a wildcard origin without exposing
+# `credentials: 'include'` to untrusted Langflow Python components. Runs
+# before CORSMiddleware so the credentialed path never sees these requests.
+_LANGFLOW_CALLBACK_PATHS = ("/flow/save-as-agent",)
+
+
+class LangflowCallbackCORS(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path not in _LANGFLOW_CALLBACK_PATHS:
+            return await call_next(request)
+        if request.method == "OPTIONS":
+            from fastapi.responses import Response as _Resp
+            return _Resp(
+                status_code=204,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+                    "Access-Control-Max-Age": "600",
+                },
+            )
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Vary"] = "Origin"
+        return response
+
+
+app.add_middleware(LangflowCallbackCORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,

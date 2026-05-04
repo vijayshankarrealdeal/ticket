@@ -1,24 +1,27 @@
 """Web widget (spec §6.5).
 
-The embedded chat widget on a customer's marketing site connects here. It's
-unauthenticated — the workspace is identified by the slug in the query
-string, and the visitor by a stable client-generated `visitorId`. We bootstrap
-a `customers.kind='visitor'` row and a `conversations` thread on first
-contact, then route messages through the same `POST /conversations/:id/inbound`
-pipeline so the AI auto-reply / intent classifier / WS fan-out path is
-identical to WhatsApp / Email.
+The embedded chat widget on a customer's marketing site connects here. The
+widget is unauthenticated in the human sense (the visitor is anonymous), but
+**not** trustless: the first call to `/widget/bootstrap` mints an HMAC-signed
+visitor token that all subsequent calls (`/widget/messages`, `/widget/ws`)
+must present. The HMAC binds `(workspace_slug, visitor_id)` together with a
+server-side secret, so a client cannot forge a token for someone else's
+visitor id and read their conversation.
 
 Endpoints:
 - `GET  /widget/bootstrap?workspace=<slug>&visitor=<id>` — returns
-  `{conversationId, customerId}`. Idempotent — safe to call on every page load.
-- `POST /widget/messages` — `{conversationId, text}` from the visitor.
-- `WS   /widget/ws?workspace=<slug>&visitor=<id>` — server pushes
-  `message.created` envelopes for that conversation. Subscribe is implicit
-  (the conversation id is resolved server-side).
+  `{conversationId, customerId, token}`. Idempotent — safe to call on every
+  page load. The token is the HMAC the client must echo back.
+- `POST /widget/messages` — `{conversationId, text, token}` from the visitor.
+- `WS   /widget/ws?workspace=<slug>&visitor=<id>&token=<hmac>` — server
+  pushes `message.created` envelopes for that conversation.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 
@@ -31,6 +34,34 @@ from ..ws import broker
 router = APIRouter(tags=["widget"])
 
 WIDGET_CHANNEL = "widget"
+
+
+def _signing_secret() -> bytes:
+    """Server-side secret used to sign visitor tokens. Reuses the existing
+    `WORKSPACEX_SECRET_KEY` so deployments don't need to add a new env var.
+    Must be the same on every replica or signed tokens won't validate
+    after a load-balancer flip."""
+    raw = (os.environ.get("WORKSPACEX_SECRET_KEY")
+           or os.environ.get("WIDGET_SIGNING_SECRET")
+           or "")
+    if not raw:
+        # Dev fallback so `docker compose up` works out of the box. Logged
+        # at startup as a warning by config.py / the operator's checklist.
+        raw = "wx-widget-dev-secret"
+    return raw.encode()
+
+
+def _sign_visitor(workspace: str, visitor: str) -> str:
+    """Return a hex HMAC for `(workspace, visitor)`. Use `hmac.compare_digest`
+    to check it — never `==`."""
+    msg = f"{workspace}\x00{visitor}".encode()
+    return hmac.new(_signing_secret(), msg, hashlib.sha256).hexdigest()
+
+
+def _verify_visitor(workspace: str, visitor: str, token: str | None) -> bool:
+    if not token or not workspace or not visitor:
+        return False
+    return hmac.compare_digest(_sign_visitor(workspace, visitor), token)
 
 
 def _now_iso() -> str:
@@ -59,6 +90,7 @@ async def _bootstrap(slug: str, visitor_id: str, ua: str | None = None) -> dict:
         (ws_id, visitor_id),
     )
     existing = await cur.fetchone()
+    token = _sign_visitor(slug, visitor_id)
     if existing:
         e = dict(existing)
         await db.execute(
@@ -70,6 +102,7 @@ async def _bootstrap(slug: str, visitor_id: str, ua: str | None = None) -> dict:
             "visitorRowId": e["id"],
             "customerId": e["customer_id"],
             "conversationId": e["conversation_id"],
+            "token": token,
         }
     # First-time visitor — create a `visitor` customer + a conversation row.
     cust_id = str(uuid.uuid4())
@@ -106,6 +139,7 @@ async def _bootstrap(slug: str, visitor_id: str, ua: str | None = None) -> dict:
     return {
         "workspaceId": ws_id, "visitorRowId": row_id,
         "customerId": cust_id, "conversationId": conv_id,
+        "token": token,
     }
 
 
@@ -118,12 +152,24 @@ async def widget_bootstrap(workspace: str = Query(...), visitor: str = Query(...
 async def widget_post(body: dict) -> dict:
     """Visitor → workspace. Persists the inbound, fans out on `conv:<id>` /
     `inbox:<ws>`, and kicks off the AI auto-reply via the same orchestrator
-    the authed inbound endpoint uses."""
+    the authed inbound endpoint uses.
+
+    Authentication: `(workspace, visitor, token)` from the body must HMAC
+    back to the same value `/widget/bootstrap` minted, AND the conversation
+    must actually belong to that visitor. Without this, knowing a victim's
+    `conversationId` (a UUID, but exposed in DOM/network logs) was enough
+    to post on their behalf.
+    """
     import asyncio as _aio
     cid = (body or {}).get("conversationId")
     text = ((body or {}).get("text") or "").strip()
+    workspace_slug = (body or {}).get("workspace") or ""
+    visitor_id = (body or {}).get("visitor") or ""
+    token = (body or {}).get("token") or ""
     if not cid or not text:
         raise HTTPException(400, "conversationId + text required")
+    if not _verify_visitor(workspace_slug, visitor_id, token):
+        raise HTTPException(401, "invalid visitor token")
     db = await get_db()
     cur = await db.execute(
         "SELECT id, workspace_id, customer_id, channel FROM conversations WHERE id = ?", (cid,)
@@ -132,6 +178,23 @@ async def widget_post(body: dict) -> dict:
     if not row:
         raise HTTPException(404, "conversation not found")
     conv = dict(row)
+    # Token must belong to this conversation's visitor — otherwise a
+    # different (legitimate) widget caller could post as someone else.
+    cur = await db.execute(
+        """
+        SELECT v.visitor_id, w.slug AS workspace_slug
+          FROM widget_visitors v
+          JOIN workspaces w ON w.id = v.workspace_id
+         WHERE v.conversation_id = ?
+        """,
+        (cid,),
+    )
+    binding = await cur.fetchone()
+    if not binding:
+        raise HTTPException(404, "conversation not found")
+    bd = dict(binding)
+    if bd["visitor_id"] != visitor_id or bd["workspace_slug"] != workspace_slug:
+        raise HTTPException(403, "visitor does not own this conversation")
     msg_id = str(uuid.uuid4())
     now = _now_iso()
     preview = text[:160]
@@ -275,8 +338,10 @@ _EMBED_JS_TEMPLATE = r"""
   }
 
   function openSocket() {
+    if (!booted || !booted.token) return;
     var url = BASE.replace(/^http/, "ws") + "/widget/ws?workspace=" +
-              encodeURIComponent(WS) + "&visitor=" + encodeURIComponent(visitor);
+              encodeURIComponent(WS) + "&visitor=" + encodeURIComponent(visitor) +
+              "&token=" + encodeURIComponent(booted.token);
     ws = new WebSocket(url);
     ws.onmessage = function (e) {
       try {
@@ -301,7 +366,13 @@ _EMBED_JS_TEMPLATE = r"""
     input.value = "";
     fetch(BASE + "/widget/messages", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ conversationId: booted.conversationId, text: text }),
+      body: JSON.stringify({
+        conversationId: booted.conversationId,
+        text: text,
+        workspace: WS,
+        visitor: visitor,
+        token: booted.token,
+      }),
     }).catch(function () { bubble("them", "(failed to send — please retry)"); });
   });
 
@@ -324,10 +395,23 @@ _EMBED_JS_TEMPLATE = r"""
 
 
 @router.websocket("/widget/ws")
-async def widget_ws(ws: WebSocket, workspace: str = Query(...), visitor: str = Query(...)) -> None:
+async def widget_ws(
+    ws: WebSocket,
+    workspace: str = Query(...),
+    visitor: str = Query(...),
+    token: str = Query(...),
+) -> None:
     """Stream `message.created` envelopes for the visitor's conversation. We
     transparently subscribe to `conv:<id>` so the agent's reply lands in the
-    widget the moment it's persisted."""
+    widget the moment it's persisted.
+
+    The `token` query param is the HMAC `/widget/bootstrap` returned. Without
+    it, anyone who could guess (or sniff in plain HTTP) another visitor's id
+    could subscribe to that conversation and read agent replies in real time.
+    """
+    if not _verify_visitor(workspace, visitor, token):
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="invalid token")
+        return
     try:
         boot = await _bootstrap(workspace, visitor, ws.headers.get("user-agent"))
     except HTTPException as e:
@@ -346,8 +430,15 @@ async def widget_ws(ws: WebSocket, workspace: str = Query(...), visitor: str = Q
             except Exception:
                 continue
             if msg.get("action") == "message" and msg.get("text"):
-                await widget_post({"conversationId": boot["conversationId"],
-                                   "text": msg["text"], "from": "Visitor"})
+                # Re-use the HTTP handler so the auth path is identical. The
+                # WebSocket has already been authenticated via `_verify_visitor`,
+                # so we know `(workspace, visitor, token)` are good and can
+                # forward them through.
+                await widget_post({
+                    "conversationId": boot["conversationId"],
+                    "text": msg["text"], "from": "Visitor",
+                    "workspace": workspace, "visitor": visitor, "token": token,
+                })
             elif msg.get("action") == "ping":
                 await ws.send_text(json.dumps({"type": "pong"}))
     except WebSocketDisconnect:

@@ -5,12 +5,14 @@ the standard S3 browser-upload pattern:
 
 1. Frontend asks for a presigned PUT URL (`POST /uploads`).
 2. Frontend PUTs the file directly to `upload_url` with the right Content-Type.
-3. Frontend then sends `public_url` as part of its message body so the
-   conversation / ticket can reference the object without going through our API.
+3. Frontend stores the object key (or a backend-proxied download URL) in
+   `messages.attachments`. To render it later it asks the backend to mint
+   a short-lived presigned GET URL via `GET /uploads/sign?key=<key>`.
 
-On boot we create the bucket if it doesn't exist and set a permissive read
-policy (objects are public-read but UPLOADS still require the presigned URL).
-For prod you'd rotate to a restricted policy + presigned GET URLs.
+The bucket is **private**: the previous implementation set a wildcard
+public-read policy, which made every uploaded object world-readable on
+every URL leak. Reads now go through presigned GETs, scoped to the caller's
+workspace by the key prefix `{workspace_id}/…`.
 """
 from __future__ import annotations
 
@@ -46,22 +48,15 @@ def _client() -> Any:
     )
 
 
-_PUBLIC_READ_POLICY = {
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "AllowPublicRead",
-            "Effect": "Allow",
-            "Principal": "*",
-            "Action": ["s3:GetObject"],
-            "Resource": [f"arn:aws:s3:::{S3_BUCKET}/*"],
-        }
-    ],
-}
-
-
 def ensure_bucket() -> None:
-    """Create the workspace bucket if it doesn't exist. Called once on startup."""
+    """Create the workspace bucket if it doesn't exist. Called once on startup.
+
+    The bucket stays **private** — every read goes through a presigned GET.
+    A previous implementation set a wildcard public-read policy on every
+    boot; we deliberately do not reset that here so existing buckets can
+    be hardened with a manual `aws s3api delete-bucket-policy` (or its
+    MinIO equivalent) without this code re-applying the public policy.
+    """
     try:
         c = _client()
         try:
@@ -72,11 +67,7 @@ def ensure_bucket() -> None:
             if code not in ("404", "NoSuchBucket", "NotFound"):
                 log.warning("head_bucket(%s) returned %s — attempting create", S3_BUCKET, code)
         c.create_bucket(Bucket=S3_BUCKET)
-        try:
-            c.put_bucket_policy(Bucket=S3_BUCKET, Policy=json.dumps(_PUBLIC_READ_POLICY))
-        except ClientError as e:
-            log.info("bucket policy set skipped: %s", e)
-        log.info("minio bucket '%s' ready at %s", S3_BUCKET, S3_ENDPOINT_URL)
+        log.info("minio bucket '%s' ready at %s (private)", S3_BUCKET, S3_ENDPOINT_URL)
     except (BotoCoreError, ClientError, Exception) as e:
         # Don't fail boot if minio isn't reachable — uploads just won't work.
         # The operator can recheck via /healthz and fix the container.
@@ -115,29 +106,50 @@ def get_json(key: str) -> Any | None:
         return None
 
 
-def presign_put(key: str, content_type: str | None = None) -> dict:
-    """Return {upload_url, public_url, key, expires_in} for a direct browser PUT.
+def presign_put(key: str,
+                content_type: str | None = None,
+                content_length_range: tuple[int, int] | None = None) -> dict:
+    """Return {upload_url, key, expires_in} for a direct browser PUT.
 
     `upload_url` goes to MinIO's internal address (inside docker that's
-    `http://minio:9000`). `public_url` rewrites the host to `S3_PUBLIC_URL`
-    so a browser on the host network can actually hit it after the upload.
+    `http://minio:9000`). The browser-visible host is `S3_PUBLIC_URL`.
+
+    `content_length_range` clamps the body size at the SignedURL layer:
+    MinIO/S3 reject the upload if `Content-Length` falls outside the range.
+    Pair with a server-side allowlist + size cap in the route handler so
+    a malicious client can't claim a small `size` and PUT a large file.
     """
     c = _client()
-    params = {"Bucket": S3_BUCKET, "Key": key}
+    params: dict[str, Any] = {"Bucket": S3_BUCKET, "Key": key}
     if content_type:
         params["ContentType"] = content_type
+    if content_length_range:
+        params["ContentLengthRange"] = list(content_length_range)
     upload_url = c.generate_presigned_url(
         "put_object", Params=params, ExpiresIn=S3_PRESIGN_EXPIRES, HttpMethod="PUT"
     )
     # Rewrite internal endpoint → browser-visible endpoint.
     if S3_PUBLIC_URL and S3_PUBLIC_URL != S3_ENDPOINT_URL:
         upload_url = upload_url.replace(S3_ENDPOINT_URL, S3_PUBLIC_URL, 1)
-    public_url = f"{S3_PUBLIC_URL.rstrip('/')}/{S3_BUCKET}/{key}"
     return {
         "upload_url": upload_url,
         "uploadUrl": upload_url,       # frontend naming
-        "public_url": public_url,
-        "publicUrl": public_url,
         "key": key,
         "expires_in": S3_PRESIGN_EXPIRES,
     }
+
+
+def presign_get(key: str, expires_in: int | None = None) -> str:
+    """Return a short-lived presigned GET URL for `key`. The bucket is private,
+    so reads must always go through this — including image previews rendered
+    in the SPA. The /uploads/sign route wraps this with a workspace check."""
+    c = _client()
+    url = c.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=int(expires_in or S3_PRESIGN_EXPIRES),
+        HttpMethod="GET",
+    )
+    if S3_PUBLIC_URL and S3_PUBLIC_URL != S3_ENDPOINT_URL:
+        url = url.replace(S3_ENDPOINT_URL, S3_PUBLIC_URL, 1)
+    return url

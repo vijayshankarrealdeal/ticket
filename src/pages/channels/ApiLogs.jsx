@@ -108,20 +108,11 @@ export default function ApiLogs() {
   const downloadNdjson = async () => {
     // Streams direct from the server so the export is *authoritative* — it
     // pulls up to `limit` rows from the DB, bypassing the in-memory filter
-    // that CSV export uses.
-    const token = (() => {
-      try {
-        const raw = localStorage.getItem('workspacex.auth');
-        const parsed = raw ? JSON.parse(raw) : null;
-        return parsed?.token || parsed?.accessToken || null;
-      } catch { return null; }
-    })();
+    // that CSV export uses. Uses the wx_session cookie for auth.
     const base = import.meta.env.VITE_API_URL || '/api';
     const url = `${base}/api-logs/stream?limit=5000`;
     try {
-      const res = await fetch(url, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
+      const res = await fetch(url, { credentials: 'include' });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       const blob = await res.blob();
       const a = document.createElement('a');

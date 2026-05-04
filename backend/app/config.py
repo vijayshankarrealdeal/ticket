@@ -96,13 +96,16 @@ S3_PRESIGN_EXPIRES = int(_env("S3_PRESIGN_EXPIRES", "300"))  # seconds
 
 
 # --- HTTP / auth ---
+# Locked to the SPA origins by default. Earlier configs included the Langflow
+# origin so its rebrand overlay could call back with `credentials: 'include'`,
+# but Langflow runs untrusted user-loaded Python components — anything that
+# can run inside that tab effectively had a credentialed cross-origin path
+# back to our API. The `/flow/save-as-agent` callback now uses bearer-token
+# auth (no cookies) and a non-credentialed CORS allowance is granted only on
+# that route by `LangflowCallbackCORS` in [main.py](main.py).
 CORS_ORIGINS = _env(
     "CORS_ORIGINS",
-    # Include the Langflow origin by default so the WorkspaceX rebrand
-    # overlay (deploy/langflow/wx-rebrand.js) can call back to us from the
-    # Langflow tab when the user clicks Export. The `credentials: 'include'`
-    # path needs an explicit origin match, not `*`.
-    "http://localhost:5173,http://localhost:3000,http://localhost:7860",
+    "http://localhost:5173,http://localhost:3000",
 ).split(",")
 SESSION_COOKIE = "wx_session"
 SESSION_TTL_DAYS = 30

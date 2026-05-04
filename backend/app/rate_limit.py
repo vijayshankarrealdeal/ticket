@@ -29,80 +29,78 @@ def _cfg(provider: str) -> tuple[float, float]:
 
 
 async def allow(provider: str, scope: str) -> bool:
-    """Debit one token. Returns True when the caller may proceed, False when
-    rate-limited. `scope` is the caller-chosen partition key — typically a
-    workspace id, shop domain, or phone_number_id.
+    """Debit one token atomically. Returns True when the caller may proceed,
+    False when rate-limited. `scope` is the caller-chosen partition key —
+    typically a workspace id, shop domain, or phone_number_id.
+
+    Implementation: take a row-level lock with `SELECT … FOR UPDATE` inside a
+    transaction so the read-refill-write sequence is atomic. Two concurrent
+    requests on the same bucket are serialized on that lock; without it,
+    they can both observe `tokens >= 1`, both decrement, and the bucket
+    silently goes negative (allowing 2× the configured burst).
 
     Best-effort: if the bucket table doesn't exist yet (schema lag), allow
     the request so webhook wiring isn't broken by an old DB.
     """
     key = f"{provider}:{scope}"
     cap, refill = _cfg(provider)
-    now = datetime.now(timezone.utc)
     db = await get_db()
     try:
-        cur = await db.execute(
-            "SELECT tokens, capacity, refill_per_sec, last_refill_at FROM rate_limit_buckets WHERE bucket_key = ?",
-            (key,),
-        )
-        row = await cur.fetchone()
+        async with db.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT tokens, capacity, refill_per_sec, last_refill_at
+                      FROM rate_limit_buckets
+                     WHERE bucket_key = $1
+                       FOR UPDATE
+                    """,
+                    key,
+                )
+                if row is None:
+                    # First hit. Insert with capacity - 1 (debiting this
+                    # request as part of the initial state). Concurrent
+                    # callers race here on the unique constraint; the loser
+                    # falls into the UPDATE branch on the next call.
+                    await conn.execute(
+                        """
+                        INSERT INTO rate_limit_buckets
+                              (bucket_key, tokens, capacity, refill_per_sec, last_refill_at)
+                        VALUES ($1, $2, $3, $4, now())
+                        ON CONFLICT (bucket_key) DO NOTHING
+                        """,
+                        key, cap - 1, cap, refill,
+                    )
+                    return True
+
+                now = datetime.now(timezone.utc)
+                last_ts = row["last_refill_at"]
+                if isinstance(last_ts, str):
+                    try:
+                        last = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+                    except Exception:
+                        last = now
+                elif isinstance(last_ts, datetime):
+                    last = last_ts if last_ts.tzinfo else last_ts.replace(tzinfo=timezone.utc)
+                else:
+                    last = now
+                capacity = float(row["capacity"] or cap)
+                rps = float(row["refill_per_sec"] or refill)
+                tokens = float(row["tokens"] or 0)
+                elapsed = max(0.0, (now - last).total_seconds())
+                tokens = min(capacity, tokens + elapsed * rps)
+
+                allowed = tokens >= 1.0
+                if allowed:
+                    tokens -= 1.0
+                await conn.execute(
+                    """
+                    UPDATE rate_limit_buckets
+                       SET tokens = $1, last_refill_at = now()
+                     WHERE bucket_key = $2
+                    """,
+                    tokens, key,
+                )
+                return allowed
     except Exception:
         return True
-
-    if row is None:
-        # First hit — insert with capacity - 1 tokens and allow.
-        try:
-            await db.execute(
-                """
-                INSERT INTO rate_limit_buckets (bucket_key, tokens, capacity, refill_per_sec, last_refill_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT (bucket_key) DO UPDATE
-                   SET tokens = GREATEST(rate_limit_buckets.tokens - 1, 0)
-                """,
-                (key, cap - 1, cap, refill, now.isoformat()),
-            )
-            await db.commit()
-        except Exception:
-            pass
-        return True
-
-    r = dict(row)
-    tokens = float(r.get("tokens") or 0)
-    capacity = float(r.get("capacity") or cap)
-    rps = float(r.get("refill_per_sec") or refill)
-    last_ts = r.get("last_refill_at")
-    if isinstance(last_ts, str):
-        try:
-            last = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
-        except Exception:
-            last = now
-    elif isinstance(last_ts, datetime):
-        last = last_ts if last_ts.tzinfo else last_ts.replace(tzinfo=timezone.utc)
-    else:
-        last = now
-
-    elapsed = max(0.0, (now - last).total_seconds())
-    tokens = min(capacity, tokens + elapsed * rps)
-    if tokens < 1.0:
-        # Persist the refilled counter so repeated denials don't starve
-        # the bucket from moving forward.
-        try:
-            await db.execute(
-                "UPDATE rate_limit_buckets SET tokens = ?, last_refill_at = ? WHERE bucket_key = ?",
-                (tokens, now.isoformat(), key),
-            )
-            await db.commit()
-        except Exception:
-            pass
-        return False
-
-    tokens -= 1.0
-    try:
-        await db.execute(
-            "UPDATE rate_limit_buckets SET tokens = ?, last_refill_at = ? WHERE bucket_key = ?",
-            (tokens, now.isoformat(), key),
-        )
-        await db.commit()
-    except Exception:
-        pass
-    return True

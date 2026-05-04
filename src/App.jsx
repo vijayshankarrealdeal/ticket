@@ -42,7 +42,12 @@ export default function App() {
   }
 
   // Platform console runs above all workspaces — super-users sign in with
-  // their own credentials (never a workspace user token).
+  // their own credentials (never a workspace user token). The console
+  // self-guards: it boots into a `PlatformLogin` form when no platform
+  // session is cached, and verifies the cached token against
+  // `/platform/auth/me` on mount before rendering the dashboard. Don't
+  // wrap this route in the workspace `loadAuth` check — a super-user can
+  // be signed in without any workspace user, and vice versa.
   if (location.pathname.startsWith('/platform')) {
     return <PlatformConsole />;
   }

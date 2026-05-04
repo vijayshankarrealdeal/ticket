@@ -6,6 +6,7 @@ short-circuits in dev. Wire to the real providers using the recipes in BACKEND_S
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -15,9 +16,35 @@ from passlib.hash import argon2
 
 from ..config import SESSION_COOKIE, SESSION_TTL_DAYS
 from ..db import get_db
+from ..rate_limit import allow as _rl_allow
 from ..schemas import AuthOut, SigninIn, SignupIn, UserOut
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP. Trusts `X-Forwarded-For` only in front of a
+    reverse proxy — set `TRUST_PROXY_HEADERS=1` once that's true. Otherwise
+    fall back to the socket peer."""
+    if os.environ.get("TRUST_PROXY_HEADERS") == "1":
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
+    return (request.client.host if request.client else "unknown") or "unknown"
+
+
+async def _rate_limit_auth(request: Request, kind: str, identifier: str) -> None:
+    """Throttle signin/signup. argon2 is intentionally expensive (~80ms) so
+    unbounded calls pin CPU; here we cap each (kind, ip) and (kind, identifier)
+    bucket independently. Defaults are tuneable via
+    `RL_AUTH_<KIND>_CAPACITY` / `RL_AUTH_<KIND>_REFILL` env vars (token bucket;
+    see backend/app/rate_limit.py)."""
+    ip = _client_ip(request)
+    provider = f"auth_{kind}"
+    if not await _rl_allow(provider, f"ip:{ip}"):
+        raise HTTPException(status_code=429, detail="too many requests")
+    if identifier and not await _rl_allow(provider, f"id:{identifier.lower()}"):
+        raise HTTPException(status_code=429, detail="too many requests")
 
 
 def _hash_token(token: str) -> str:
@@ -99,7 +126,8 @@ async def _create_session(user_id: str, response: Response | None = None) -> str
 
 
 @router.post("/signup", response_model=AuthOut)
-async def signup(body: SignupIn, response: Response) -> AuthOut:
+async def signup(body: SignupIn, request: Request, response: Response) -> AuthOut:
+    await _rate_limit_auth(request, "signup", str(body.email))
     db = await get_db()
     email = str(body.email).lower()
     cur = await db.execute("SELECT 1 FROM users WHERE email = ?", (email,))
@@ -138,7 +166,8 @@ async def signup(body: SignupIn, response: Response) -> AuthOut:
 
 
 @router.post("/signin", response_model=AuthOut)
-async def signin(body: SigninIn, response: Response) -> AuthOut:
+async def signin(body: SigninIn, request: Request, response: Response) -> AuthOut:
+    await _rate_limit_auth(request, "signin", str(body.email))
     db = await get_db()
     cur = await db.execute(
         "SELECT * FROM users WHERE email = ?", (str(body.email).lower(),)
@@ -157,6 +186,40 @@ async def signin(body: SigninIn, response: Response) -> AuthOut:
     token = await _create_session(user["id"], response)
     user_out = await _to_user_out(user)
     return AuthOut(user=UserOut(**user_out), token=token, accessToken=token)
+
+
+@router.post("/handoff-token")
+async def handoff_token(request: Request) -> dict:
+    """Mint a short-lived bearer for places where the httponly cookie can't
+    travel: the `/ws` WebSocket upgrade (no JS-controlled headers on the
+    handshake) and cross-origin full-tab navigations (SPA on :5173 →
+    backend on :8000 in dev).
+
+    Authenticate this request with the cookie (or a Bearer header if a
+    legacy caller still uses one), then issue a narrow bearer that's only
+    valid for the next minute. The token lives in `auth_sessions` exactly
+    like a normal session row, so all the existing validation paths just
+    work; the short TTL keeps the blast radius small if it leaks via a
+    referrer header or browser history.
+    """
+    auth = request.headers.get("authorization", "")
+    cookie_token: str | None = None
+    if auth.lower().startswith("bearer "):
+        cookie_token = auth.split(" ", 1)[1].strip()
+    if not cookie_token:
+        cookie_token = request.cookies.get(SESSION_COOKIE)
+    user = await session_user_from_token(cookie_token) if cookie_token else None
+    if user is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    db = await get_db()
+    raw, hashed = _issue_token()
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
+    await db.execute(
+        "INSERT INTO auth_sessions (id, user_id, token_hash, expires_at) VALUES (?,?,?,?)",
+        (str(uuid4()), user["id"], hashed, expires),
+    )
+    await db.commit()
+    return {"token": raw, "expires_in": 60}
 
 
 @router.post("/signout")
@@ -190,15 +253,15 @@ async def me(request: Request) -> dict | None:
 
 
 @router.post("/forgot-password", status_code=202)
-async def forgot_password(body: dict) -> dict:
+async def forgot_password(body: dict, request: Request) -> dict:
     """Issue a password-reset token. Real Build-3+ deployment delivers it via
-    SMTP/SES; for now we echo the token in the response when `DEV_RESET_TOKEN`
-    is on so the SPA's forgot-password form can test the round-trip end to
-    end. Always returns 202 — never reveals whether the email exists."""
-    import os
+    SMTP/SES; for now we echo the token in the response only when
+    `DEV_RESET_TOKEN=1` is set explicitly so prod never leaks tokens. Always
+    returns 202 — never reveals whether the email exists."""
     email = (body or {}).get("email", "").strip().lower()
     if not email:
         raise HTTPException(400, "email required")
+    await _rate_limit_auth(request, "forgot", email)
     db = await get_db()
     cur = await db.execute("SELECT id FROM users WHERE email = ?", (email,))
     row = await cur.fetchone()
@@ -236,7 +299,9 @@ async def forgot_password(body: dict) -> dict:
             })),
         )
         await db.commit()
-        if os.environ.get("DEV_RESET_TOKEN", "1") == "1":
+        # Default OFF so prod never echoes the reset token. Set DEV_RESET_TOKEN=1
+        # explicitly in local dev to enable the round-trip test path.
+        if os.environ.get("DEV_RESET_TOKEN", "0") == "1":
             payload["devToken"] = raw
     return payload
 

@@ -70,17 +70,17 @@ export default function Platforms() {
     if (!connected && OAUTH_CHANNELS[p.id]) {
       // Real OAuth round-trip: redirect to the backend starter, which bounces
       // to the provider and drops us back at /platforms with ?connected=<id>.
-      // We ship the bearer token on the URL because the full-tab navigation
-      // jumps cross-origin (localhost:5173 → localhost:8000) and the
-      // wx_session cookie doesn't tag along.
+      // Same-origin path uses the wx_session cookie. For cross-origin dev
+      // (SPA on :5173 → backend on :8000) we fall back to a short-lived
+      // handoff token minted from the cookie — the long-lived bearer is
+      // never read from JS-accessible storage.
       const base = import.meta.env.VITE_API_URL || '/api';
-      let token = '';
-      try {
-        const auth = JSON.parse(localStorage.getItem('workspacex.auth') || '{}');
-        token = auth.token || auth.accessToken || '';
-      } catch {}
+      const { getHandoffToken } = await import('../api.js');
+      const token = (await getHandoffToken()) || '';
       const returnTo = window.location.origin + window.location.pathname;
-      const qs = new URLSearchParams({ mode: 'connect', return_to: returnTo, token }).toString();
+      const params = { mode: 'connect', return_to: returnTo };
+      if (token) params.token = token;
+      const qs = new URLSearchParams(params).toString();
       window.location.href = `${base}/auth/oauth/${OAUTH_CHANNELS[p.id]}/start?${qs}`;
       return;
     }

@@ -3,6 +3,12 @@ import TopBar from '../components/TopBar.jsx';
 import { useAnimationPref } from '../hooks/useAnimationPref.js';
 import { api } from '../api.js';
 
+// Surface fetch failures in devtools instead of silently rendering empty
+// states. The settings page is full of optional sub-resources (billing, SLA,
+// notification prefs) that legitimately may not exist; we still want the
+// underlying error visible when one of them blows up.
+const logError = (scope) => (err) => console.error(`[settings:${scope}]`, err);
+
 const sections = [
   { key: 'profile', label: 'Profile' },
   { key: 'workspace', label: 'Workspace' },
@@ -84,7 +90,7 @@ function SaveButton({ state, label = 'Save changes' }) {
 function Profile() {
   const [me, setMe] = useState(null);
   const [state, save] = useAsyncSave();
-  useEffect(() => { api.get('/me').then(setMe).catch(() => {}); }, []);
+  useEffect(() => { api.get('/me').then(setMe).catch(logError('profile')); }, []);
   function onSubmit(e) {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
@@ -114,7 +120,7 @@ function Profile() {
 function Workspace() {
   const [ws, setWs] = useState(null);
   const [state, save] = useAsyncSave();
-  useEffect(() => { api.get('/workspace').then(setWs).catch(() => {}); }, []);
+  useEffect(() => { api.get('/workspace').then(setWs).catch(logError('workspace')); }, []);
   function onSubmit(e) {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
@@ -202,7 +208,7 @@ function Notifications() {
   const [prefs, setPrefs] = useState({ email: true, browser: false, digest: 'daily' });
   const [state, save] = useAsyncSave();
   useEffect(() => {
-    api.get('/me/notification-prefs').then((p) => setPrefs({ ...prefs, ...p })).catch(() => {});
+    api.get('/me/notification-prefs').then((p) => setPrefs({ ...prefs, ...p })).catch(logError('notification-prefs'));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   function toggle(key) {
@@ -277,7 +283,7 @@ function ConnectedAccounts() {
   const [err, setErr] = useState(null);
   const [msg, setMsg] = useState(null);
 
-  const reload = () => api.get('/me').then(setMe).catch(() => {});
+  const reload = () => api.get('/me').then(setMe).catch(logError('security'));
   useEffect(() => { reload(); }, []);
 
   const providers = [
@@ -434,8 +440,11 @@ function SlaPolicies() {
   const [state, save] = useAsyncSave();
   const isAdmin = me?.role === 'admin';
   useEffect(() => {
-    api.get('/me').then(setMe).catch(() => {});
-    api.get('/workspace/sla-policies').then(setList).catch(() => setList([]));
+    api.get('/me').then(setMe).catch(logError('sla-me'));
+    api.get('/workspace/sla-policies').then(setList).catch((err) => {
+      logError('sla-policies')(err);
+      setList([]);
+    });
   }, []);
   function onSubmit(e) {
     e.preventDefault();
@@ -593,13 +602,13 @@ function Billing() {
 
   const reload = () => {
     Promise.all([
-      api.get('/billing/plan').catch(() => null),
-      api.get('/billing/usage').catch(() => null),
-      api.get('/billing/invoices').catch(() => []),
+      api.get('/billing/plan').catch((err) => { logError('billing-plan')(err); return null; }),
+      api.get('/billing/usage').catch((err) => { logError('billing-usage')(err); return null; }),
+      api.get('/billing/invoices').catch((err) => { logError('billing-invoices')(err); return []; }),
     ]).then(([p, u, inv]) => { setPlan(p); setUsage(u); setInvoices(inv || []); });
   };
   useEffect(() => {
-    api.get('/me').then(setMe).catch(() => {});
+    api.get('/me').then(setMe).catch(logError('billing-me'));
     reload();
   }, []);
 
@@ -740,10 +749,13 @@ function Members() {
   const isAdmin = me?.role === 'admin';
 
   const reload = () => {
-    api.get('/workspace/members').then(setList).catch(() => setList([]));
+    api.get('/workspace/members').then(setList).catch((err) => {
+      logError('members')(err);
+      setList([]);
+    });
   };
   useEffect(() => {
-    api.get('/me').then(setMe).catch(() => {});
+    api.get('/me').then(setMe).catch(logError('members-me'));
     reload();
   }, []);
 
@@ -858,8 +870,11 @@ function Broadcasts() {
   const [state, save] = useAsyncSave();
   const isAdmin = me?.role === 'admin';
   useEffect(() => {
-    api.get('/me').then(setMe).catch(() => {});
-    api.get('/workspace/broadcasts').then(setList).catch(() => setList([]));
+    api.get('/me').then(setMe).catch(logError('broadcasts-me'));
+    api.get('/workspace/broadcasts').then(setList).catch((err) => {
+      logError('broadcasts')(err);
+      setList([]);
+    });
   }, []);
   function onSubmit(e) {
     e.preventDefault();

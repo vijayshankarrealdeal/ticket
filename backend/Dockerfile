@@ -20,27 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # ---- deps layer ----
 FROM base AS deps
-COPY requirements.txt* pyproject.toml* poetry.lock* ./
-RUN if [ -f requirements.txt ]; then \
-        pip install -r requirements.txt ; \
-    else \
-        pip install \
-          "fastapi[standard]" \
-          "uvicorn[standard]" \
-          "pydantic>=2" \
-          "pydantic-ai" \
-          "sqlalchemy>=2" \
-          "asyncpg" \
-          "psycopg[binary]" \
-          "alembic" \
-          "redis>=5" \
-          "httpx" \
-          "python-jose[cryptography]" \
-          "passlib[argon2]" \
-          "python-multipart" \
-          "boto3" \
-          "openai" ; \
-    fi
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
 
 # ---- runtime ----
 FROM base AS runner

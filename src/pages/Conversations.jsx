@@ -10,6 +10,8 @@ import { api, uploadFile } from '../api.js';
 import { useRealtimeTopic } from '../hooks/useRealtime.js';
 import { loadAuth } from './AuthPage.jsx';
 
+const logError = (scope) => (err) => console.error(`[conversations:${scope}]`, err);
+
 const CHANNELS = ['All', 'WhatsApp', 'Instagram', 'Live Chat', 'Mails'];
 
 // Backend stores raw channel names (gmail/whatsapp/outlook/...) while the UI
@@ -63,7 +65,7 @@ export default function Conversations() {
         if (!alive || !detail) return;
         setList((prev) => prev.map((t) => t.id === selectedId ? { ...t, ...detail } : t));
       })
-      .catch(() => {});
+      .catch(logError('conversation-detail'));
     return () => { alive = false; };
   }, [selectedId]);
 
@@ -89,7 +91,7 @@ export default function Conversations() {
       setList((prev) => {
         const known = prev.some((c) => c.id === evt.data.id);
         if (!known) {
-          api.get('/conversations').then((rows) => setList(Array.isArray(rows) ? rows : [])).catch(() => {});
+          api.get('/conversations').then((rows) => setList(Array.isArray(rows) ? rows : [])).catch(logError('conversations-refetch'));
           return prev;
         }
         return prev.map((c) => c.id === evt.data.id ? { ...c, ...evt.data } : c);
@@ -588,7 +590,7 @@ export default function Conversations() {
                   )}
                 </div>
                 <SyncInboxButton onSynced={() => {
-                  api.get('/conversations').then((rows) => setList(Array.isArray(rows) ? rows : [])).catch(() => {});
+                  api.get('/conversations').then((rows) => setList(Array.isArray(rows) ? rows : [])).catch(logError('conversations-refetch'));
                 }} />
                 <div className="dropdown" style={{ display: 'flex' }}>
                   <button

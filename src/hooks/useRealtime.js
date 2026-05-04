@@ -11,6 +11,7 @@
  * Build 2. See wire.md.
  */
 import { useEffect, useRef } from 'react';
+import { api } from '../api.js';
 
 const BASE_WS = (() => {
   const apiBase = import.meta.env.VITE_API_URL || '/api';
@@ -27,12 +28,15 @@ let reconnectTimer = null;
 const subs = new Map(); // topic -> Set<(evt)=>void>
 const pendingQueue = []; // frames to send once connected
 
-function authToken() {
+// The WS upgrade can't read the httponly session cookie from JavaScript, and
+// browsers don't send cookies on cross-origin WebSocket handshakes from
+// within `new WebSocket(url)`. Mint a short-lived bearer from
+// /auth/handoff-token (which IS authenticated by the cookie) and pass it on
+// the URL only for the upgrade. Token is short-TTL and never lands in storage.
+async function fetchWsToken() {
   try {
-    const raw = localStorage.getItem('workspacex.auth');
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    return parsed?.token || parsed?.accessToken || null;
+    const res = await api.post('/auth/handoff-token');
+    return res?.token || null;
   } catch {
     return null;
   }
@@ -48,11 +52,15 @@ function sendFrame(obj) {
   }
 }
 
-function connect() {
+async function connect() {
   if (socket || state === 'connecting') return;
-  const token = authToken();
-  if (!token) return; // wait until signed in
   state = 'connecting';
+  const token = await fetchWsToken();
+  if (!token) {
+    state = 'closed';
+    scheduleReconnect();
+    return;
+  }
   try {
     socket = new WebSocket(`${BASE_WS}?token=${encodeURIComponent(token)}`);
   } catch {

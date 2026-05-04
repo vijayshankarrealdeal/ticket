@@ -143,15 +143,10 @@ export default function ApiLibrary() {
 
   const downloadLogs = async () => {
     try {
-      const res = await fetch(`${import.meta.env.VITE_API_URL || '/api'}/api-logs/stream?limit=5000`, {
-        headers: (() => {
-          try {
-            const raw = localStorage.getItem('workspacex.auth');
-            const t = raw && (JSON.parse(raw).token || JSON.parse(raw).accessToken);
-            return t ? { Authorization: `Bearer ${t}` } : {};
-          } catch { return {}; }
-        })(),
-      });
+      const res = await fetch(
+        `${import.meta.env.VITE_API_URL || '/api'}/api-logs/stream?limit=5000`,
+        { credentials: 'include' },
+      );
       if (!res.ok) throw new Error(`${res.status}`);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);

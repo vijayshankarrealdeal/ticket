@@ -81,26 +81,142 @@ def row_to_dict(row: Row | dict | None) -> dict | None:
 # ---------- placeholder rewrite ----------------------------------------------
 
 
-_QUOTE_RE = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+_DOLLAR_TAG_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+# JSONB operators that contain a literal `?`. We must NOT rewrite these.
+_JSONB_OPS = ("?|", "?&", "@?", "?#")
 
 
 def _qmark_to_dollar(sql: str) -> str:
-    """Replace `?` outside quoted literals with `$1, $2, …`."""
-    counter = {"n": 0}
+    """Replace bind `?` placeholders with `$1, $2, …`.
 
-    def _sub_safe(text: str) -> str:
-        def _repl(_m: re.Match) -> str:
-            counter["n"] += 1
-            return f"${counter['n']}"
-        return re.sub(r"\?", _repl, text)
+    Skips:
+    - single-quoted strings (`'…'`, including doubled `''` escapes and
+      E-string backslash escapes like `E'\\''`),
+    - double-quoted identifiers (`"…"` with `""` escapes),
+    - dollar-quoted strings (`$$…$$`, `$tag$…$tag$`),
+    - line comments (`-- … \\n`) and block comments (`/* … */`),
+    - multi-character JSONB operators that contain `?` (`?|`, `?&`, `@?`,
+      `?#`).
 
+    The bare `?` JSONB existence operator (`data ? 'key'`) is **not**
+    distinguishable from a bind placeholder by surrounding whitespace, so
+    routers must use `jsonb_exists(col, 'key')` instead of `col ? 'key'`.
+    """
     out: list[str] = []
-    last = 0
-    for m in _QUOTE_RE.finditer(sql):
-        out.append(_sub_safe(sql[last:m.start()]))
-        out.append(m.group(0))  # preserve quoted literals verbatim
-        last = m.end()
-    out.append(_sub_safe(sql[last:]))
+    i = 0
+    n = len(sql)
+    counter = 0
+
+    while i < n:
+        ch = sql[i]
+
+        # Line comment: -- … (to end of line)
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            j = sql.find("\n", i)
+            if j == -1:
+                out.append(sql[i:])
+                return "".join(out)
+            out.append(sql[i : j + 1])
+            i = j + 1
+            continue
+
+        # Block comment: /* … */
+        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            j = sql.find("*/", i + 2)
+            if j == -1:
+                out.append(sql[i:])
+                return "".join(out)
+            out.append(sql[i : j + 2])
+            i = j + 2
+            continue
+
+        # E'…' escape strings: backslash escapes work inside.
+        if ch in ("E", "e") and i + 1 < n and sql[i + 1] == "'":
+            out.append(sql[i : i + 2])
+            j = i + 2
+            while j < n:
+                c = sql[j]
+                if c == "\\" and j + 1 < n:
+                    out.append(sql[j : j + 2])
+                    j += 2
+                    continue
+                if c == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        out.append("''")
+                        j += 2
+                        continue
+                    out.append("'")
+                    j += 1
+                    break
+                out.append(c)
+                j += 1
+            i = j
+            continue
+
+        # Single-quoted string with doubled-quote escapes.
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(sql[i:j])
+            i = j
+            continue
+
+        # Double-quoted identifier with doubled-quote escapes.
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if sql[j] == '"':
+                    if j + 1 < n and sql[j + 1] == '"':
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(sql[i:j])
+            i = j
+            continue
+
+        # Dollar-quoted string: $tag$…$tag$ (tag may be empty).
+        if ch == "$":
+            m = _DOLLAR_TAG_RE.match(sql, i)
+            if m:
+                tag = m.group(0)
+                j = sql.find(tag, m.end())
+                if j == -1:
+                    out.append(sql[i:])
+                    return "".join(out)
+                end = j + len(tag)
+                out.append(sql[i:end])
+                i = end
+                continue
+
+        # JSONB multi-char operators that contain `?`.
+        if ch == "?" and i + 1 < n and sql[i : i + 2] in _JSONB_OPS:
+            out.append(sql[i : i + 2])
+            i += 2
+            continue
+        if ch == "@" and i + 1 < n and sql[i : i + 2] == "@?":
+            out.append(sql[i : i + 2])
+            i += 2
+            continue
+
+        # Bare `?` — always treated as a bind placeholder (see docstring).
+        if ch == "?":
+            counter += 1
+            out.append(f"${counter}")
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
     return "".join(out)
 
 
@@ -196,7 +312,63 @@ def _mask_dsn(dsn: str) -> str:
     return re.sub(r"://([^:]+):[^@]+@", r"://\1:***@", dsn)
 
 
+MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+
+
+async def _ensure_migration_table(db: DB) -> None:
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          name        text PRIMARY KEY,
+          applied_at  timestamptz NOT NULL DEFAULT now()
+        );
+        """
+    )
+
+
+async def _applied_migrations(db: DB) -> set[str]:
+    cur = await db.execute("SELECT name FROM schema_migrations")
+    rows = await cur.fetchall()
+    return {r[0] for r in rows}
+
+
+async def _apply_numbered_migrations(db: DB) -> None:
+    """Apply files in `app/migrations/` in lexicographic order, tracking each
+    in `schema_migrations` so reruns are no-ops. Opt-in via
+    `RUN_NUMBERED_MIGRATIONS=1` because migration `0002_pgvector.sql` requires
+    a Postgres install with the `vector` extension available, and `0003_rls.sql`
+    enables row-level security which downstream code must be compatible with."""
+    if os.environ.get("RUN_NUMBERED_MIGRATIONS", "0") != "1":
+        return
+    if not MIGRATIONS_DIR.exists():
+        return
+    files = sorted(p for p in MIGRATIONS_DIR.glob("*.sql") if p.is_file())
+    if not files:
+        return
+    await _ensure_migration_table(db)
+    applied = await _applied_migrations(db)
+    for path in files:
+        if path.name in applied:
+            continue
+        log.info("applying migration %s …", path.name)
+        sql = path.read_text()
+        async with db.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(sql)
+                await conn.execute(
+                    "INSERT INTO schema_migrations (name) VALUES ($1) ON CONFLICT DO NOTHING",
+                    path.name,
+                )
+        log.info("migration %s applied", path.name)
+
+
 async def _run_migrations(db: DB) -> None:
+    """Apply schema.sql (idempotent baseline) and any opt-in numbered
+    migrations. Set `AUTO_MIGRATE=0` in production where migrations run
+    out-of-band (CI / one-shot job) — the schema-apply on every API boot
+    risks a partial-deploy race where the new schema lands before the new
+    code does.
+    """
     if not AUTO_MIGRATE:
         log.info("AUTO_MIGRATE=0 — skipping schema apply")
         return
@@ -206,22 +378,44 @@ async def _run_migrations(db: DB) -> None:
     log.info("applying schema.sql …")
     await db.executescript(SCHEMA_FILE.read_text())
     log.info("schema applied")
+    await _apply_numbered_migrations(db)
     await _bootstrap_platform_admin(db)
 
 
 async def _bootstrap_platform_admin(db: DB) -> None:
     """Ensure at least one super-user exists so the platform console is
-    reachable on a fresh install. Credentials come from env (PLATFORM_ADMIN_*)
-    or fall back to a dev default. Idempotent — does nothing once a row
-    exists."""
+    reachable on a fresh install. Credentials come from env
+    (PLATFORM_ADMIN_EMAIL + PLATFORM_ADMIN_PASSWORD). Idempotent — does
+    nothing once a row exists.
+
+    Why no defaults: a forgotten env var in prod previously meant the box
+    booted with `superuser@workspacex.com / superuser` god-mode credentials
+    over every tenant. Missing env now skips bootstrap entirely; operator
+    must run `python -m app.create_super_admin` to seed the first row."""
     import os
     from passlib.hash import argon2
     cur = await db.execute("SELECT COUNT(*) FROM platform_admins")
     (n,) = (await cur.fetchone()) or (0,)
     if int(n or 0) > 0:
         return
-    email = (os.environ.get("PLATFORM_ADMIN_EMAIL") or "superuser@workspacex.com").lower()
-    password = os.environ.get("PLATFORM_ADMIN_PASSWORD") or "superuser"
+    email = (os.environ.get("PLATFORM_ADMIN_EMAIL") or "").strip().lower()
+    password = os.environ.get("PLATFORM_ADMIN_PASSWORD") or ""
+    if not email or not password:
+        log.warning(
+            "PLATFORM_ADMIN_EMAIL / PLATFORM_ADMIN_PASSWORD not set — "
+            "skipping platform-admin bootstrap. Run "
+            "`python -m app.create_super_admin` to seed the first super-user."
+        )
+        return
+    if len(password) < 12:
+        # Refuse to mint a god-mode account behind a trivially-guessable
+        # password. The operator can always invoke create_super_admin
+        # interactively for one-off provisioning.
+        log.error(
+            "PLATFORM_ADMIN_PASSWORD must be at least 12 characters — "
+            "refusing to bootstrap platform admin."
+        )
+        return
     name = os.environ.get("PLATFORM_ADMIN_NAME") or "Platform Admin"
     from uuid import uuid4 as _uuid
     await db.execute(

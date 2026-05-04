@@ -70,17 +70,16 @@ export default function ChannelsOverview() {
 
   const OAUTH_CHANNELS = { gmail: 'google', outlook: 'outlook' };
 
-  const startOAuth = (id) => {
+  const startOAuth = async (id) => {
     // OAuth channels: redirect through /auth/oauth/<provider>/start so the
     // real token exchange happens (Platforms.jsx uses the same flow).
     const base = import.meta.env.VITE_API_URL || '/api';
-    let token = '';
-    try {
-      const auth = JSON.parse(localStorage.getItem('workspacex.auth') || '{}');
-      token = auth.token || auth.accessToken || '';
-    } catch {}
+    const { getHandoffToken } = await import('../../api.js');
+    const token = (await getHandoffToken()) || '';
     const returnTo = window.location.origin + window.location.pathname;
-    const qs = new URLSearchParams({ mode: 'connect', return_to: returnTo, token }).toString();
+    const params = { mode: 'connect', return_to: returnTo };
+    if (token) params.token = token;
+    const qs = new URLSearchParams(params).toString();
     window.location.href = `${base}/auth/oauth/${OAUTH_CHANNELS[id]}/start?${qs}`;
   };
 

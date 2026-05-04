@@ -5,27 +5,24 @@ import { Spinner } from '../components/Spinner.jsx';
 import { api } from '../api.js';
 
 // Build the `/flow/launch` URL the new tab navigates into. The backend logs
-// the user into Langflow and 302s into the flow editor. The `?token=`
-// fallback is needed because the new tab is cross-origin in host-mode dev
-// (SPA on :5173, backend on :8000) and the `wx_session` cookie won't
-// follow.
-function launchUrl(agentId) {
+// the user into Langflow and 302s into the flow editor. Same-origin uses
+// the wx_session cookie automatically; cross-origin dev (SPA on :5173,
+// backend on :8000) falls back to a short-lived handoff token minted from
+// the cookie. The long-lived bearer is never read from storage.
+async function launchUrl(agentId) {
   const base = import.meta.env.VITE_API_URL || '/api';
-  let token = '';
-  try {
-    const auth = JSON.parse(localStorage.getItem('workspacex.auth') || '{}');
-    token = auth.token || auth.accessToken || '';
-  } catch { }
+  const { getHandoffToken } = await import('../api.js');
+  const token = (await getHandoffToken()) || '';
   const params = new URLSearchParams();
   if (agentId) params.set('agent', agentId);
   if (token) params.set('token', token);
   return `${base}/flow/launch?${params.toString()}`;
 }
 
-function openFlow(agentId) {
+async function openFlow(agentId) {
   // `noopener` so the Langflow tab can't reach back into this window via
   // `window.opener`. Also prevents it from becoming a focus-stealing child.
-  window.open(launchUrl(agentId), '_blank', 'noopener');
+  window.open(await launchUrl(agentId), '_blank', 'noopener');
 }
 
 function formatRelativeTime(iso) {

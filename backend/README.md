@@ -1,6 +1,6 @@
 # WorkspaceX backend (FastAPI + Postgres + MinIO)
 
-Scope: Build 1 of [BACKEND_SPEC.md](../BACKEND_SPEC.md) — Auth + Customers + Conversations + Messages + Tickets, realtime over WebSocket, direct-to-MinIO presigned uploads. Pages that belong to Build 2/3 (Notifications feed, Teams chat, Platforms, Channels, Analytics, Agents, Search) have stub endpoints returning seeded or empty data so the React frontend loads without modification.
+Scope: end-to-end implementation of Builds 1–3 from [BACKEND_SPEC.md](../BACKEND_SPEC.md). Auth, Customers, Conversations, Messages, Tickets, Notifications feed, Teams chat (channels + DMs), Platforms (OAuth + form-driven connectors), Channels (API library, playground, sheets, health probes), Analytics (CSAT, dashboards), and Search are real implementations backed by Postgres and the WebSocket broker. The only canned-response endpoint left from earlier Builds is `/agents/{id}/test`, which still returns deterministic mock output until the streaming Langflow integration replaces it.
 
 ## Run the whole stack
 
@@ -56,7 +56,7 @@ On first boot the app:
 1. Waits for Postgres to accept connections (retry loop; handles `docker compose up` race).
 2. Applies [app/schema.sql](app/schema.sql) with `IF NOT EXISTS` — idempotent.
 3. Runs the demo seed when the `users` table is empty (demo creds above).
-4. Ensures the MinIO bucket `workspacex` exists with public-read access on objects.
+4. Ensures the private MinIO bucket `workspacex` exists. Reads go through `GET /uploads/sign?key=…`, which mints a short-lived presigned URL scoped to the caller's workspace.
 
 Set `AUTO_MIGRATE=0` to disable the schema apply (use real migrations in prod). Set `AUTO_SEED=0` to skip the demo seed.
 
@@ -110,3 +110,13 @@ backend/
 - Reseed without wiping schema: `docker exec -it workspacex-api-1 python -m app.seed`.
 - Inspect WebSocket traffic: DevTools → Network → `ws` entry → Frames.
 - Inspect MinIO objects: `http://localhost:9001` → bucket `workspacex`.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest                           # unit suite (no infra)
+TEST_DATABASE_URL=postgres://… pytest -m integration   # DB-backed checks
+```
+
+The unit suite covers the placeholder translator, DSN normaliser, widget HMAC signer, and upload allowlist. Integration tests are skipped unless `TEST_DATABASE_URL` is set.
