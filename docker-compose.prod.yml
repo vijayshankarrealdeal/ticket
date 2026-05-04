@@ -38,6 +38,10 @@ services:
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
 
+  db-init:
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+
   api:
     environment:
       DATABASE_URL: postgresql://workspacex:${POSTGRES_PASSWORD}@db:5432/workspacex
@@ -62,6 +66,7 @@ services:
   langflow:
     environment:
       LANGFLOW_CORS_ORIGINS: https://${PUBLIC_DOMAIN}
+      LANGFLOW_DATABASE_URL: postgresql://workspacex:${POSTGRES_PASSWORD}@db:5432/langflow
 
 volumes:
   caddy_data:
