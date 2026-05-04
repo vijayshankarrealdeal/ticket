@@ -40,6 +40,9 @@ jobs:
     timeout-minutes: 25
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Configure SSH
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
@@ -50,23 +53,22 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Sync repo on VM
+      - name: Sync working tree to VM
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
-          GITHUB_SHA: ${{ github.sha }}
         run: |
-          ssh "$VM_USER@$VM_HOST" "REPO_SHA='$GITHUB_SHA' bash -s" <<'REMOTE'
-          set -euo pipefail
-          DEST=/opt/workspacex
-          if [ ! -d "$DEST/.git" ]; then
-            sudo install -d -o "$USER" -g "$USER" "$DEST"
-            git clone https://github.com/vijayshankarrealdeal/ticket.git "$DEST"
-          fi
-          cd "$DEST"
-          git fetch origin main
-          git reset --hard "$REPO_SHA"
-          REMOTE
+          # Make sure the destination exists and is writable for our user.
+          ssh "$VM_USER@$VM_HOST" 'sudo install -d -o "$USER" -g "$USER" /opt/workspacex'
+          # rsync the repo (excluding .git, node_modules, build artefacts).
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            --exclude 'dist' \
+            --exclude '__pycache__' \
+            --exclude '.venv' \
+            --exclude '.env' \
+            ./ "$VM_USER@$VM_HOST":/opt/workspacex/
 
       - name: Write .env on VM and roll the stack
         env:
