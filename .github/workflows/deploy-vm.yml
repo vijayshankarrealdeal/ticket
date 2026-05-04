@@ -74,6 +74,7 @@ jobs:
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
+          # Core
           PUBLIC_DOMAIN: ${{ secrets.PUBLIC_DOMAIN }}
           ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
@@ -82,10 +83,42 @@ jobs:
           WORKSPACEX_INTERNAL_KEY: ${{ secrets.WORKSPACEX_INTERNAL_KEY }}
           PLATFORM_ADMIN_EMAIL: ${{ secrets.PLATFORM_ADMIN_EMAIL }}
           PLATFORM_ADMIN_PASSWORD: ${{ secrets.PLATFORM_ADMIN_PASSWORD }}
+          # AI
           AZURE_OPEN_AI_KEY: ${{ secrets.AZURE_OPEN_AI_KEY }}
           AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          # Google OAuth + Gmail
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GMAIL_PUBSUB_TOPIC: ${{ secrets.GMAIL_PUBSUB_TOPIC }}
+          # Outlook / Microsoft
+          OUTLOOK_CLIENT_ID: ${{ secrets.OUTLOOK_CLIENT_ID }}
+          OUTLOOK_CLIENT_SECRET: ${{ secrets.OUTLOOK_CLIENT_SECRET }}
+          OUTLOOK_TENANT_ID: ${{ secrets.OUTLOOK_TENANT_ID }}
+          OUTLOOK_CLIENT_STATE: ${{ secrets.OUTLOOK_CLIENT_STATE }}
+          OUTLOOK_NOTIFICATION_URL: ${{ secrets.OUTLOOK_NOTIFICATION_URL }}
+          MICROSOFT_CLIENT_ID: ${{ secrets.MICROSOFT_CLIENT_ID }}
+          MICROSOFT_CLIENT_SECRET: ${{ secrets.MICROSOFT_CLIENT_SECRET }}
+          # SMTP outbox
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          # Channels
+          WHATSAPP_ACCESS_TOKEN: ${{ secrets.WHATSAPP_ACCESS_TOKEN }}
+          WHATSAPP_PHONE_NUMBER_ID: ${{ secrets.WHATSAPP_PHONE_NUMBER_ID }}
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+          INSTAGRAM_PAGE_ID: ${{ secrets.INSTAGRAM_PAGE_ID }}
+          MESSENGER_PAGE_ACCESS_TOKEN: ${{ secrets.MESSENGER_PAGE_ACCESS_TOKEN }}
+          MESSENGER_PAGE_ID: ${{ secrets.MESSENGER_PAGE_ID }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_DEFAULT_CHANNEL: ${{ secrets.SLACK_DEFAULT_CHANNEL }}
+          SHOPIFY_API_VERSION: ${{ secrets.SHOPIFY_API_VERSION }}
+          SHOPIFY_WEBHOOK_ADDRESS: ${{ secrets.SHOPIFY_WEBHOOK_ADDRESS }}
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
         run: |
           umask 077
           # Write the dotenv locally then scp it — keeps the secrets out of
@@ -101,8 +134,41 @@ jobs:
           PLATFORM_ADMIN_PASSWORD=$PLATFORM_ADMIN_PASSWORD
           AZURE_OPEN_AI_KEY=$AZURE_OPEN_AI_KEY
           AZURE_ENDPOINT=$AZURE_ENDPOINT
+          # Google OAuth + Gmail
           Client_ID=$GOOGLE_CLIENT_ID
           Client_Secret=$GOOGLE_CLIENT_SECRET
+          GOOGLE_CLIENT_ID=$GOOGLE_CLIENT_ID
+          GOOGLE_CLIENT_SECRET=$GOOGLE_CLIENT_SECRET
+          GMAIL_PUBSUB_TOPIC=$GMAIL_PUBSUB_TOPIC
+          # Outlook / Microsoft
+          OUTLOOK_CLIENT_ID=$OUTLOOK_CLIENT_ID
+          OUTLOOK_CLIENT_SECRET=$OUTLOOK_CLIENT_SECRET
+          OUTLOOK_TENANT_ID=$OUTLOOK_TENANT_ID
+          OUTLOOK_CLIENT_STATE=$OUTLOOK_CLIENT_STATE
+          OUTLOOK_NOTIFICATION_URL=$OUTLOOK_NOTIFICATION_URL
+          MICROSOFT_CLIENT_ID=$MICROSOFT_CLIENT_ID
+          MICROSOFT_CLIENT_SECRET=$MICROSOFT_CLIENT_SECRET
+          # SMTP
+          SMTP_HOST=$SMTP_HOST
+          SMTP_PORT=$SMTP_PORT
+          SMTP_USERNAME=$SMTP_USERNAME
+          SMTP_PASSWORD=$SMTP_PASSWORD
+          SMTP_FROM=$SMTP_FROM
+          # Channels
+          WHATSAPP_ACCESS_TOKEN=$WHATSAPP_ACCESS_TOKEN
+          WHATSAPP_PHONE_NUMBER_ID=$WHATSAPP_PHONE_NUMBER_ID
+          INSTAGRAM_ACCESS_TOKEN=$INSTAGRAM_ACCESS_TOKEN
+          INSTAGRAM_PAGE_ID=$INSTAGRAM_PAGE_ID
+          MESSENGER_PAGE_ACCESS_TOKEN=$MESSENGER_PAGE_ACCESS_TOKEN
+          MESSENGER_PAGE_ID=$MESSENGER_PAGE_ID
+          TWILIO_ACCOUNT_SID=$TWILIO_ACCOUNT_SID
+          TWILIO_AUTH_TOKEN=$TWILIO_AUTH_TOKEN
+          TWILIO_FROM=$TWILIO_FROM
+          SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN
+          SLACK_DEFAULT_CHANNEL=$SLACK_DEFAULT_CHANNEL
+          SHOPIFY_API_VERSION=$SHOPIFY_API_VERSION
+          SHOPIFY_WEBHOOK_ADDRESS=$SHOPIFY_WEBHOOK_ADDRESS
+          STRIPE_SECRET_KEY=$STRIPE_SECRET_KEY
           AUTO_SEED=0
           AUTO_MIGRATE=1
           EOF
