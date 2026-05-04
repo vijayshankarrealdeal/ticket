@@ -1,0 +1,68 @@
+# Prod overlay applied on top of docker-compose.yml. Adds Caddy as the
+# public-facing reverse proxy / TLS terminator, locks the api/web ports
+# inside the docker network, and points the api at the prod domain.
+#
+# Usage on the VM:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Required env (CI writes /opt/workspacex/.env from GitHub secrets):
+#   PUBLIC_DOMAIN              e.g. workspacx.com
+#   ACME_EMAIL                 contact email Caddy registers with Let's Encrypt
+#   POSTGRES_PASSWORD          rotate from default `workspacex`
+#   LANGFLOW_SUPERUSER_PASSWORD
+#   WORKSPACEX_SECRET_KEY
+#   WORKSPACEX_INTERNAL_KEY
+#   PLATFORM_ADMIN_EMAIL
+#   PLATFORM_ADMIN_PASSWORD    >=12 chars; bootstraps the super-admin row
+#                              on first boot only
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - web
+
+  db:
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+  api:
+    environment:
+      DATABASE_URL: postgresql://workspacex:${POSTGRES_PASSWORD}@db:5432/workspacex
+      CORS_ORIGINS: https://${PUBLIC_DOMAIN},https://www.${PUBLIC_DOMAIN}
+      SPA_ORIGIN: https://${PUBLIC_DOMAIN}
+      BACKEND_ORIGIN: https://${PUBLIC_DOMAIN}
+      LANGFLOW_PUBLIC_URL: https://${PUBLIC_DOMAIN}/lf
+      AUTO_SEED: "0"
+      PLATFORM_ADMIN_EMAIL: ${PLATFORM_ADMIN_EMAIL}
+      PLATFORM_ADMIN_PASSWORD: ${PLATFORM_ADMIN_PASSWORD}
+
+  worker:
+    environment:
+      DATABASE_URL: postgresql://workspacex:${POSTGRES_PASSWORD}@db:5432/workspacex
+
+  web:
+    build:
+      context: .
+      args:
+        VITE_API_URL: /api
+
+  langflow:
+    environment:
+      LANGFLOW_CORS_ORIGINS: https://${PUBLIC_DOMAIN}
+
+volumes:
+  caddy_data:
+  caddy_config:

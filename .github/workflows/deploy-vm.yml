@@ -1,0 +1,134 @@
+name: Deploy to VM
+
+# Triggered on every push to `main`. SSHes into the production VM,
+# git-syncs to the new commit, writes /opt/workspacex/.env from GitHub
+# secrets, and rolls the docker-compose stack via the prod overlay
+# (docker-compose.prod.yml — adds Caddy + TLS termination).
+#
+# Required GitHub secrets (Settings → Secrets and variables → Actions):
+#   Infrastructure:
+#     VM_HOST                  public IP or hostname of the VM
+#     VM_USER                  ssh user (default: azureuser)
+#     VM_SSH_KEY               private key contents — paired with the
+#                              public key authorized_keys'd onto the VM
+#   App / domain:
+#     PUBLIC_DOMAIN            e.g. workspacx.com
+#     ACME_EMAIL               admin email for Let's Encrypt registration
+#     POSTGRES_PASSWORD
+#     LANGFLOW_SUPERUSER_PASSWORD
+#     WORKSPACEX_SECRET_KEY
+#     WORKSPACEX_INTERNAL_KEY
+#     PLATFORM_ADMIN_EMAIL
+#     PLATFORM_ADMIN_PASSWORD  >= 12 chars; backend's bootstrap refuses
+#                              shorter values
+#   Optional integrations:
+#     AZURE_OPEN_AI_KEY, AZURE_ENDPOINT
+#     GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-vm
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Configure SSH
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Sync repo on VM
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          ssh "$VM_USER@$VM_HOST" "REPO_SHA='$GITHUB_SHA' bash -s" <<'REMOTE'
+          set -euo pipefail
+          DEST=/opt/workspacex
+          if [ ! -d "$DEST/.git" ]; then
+            sudo install -d -o "$USER" -g "$USER" "$DEST"
+            git clone https://github.com/vijayshankarrealdeal/ticket.git "$DEST"
+          fi
+          cd "$DEST"
+          git fetch origin main
+          git reset --hard "$REPO_SHA"
+          REMOTE
+
+      - name: Write .env on VM and roll the stack
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          PUBLIC_DOMAIN: ${{ secrets.PUBLIC_DOMAIN }}
+          ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          LANGFLOW_SUPERUSER_PASSWORD: ${{ secrets.LANGFLOW_SUPERUSER_PASSWORD }}
+          WORKSPACEX_SECRET_KEY: ${{ secrets.WORKSPACEX_SECRET_KEY }}
+          WORKSPACEX_INTERNAL_KEY: ${{ secrets.WORKSPACEX_INTERNAL_KEY }}
+          PLATFORM_ADMIN_EMAIL: ${{ secrets.PLATFORM_ADMIN_EMAIL }}
+          PLATFORM_ADMIN_PASSWORD: ${{ secrets.PLATFORM_ADMIN_PASSWORD }}
+          AZURE_OPEN_AI_KEY: ${{ secrets.AZURE_OPEN_AI_KEY }}
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: |
+          umask 077
+          # Write the dotenv locally then scp it — keeps the secrets out of
+          # the SSH command line / process listing on the runner.
+          cat > /tmp/dotenv <<EOF
+          PUBLIC_DOMAIN=$PUBLIC_DOMAIN
+          ACME_EMAIL=$ACME_EMAIL
+          POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+          LANGFLOW_SUPERUSER_PASSWORD=$LANGFLOW_SUPERUSER_PASSWORD
+          WORKSPACEX_SECRET_KEY=$WORKSPACEX_SECRET_KEY
+          WORKSPACEX_INTERNAL_KEY=$WORKSPACEX_INTERNAL_KEY
+          PLATFORM_ADMIN_EMAIL=$PLATFORM_ADMIN_EMAIL
+          PLATFORM_ADMIN_PASSWORD=$PLATFORM_ADMIN_PASSWORD
+          AZURE_OPEN_AI_KEY=$AZURE_OPEN_AI_KEY
+          AZURE_ENDPOINT=$AZURE_ENDPOINT
+          Client_ID=$GOOGLE_CLIENT_ID
+          Client_Secret=$GOOGLE_CLIENT_SECRET
+          AUTO_SEED=0
+          AUTO_MIGRATE=1
+          EOF
+          scp /tmp/dotenv "$VM_USER@$VM_HOST":/opt/workspacex/.env
+          rm /tmp/dotenv
+          ssh "$VM_USER@$VM_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/workspacex
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml pull --quiet || true
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
+          REMOTE
+
+      - name: Health check
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          ssh "$VM_USER@$VM_HOST" '
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+              if curl -fsS http://localhost:8000/healthz >/dev/null; then
+                echo "api healthy"
+                exit 0
+              fi
+              echo "attempt $i: api not ready yet"
+              sleep 5
+            done
+            echo "api never became healthy"
+            docker compose -f /opt/workspacex/docker-compose.yml -f /opt/workspacex/docker-compose.prod.yml logs --tail=80 api
+            exit 1
+          '

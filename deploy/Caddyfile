@@ -1,0 +1,40 @@
+# Caddy fronts the whole stack on the VM. Auto-issues Let's Encrypt for
+# {$PUBLIC_DOMAIN} via the on-demand HTTP-01 challenge — port 80 must be
+# reachable from the public internet for ACME to succeed.
+#
+# Routing:
+#   - /api/*      -> api:8000 (strip /api prefix)
+#   - /ws         -> api:8000 (websocket upgrade)
+#   - /flow/*, /webhooks/*, /widget*, /lf/*, /healthz -> api:8000
+#   - everything else -> web:80 (nginx serving the SPA)
+{
+    email {$ACME_EMAIL}
+}
+
+{$PUBLIC_DOMAIN}, www.{$PUBLIC_DOMAIN} {
+    encode zstd gzip
+
+    # api routes — strip the `/api` prefix so backend sees `/auth/...`,
+    # `/conversations/...` etc.
+    handle_path /api/* {
+        reverse_proxy api:8000
+    }
+
+    # WebSocket — both the workspace `/ws` and the widget `/widget/ws`
+    # paths upgrade in place; Caddy transparently proxies the upgrade.
+    @ws path /ws /widget/ws
+    handle @ws {
+        reverse_proxy api:8000
+    }
+
+    # Other backend-served paths that the browser hits directly.
+    @backend path /flow/* /webhooks/* /widget* /healthz /lf/*
+    handle @backend {
+        reverse_proxy api:8000
+    }
+
+    # Everything else is the SPA.
+    handle {
+        reverse_proxy web:80
+    }
+}
