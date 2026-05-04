@@ -50,6 +50,10 @@ services:
       BACKEND_ORIGIN: https://${PUBLIC_DOMAIN}
       LANGFLOW_PUBLIC_URL: https://${PUBLIC_DOMAIN}/lf
       AUTO_SEED: "0"
+      # Caddy is in front of every request — trust X-Forwarded-For so the
+      # auth rate limiter, audit log, and presence tracker see the real
+      # client IP instead of the Caddy container's address.
+      TRUST_PROXY_HEADERS: "1"
       PLATFORM_ADMIN_EMAIL: ${PLATFORM_ADMIN_EMAIL}
       PLATFORM_ADMIN_PASSWORD: ${PLATFORM_ADMIN_PASSWORD}
 
