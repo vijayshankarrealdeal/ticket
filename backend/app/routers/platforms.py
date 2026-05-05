@@ -713,13 +713,20 @@ async def test_platform(pid: str, user: dict = Me) -> dict:
 
 
 @router.post("/platforms/gmail/sync")
-async def gmail_sync(user: dict = Me) -> dict:
+async def gmail_sync(
+    user: dict = Me,
+    backfill: int = Query(7, ge=0, le=90),
+) -> dict:
     """Force a Gmail pull right now. The background poller in worker.py runs
-    every 30 s so this is mostly a UX affordance — lets the user click
-    "Sync inbox" and see inbound emails show up immediately instead of
-    waiting for the next tick."""
+    every 30 s with `is:unread` only; this endpoint also pulls already-read
+    messages from the last `backfill` days (default 7, capped 90) so the
+    user sees historical mail right after a fresh connect. Subsequent calls
+    are idempotent — `external_message_id` dedup skips already-ingested rows.
+    """
     from ..channels.gmail_poller import poll_all_gmail_accounts
-    result = await poll_all_gmail_accounts(workspace_id=user["workspace_id"])
+    result = await poll_all_gmail_accounts(
+        workspace_id=user["workspace_id"], backfill_days=backfill,
+    )
     # Enrich with intent/health so the UI can tell "never connected" apart
     # from "connected but the stored token needs a reauth" — the two look
     # identical from the poller's perspective (both return accounts=0) but

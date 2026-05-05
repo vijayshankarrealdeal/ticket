@@ -181,9 +181,14 @@ def _headers_map(headers: list[dict]) -> dict[str, str]:
     return {(h.get("name") or "").lower(): h.get("value") or "" for h in headers or []}
 
 
-async def poll_gmail_for_credential(db, cred_row: dict) -> dict:
-    """Pull unread inbound messages for one credential row. Returns
-    `{ingested, fetched, error?}` so the caller can surface progress."""
+async def poll_gmail_for_credential(db, cred_row: dict, backfill_days: int = 0) -> dict:
+    """Pull inbound messages for one credential row. Returns
+    `{ingested, fetched, error?}` so the caller can surface progress.
+
+    `backfill_days`: when > 0, includes already-read mail from the last N
+    days (useful after a fresh connect). Default 0 = unread-only, for the
+    cheap periodic tick.
+    """
     from ..routers.conversations import (
         ingest_inbound_message,
         resolve_or_create_conversation,
@@ -199,20 +204,28 @@ async def poll_gmail_for_credential(db, cred_row: dict) -> dict:
         # Dev-mode creds can't call real Gmail — skip quietly.
         return {"ingested": 0, "fetched": 0, "note": "dev-token"}
 
-    # 1) List unread inbox messages, skipping:
+    # 1) List inbox messages, skipping:
     #    - our own outbound (would bounce the AI's replies back in)
     #    - automated senders (no-reply, notifications, security alerts) — the
     #      AI would cheerfully reply to newsletters otherwise
     #    - category:promotions / social to keep demos clean
+    if backfill_days > 0:
+        # Pull last N days regardless of read state. Dedup happens later
+        # via external_message_id, so re-running is safe and idempotent.
+        date_filter = f"newer_than:{int(backfill_days)}d"
+        max_results = 100
+    else:
+        date_filter = "is:unread"
+        max_results = 20
     gmail_query = (
-        "is:unread -in:sent -in:chats "
+        f"{date_filter} -in:sent -in:chats "
         "-from:noreply -from:no-reply -from:donotreply -from:do-not-reply "
         "-from:notifications -from:mailer-daemon -from:postmaster "
         "-category:promotions -category:social"
     )
     status, body = await _gmail_get(
         f"{GMAIL_API}/messages", token,
-        {"q": gmail_query, "maxResults": 20, "labelIds": "INBOX"},
+        {"q": gmail_query, "maxResults": max_results, "labelIds": "INBOX"},
     )
     if status == 401 and refresh:
         new_token = await _refresh_access_token(db, cred_id, refresh)
@@ -221,7 +234,7 @@ async def poll_gmail_for_credential(db, cred_row: dict) -> dict:
         token = new_token
         status, body = await _gmail_get(
             f"{GMAIL_API}/messages", token,
-            {"q": gmail_query, "maxResults": 20, "labelIds": "INBOX"},
+            {"q": gmail_query, "maxResults": max_results, "labelIds": "INBOX"},
         )
     if status != 200 or not isinstance(body, dict):
         return {"ingested": 0, "fetched": 0, "error": f"list {status}: {str(body)[:200]}"}
@@ -376,10 +389,15 @@ async def _mark_read(token: str, mid: str) -> None:
         pass
 
 
-async def poll_all_gmail_accounts(workspace_id: str | None = None) -> dict:
+async def poll_all_gmail_accounts(
+    workspace_id: str | None = None,
+    backfill_days: int = 0,
+) -> dict:
     """Fan out the per-credential poller across every active Gmail account.
     Scoped to `workspace_id` when provided so the manual-sync endpoint
-    doesn't leak work to other tenants."""
+    doesn't leak work to other tenants. `backfill_days > 0` includes
+    already-read mail from the last N days — call from the manual sync
+    endpoint, not the periodic worker tick."""
     db = await get_db()
     clauses = ["provider = 'gmail'", "status = 'active'"]
     params: list = []
@@ -390,7 +408,7 @@ async def poll_all_gmail_accounts(workspace_id: str | None = None) -> dict:
     rows = [dict(r) for r in await cur.fetchall()]
     totals = {"accounts": 0, "ingested": 0, "fetched": 0, "errors": []}
     for r in rows:
-        result = await poll_gmail_for_credential(db, r)
+        result = await poll_gmail_for_credential(db, r, backfill_days=backfill_days)
         totals["accounts"] += 1
         totals["ingested"] += int(result.get("ingested") or 0)
         totals["fetched"] += int(result.get("fetched") or 0)
