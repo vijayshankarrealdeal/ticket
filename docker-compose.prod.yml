@@ -43,6 +43,12 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD}
 
   api:
+    # Pass every key in /opt/workspacex/.env through to the container so the
+    # backend can read OUTLOOK_*, MICROSOFT_*, SMTP_*, channel tokens, etc.
+    # without each one being listed individually in compose. Without this,
+    # the api falls into its dev-mode short-circuit (e.g. `code=dev` for
+    # OAuth) because os.environ.get("OUTLOOK_CLIENT_ID") returns None.
+    env_file: .env
     environment:
       DATABASE_URL: postgresql://workspacex:${POSTGRES_PASSWORD}@db:5432/workspacex
       CORS_ORIGINS: https://${PUBLIC_DOMAIN},https://www.${PUBLIC_DOMAIN}
@@ -58,6 +64,7 @@ services:
       PLATFORM_ADMIN_PASSWORD: ${PLATFORM_ADMIN_PASSWORD}
 
   worker:
+    env_file: .env
     environment:
       DATABASE_URL: postgresql://workspacex:${POSTGRES_PASSWORD}@db:5432/workspacex
 
