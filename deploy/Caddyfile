@@ -11,7 +11,16 @@
     email {$ACME_EMAIL}
 }
 
-{$PUBLIC_DOMAIN}, www.{$PUBLIC_DOMAIN} {
+# Canonicalise on the apex so the session cookie (httponly, no Domain
+# attribute → defaults to the host that set it) is sent on every request.
+# Without this, signing in on the apex and then loading the SPA from www
+# results in 401s on every authed call because the browser refuses to
+# send a workspacx.com cookie to www.workspacx.com.
+www.{$PUBLIC_DOMAIN} {
+    redir https://{$PUBLIC_DOMAIN}{uri} permanent
+}
+
+{$PUBLIC_DOMAIN} {
     encode zstd gzip
 
     # api routes — strip the `/api` prefix so backend sees `/auth/...`,
