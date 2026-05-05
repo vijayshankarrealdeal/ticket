@@ -162,8 +162,20 @@ async def oauth_start(
 
     client_id, _ = _provider_creds(provider)
     if not client_id:
-        # Dev mode: redirect straight to our callback with a synthetic code so
-        # the operator can exercise the success path without real credentials.
+        # Dev fallback: only fire when explicitly enabled with
+        # `OAUTH_DEV_FALLBACK=1`. Earlier this fired automatically whenever
+        # the client_id env var was missing, which on prod silently faked a
+        # successful "Connected" badge using a `code=dev` round-trip — easy
+        # to mistake for a real connection. Prod now 500s instead so the
+        # missing config is loud.
+        if os.environ.get("OAUTH_DEV_FALLBACK") != "1":
+            raise HTTPException(
+                500,
+                f"OAuth provider '{provider}' is not configured: "
+                f"missing {PROVIDERS[provider]['client_id_envs'][0]}. "
+                "Set the env vars in deploy secrets, or set "
+                "OAUTH_DEV_FALLBACK=1 to use the synthetic dev flow.",
+            )
         return RedirectResponse(
             f"{redirect_uri}?code=dev&state={state}", status_code=302,
         )
