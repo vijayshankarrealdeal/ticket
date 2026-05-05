@@ -1,0 +1,51 @@
+SKU,Product Name,Category,Description,Quantity,Unit Price,Cost Price,Supplier,Reorder Level,Warehouse,Last Restocked,Status
+SKU-1001,Wireless Mouse,Electronics,Ergonomic 2.4GHz wireless mouse,142,24.99,12.50,Logitek Inc,30,Warehouse A,2026-04-12,In Stock
+SKU-1002,Mechanical Keyboard,Electronics,RGB backlit mechanical keyboard,58,89.00,45.00,KeyForge Co,20,Warehouse A,2026-04-22,In Stock
+SKU-1003,USB-C Hub 7-in-1,Electronics,7-port USB-C multiport adapter,210,39.95,18.20,PortPro Ltd,50,Warehouse B,2026-04-30,In Stock
+SKU-1004,Noise Canceling Headphones,Electronics,Over-ear ANC Bluetooth headphones,34,179.99,92.00,SoundWave,15,Warehouse A,2026-03-28,Low Stock
+SKU-1005,4K Webcam,Electronics,UHD webcam with autofocus,72,119.50,56.75,VisionTech,25,Warehouse B,2026-04-05,In Stock
+SKU-1006,Laptop Stand Aluminum,Office,Adjustable aluminum laptop riser,189,42.00,16.80,DeskWorks,40,Warehouse A,2026-04-18,In Stock
+SKU-1007,Standing Desk Mat,Office,Anti-fatigue cushioned floor mat,67,55.00,22.40,DeskWorks,20,Warehouse C,2026-04-09,In Stock
+SKU-1008,Office Chair Lumbar,Office,Mesh ergonomic office chair,12,249.00,128.00,SeatRight,10,Warehouse C,2026-02-14,Low Stock
+SKU-1009,Whiteboard 4x6 ft,Office,Magnetic dry-erase whiteboard,28,139.00,68.00,BoardCo,8,Warehouse C,2026-03-22,In Stock
+SKU-1010,Sticky Notes Pack,Office,Pack of 12 assorted color sticky notes,540,12.99,4.10,PaperPlus,100,Warehouse A,2026-04-25,In Stock
+SKU-1011,Coffee Beans Arabica,Pantry,1lb whole bean medium roast,86,18.50,8.20,RoastHouse,30,Warehouse D,2026-04-28,In Stock
+SKU-1012,Green Tea Bags,Pantry,Box of 100 organic green tea bags,124,9.99,3.85,TeaTime,50,Warehouse D,2026-04-15,In Stock
+SKU-1013,Sparkling Water Lime,Pantry,12-pack 12oz lime sparkling water,78,8.49,3.20,FizzCo,40,Warehouse D,2026-04-21,In Stock
+SKU-1014,Granola Bars Variety,Pantry,Box of 24 mixed flavor granola bars,45,15.99,6.10,SnackBox,25,Warehouse D,2026-03-30,In Stock
+SKU-1015,Protein Powder Vanilla,Pantry,2lb whey protein vanilla flavor,22,49.99,22.00,FitFuel,15,Warehouse D,2026-03-12,Low Stock
+SKU-1016,Yoga Mat 6mm,Fitness,Non-slip TPE yoga mat,93,32.00,11.50,FlexFit,30,Warehouse B,2026-04-19,In Stock
+SKU-1017,Resistance Bands Set,Fitness,5-band set with door anchor,154,21.99,7.80,FlexFit,40,Warehouse B,2026-04-23,In Stock
+SKU-1018,Adjustable Dumbbell 25lb,Fitness,Single adjustable dumbbell 5-25lb,8,179.00,98.00,IronWorks,5,Warehouse B,2026-02-28,Low Stock
+SKU-1019,Foam Roller 18in,Fitness,High-density EVA foam roller,67,28.50,11.00,FlexFit,20,Warehouse B,2026-04-02,In Stock
+SKU-1020,Jump Rope Speed,Fitness,Adjustable steel cable jump rope,212,14.99,4.20,SwiftSport,50,Warehouse B,2026-04-26,In Stock
+SKU-1021,Cotton T-Shirt Black M,Apparel,100% cotton crew neck Medium,176,16.00,5.50,ThreadMill,60,Warehouse E,2026-04-10,In Stock
+SKU-1022,Cotton T-Shirt Black L,Apparel,100% cotton crew neck Large,142,16.00,5.50,ThreadMill,60,Warehouse E,2026-04-10,In Stock
+SKU-1023,Hoodie Gray L,Apparel,Pullover fleece hoodie gray Large,88,42.00,16.80,ThreadMill,30,Warehouse E,2026-04-04,In Stock
+SKU-1024,Baseball Cap Navy,Apparel,Adjustable cotton twill cap,201,18.99,6.20,CapWorks,50,Warehouse E,2026-04-17,In Stock
+SKU-1025,Wool Socks 3-Pack,Apparel,Merino wool crew socks size L,114,28.00,9.50,FootSnug,40,Warehouse E,2026-03-25,In Stock
+SKU-1026,Insulated Water Bottle,Outdoor,32oz double-walled stainless steel,158,29.99,11.20,HydraCore,40,Warehouse B,2026-04-14,In Stock
+SKU-1027,Camping Tent 4-Person,Outdoor,3-season dome tent waterproof,16,189.00,84.00,TrailGear,8,Warehouse B,2026-03-18,In Stock
+SKU-1028,Sleeping Bag 20F,Outdoor,Mummy bag rated to 20F,29,99.00,42.00,TrailGear,12,Warehouse B,2026-03-08,In Stock
+SKU-1029,Hiking Backpack 40L,Outdoor,Multi-day pack with rain cover,47,149.00,68.00,TrailGear,15,Warehouse B,2026-04-01,In Stock
+SKU-1030,LED Headlamp,Outdoor,500-lumen rechargeable headlamp,132,34.99,12.50,LumiTrek,40,Warehouse B,2026-04-20,In Stock
+SKU-1031,Cordless Drill 18V,Tools,18V lithium-ion drill with battery,38,99.99,46.00,PowerCraft,15,Warehouse C,2026-03-26,In Stock
+SKU-1032,Tape Measure 25ft,Tools,Magnetic locking tape measure,167,16.50,5.40,PowerCraft,50,Warehouse C,2026-04-13,In Stock
+SKU-1033,Hammer 16oz Claw,Tools,Fiberglass handle claw hammer,84,22.00,8.10,PowerCraft,25,Warehouse C,2026-03-31,In Stock
+SKU-1034,Screwdriver Set 12pc,Tools,Magnetic tip 12-piece set,72,29.99,11.00,PowerCraft,25,Warehouse C,2026-04-08,In Stock
+SKU-1035,Work Gloves Leather L,Tools,Heavy duty leather work gloves,196,18.00,6.40,GripPro,60,Warehouse C,2026-04-24,In Stock
+SKU-1036,Dog Food Chicken 30lb,Pet,Adult dry dog food chicken recipe,41,52.00,24.00,PetNourish,15,Warehouse D,2026-03-29,In Stock
+SKU-1037,Cat Litter Clumping 20lb,Pet,Multi-cat clumping clay litter,89,18.99,7.20,PetNourish,30,Warehouse D,2026-04-11,In Stock
+SKU-1038,Dog Leash 6ft,Pet,Reflective nylon dog leash,153,15.99,5.10,PawGear,40,Warehouse D,2026-04-16,In Stock
+SKU-1039,Cat Scratching Post,Pet,32in sisal rope scratching post,24,44.00,18.50,PawGear,10,Warehouse D,2026-03-15,Low Stock
+SKU-1040,Aquarium Filter 20gal,Pet,Hang-on-back filter for 20gal tank,33,29.99,12.50,AquaLife,12,Warehouse D,2026-03-20,In Stock
+SKU-1041,Vitamin C 1000mg,Health,Bottle of 120 vitamin C tablets,118,14.99,4.80,WellCare,40,Warehouse A,2026-04-07,In Stock
+SKU-1042,Multivitamin Daily,Health,Bottle of 90 daily multivitamins,96,19.99,7.50,WellCare,30,Warehouse A,2026-03-24,In Stock
+SKU-1043,First Aid Kit Family,Health,200-piece family first aid kit,52,34.99,14.20,SafeMed,20,Warehouse A,2026-04-03,In Stock
+SKU-1044,Hand Sanitizer 8oz,Health,70% alcohol hand sanitizer 8oz,287,4.99,1.40,SafeMed,80,Warehouse A,2026-04-27,In Stock
+SKU-1045,Digital Thermometer,Health,Fast-read digital thermometer,77,12.99,4.60,SafeMed,25,Warehouse A,2026-03-19,In Stock
+SKU-1046,Notebook A5 Dotted,Stationery,160-page A5 dotted notebook,219,12.50,3.80,PaperPlus,60,Warehouse A,2026-04-29,In Stock
+SKU-1047,Gel Pen Pack 10,Stationery,Pack of 10 assorted gel pens,341,8.99,2.40,PaperPlus,100,Warehouse A,2026-04-22,In Stock
+SKU-1048,Highlighter Pack 6,Stationery,Pack of 6 chisel-tip highlighters,265,6.99,1.90,PaperPlus,80,Warehouse A,2026-04-15,In Stock
+SKU-1049,Desk Organizer Mesh,Stationery,5-compartment mesh desk organizer,63,21.99,8.20,DeskWorks,20,Warehouse A,2026-03-27,In Stock
+SKU-1050,Stapler Heavy Duty,Stationery,40-sheet capacity heavy stapler,48,18.50,7.00,DeskWorks,15,Warehouse A,2026-04-06,In Stock

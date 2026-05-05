@@ -346,6 +346,12 @@ export const Icon = {
       <path d="M12 3 2 20h20zM12 10v4M12 17v.01" />
     </svg>
   ),
+  Eye: (p) => (
+    <svg viewBox="0 0 24 24" width="14" height="14" {...stroke} {...p}>
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  ),
   Book: (p) => (
     <svg viewBox="0 0 24 24" width="14" height="14" {...stroke} {...p}>
       <path d="M4 5a2 2 0 0 1 2-2h13v18H6a2 2 0 0 0-2 2zM4 19a2 2 0 0 1 2-2h13" />
