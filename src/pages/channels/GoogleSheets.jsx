@@ -74,6 +74,28 @@ export default function GoogleSheets() {
     } catch { /* ignore */ }
   };
 
+  const toggleAgentLink = async (id) => {
+    const sheet = sheets.find((s) => s.id === id);
+    if (!sheet) return;
+    const next = !sheet.linkedToAgent;
+    setSheets((prev) => prev.map((s) => (s.id === id ? { ...s, linkedToAgent: next } : s)));
+    try {
+      const updated = await api.patch(
+        `/sheets/${encodeURIComponent(id)}`,
+        { linkedToAgent: next },
+      );
+      setSheets((prev) => prev.map((s) => (s.id === id ? { ...s, ...updated } : s)));
+      if (next) {
+        try {
+          const synced = await api.post(`/sheets/${encodeURIComponent(id)}/sync`);
+          setSheets((prev) => prev.map((s) => (s.id === id ? { ...s, ...synced } : s)));
+        } catch { /* ignore — toggle still flipped */ }
+      }
+    } catch {
+      setSheets((prev) => prev.map((s) => (s.id === id ? { ...s, linkedToAgent: !next } : s)));
+    }
+  };
+
   return (
     <div className="ch-page">
       <div className="ch-page-head">
@@ -176,6 +198,14 @@ export default function GoogleSheets() {
                   <th className="num">Tabs</th>
                   <th className="num">Rows</th>
                   <th>Last sync</th>
+                  <th>
+                    <span
+                      className="ch-sheet-th-help"
+                      title="When on, the AI agent can read this sheet via kb_search and cite it when answering customer queries."
+                    >
+                      Link to AI agent
+                    </span>
+                  </th>
                   <th className="actions">Actions</th>
                 </tr>
               </thead>
@@ -204,6 +234,26 @@ export default function GoogleSheets() {
                     <td className="num">{s.tabs.length}</td>
                     <td className="num">{s.rows.toLocaleString()}</td>
                     <td className="ch-sheet-lastsync">{s.lastSync}</td>
+                    <td>
+                      <label
+                        className={'ch-toggle' + (s.linkedToAgent ? ' on' : '')}
+                        title={s.linkedToAgent
+                          ? 'On — agent can use this sheet as a source'
+                          : 'Off — agent will not see this sheet'}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={!!s.linkedToAgent}
+                          onChange={() => toggleAgentLink(s.id)}
+                        />
+                        <span className="ch-toggle-track">
+                          <span className="ch-toggle-thumb" />
+                        </span>
+                        <span className="ch-toggle-label">
+                          {s.linkedToAgent ? 'Linked' : 'Not linked'}
+                        </span>
+                      </label>
+                    </td>
                     <td className="actions">
                       <div className="ch-sheet-actions">
                         <button className="ch-row-action primary" onClick={() => setPreviewSheet(s)}>

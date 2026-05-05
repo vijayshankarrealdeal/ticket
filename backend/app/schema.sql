@@ -414,6 +414,9 @@ ALTER TABLE users           ADD COLUMN IF NOT EXISTS langflow_password_secret_id
 CREATE UNIQUE INDEX IF NOT EXISTS users_provider_sub_idx
   ON users (workspace_id, provider, oauth_sub) WHERE oauth_sub IS NOT NULL;
 
+-- Sheets: opt-in flag that exposes a sheet to the AI agent as a knowledge source.
+ALTER TABLE sheets          ADD COLUMN IF NOT EXISTS linked_to_agent boolean NOT NULL DEFAULT false;
+
 -- Workspaces: AI guardrails + Langflow folder.
 ALTER TABLE workspaces      ADD COLUMN IF NOT EXISTS default_lang text NOT NULL DEFAULT 'en';
 ALTER TABLE workspaces      ADD COLUMN IF NOT EXISTS ai_prompt_append text;
@@ -607,15 +610,16 @@ CREATE INDEX IF NOT EXISTS csat_tokens_ticket_idx ON csat_tokens (ticket_id);
 
 -- ---------- Sheets (spec §3.9.5) — table for when the sync worker lands ----------
 CREATE TABLE IF NOT EXISTS sheets (
-  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  workspace_id  uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  url           text NOT NULL,
-  name          text,
-  tabs          jsonb NOT NULL DEFAULT '[]'::jsonb,
-  rows          int NOT NULL DEFAULT 0,
-  status        text NOT NULL DEFAULT 'connected',
-  last_sync_at  timestamptz,
-  created_at    timestamptz NOT NULL DEFAULT now()
+  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id     uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  url              text NOT NULL,
+  name             text,
+  tabs             jsonb NOT NULL DEFAULT '[]'::jsonb,
+  rows             int NOT NULL DEFAULT 0,
+  status           text NOT NULL DEFAULT 'connected',
+  linked_to_agent  boolean NOT NULL DEFAULT false,
+  last_sync_at     timestamptz,
+  created_at       timestamptz NOT NULL DEFAULT now()
 );
 
 -- ---------- E-commerce events feed (spec §3.9.2) ----------

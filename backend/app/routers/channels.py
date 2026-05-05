@@ -561,6 +561,7 @@ def _serialize_sheet(r: dict) -> dict:
         "tabs": jl(r.get("tabs"), []),
         "rows": int(r.get("rows") or 0),
         "status": r.get("status") or "connected",
+        "linkedToAgent": bool(r.get("linked_to_agent")),
         "lastSync": _rel(r.get("last_sync_at")),
         "lastSyncAt": r.get("last_sync_at"),
     }
@@ -634,11 +635,22 @@ async def sheets_patch(sid: str, body: dict, user: dict = Me) -> dict:
             fields[k] = body[k]
     if "tabs" in body:
         fields["tabs"] = js(body["tabs"])
+    if "linkedToAgent" in body:
+        fields["linked_to_agent"] = bool(body["linkedToAgent"])
     if fields:
         sets = ", ".join(f"{k} = ?" for k in fields)
         await db.execute(
             f"UPDATE sheets SET {sets} WHERE id = ? AND workspace_id = ?",
             (*fields.values(), sid, user["workspace_id"]),
+        )
+        await db.commit()
+    # Side effect: when an operator unlinks a sheet from the agent, evict its
+    # rows from kb_chunks so `kb_search` stops returning them. Re-linking
+    # repopulates via the existing /sync handler.
+    if "linkedToAgent" in body and not fields["linked_to_agent"]:
+        await db.execute(
+            "DELETE FROM kb_chunks WHERE workspace_id = ? AND source = ?",
+            (user["workspace_id"], f"sheet:{sid}"),
         )
         await db.commit()
     cur = await db.execute("SELECT * FROM sheets WHERE id = ?", (sid,))
@@ -677,28 +689,37 @@ async def sheets_sync(sid: str, user: dict = Me) -> dict:
         raise HTTPException(404, "sheet not found")
     sheet = dict(row)
     tabs = jl(sheet.get("tabs"), []) or ["Sheet1"]
+    is_linked = bool(sheet.get("linked_to_agent"))
 
     await db.execute(
         "DELETE FROM kb_chunks WHERE workspace_id = ? AND source = ?",
         (user["workspace_id"], f"sheet:{sid}"),
     )
     chunks_created = 0
-    for tab in tabs:
-        for i in range(5):  # 5 synthetic rows per tab — enough for demo recall.
-            await db.execute(
-                """
-                INSERT INTO kb_chunks (workspace_id, source, title, body)
-                VALUES (?,?,?,?)
-                """,
-                (user["workspace_id"], f"sheet:{sid}",
-                 f"{sheet.get('name') or 'Sheet'} · {tab} · row {i+1}",
-                 f"Row {i+1} from tab '{tab}' of sheet '{sheet.get('name')}' "
-                 f"({sheet.get('url')}). Replace with real Sheets API rows."),
-            )
-            chunks_created += 1
+    # Only populate kb_chunks when the operator has linked this sheet to the
+    # agent — otherwise the rows are visible to the operator but not to
+    # `kb_search`. The page can still show row counts because we update the
+    # `rows` column either way.
+    if is_linked:
+        for tab in tabs:
+            for i in range(5):  # 5 synthetic rows per tab — enough for demo recall.
+                await db.execute(
+                    """
+                    INSERT INTO kb_chunks (workspace_id, source, title, body)
+                    VALUES (?,?,?,?)
+                    """,
+                    (user["workspace_id"], f"sheet:{sid}",
+                     f"{sheet.get('name') or 'Sheet'} · {tab} · row {i+1}",
+                     f"Row {i+1} from tab '{tab}' of sheet '{sheet.get('name')}' "
+                     f"({sheet.get('url')}). Replace with real Sheets API rows."),
+                )
+                chunks_created += 1
+    # When unlinked we still report a synthetic row count so the operator sees
+    # what would land in the agent's KB the moment they flip the toggle.
+    row_count = chunks_created if is_linked else len(tabs) * 5
     await db.execute(
         "UPDATE sheets SET last_sync_at = now(), rows = ? WHERE id = ?",
-        (chunks_created, sid),
+        (row_count, sid),
     )
     await db.commit()
     cur = await db.execute("SELECT * FROM sheets WHERE id = ?", (sid,))
