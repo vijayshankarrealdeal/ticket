@@ -179,6 +179,11 @@ jobs:
           cd /opt/workspacex
           docker compose -f docker-compose.yml -f docker-compose.prod.yml pull --quiet || true
           docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+          # Caddyfile is bind-mounted as a single file. rsync replaces the
+          # file by inode, which Docker's bind mount doesn't track; without
+          # a restart the container keeps reading the old contents. Restart
+          # Caddy explicitly so deploy/Caddyfile changes always take effect.
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml restart caddy
           docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
           REMOTE
 
