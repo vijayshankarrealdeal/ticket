@@ -28,7 +28,12 @@
     }
 
     # Other backend-served paths that the browser hits directly.
-    @backend path /flow/* /webhooks/* /widget* /healthz /lf/*
+    # `/auth/oauth/*/callback` is critical: Google/Outlook redirect the
+    # browser there with `?code=…` after consent, and the api needs to
+    # complete the token exchange. Without it, Caddy 200s the SPA shell
+    # (which has no client-side route for /auth/oauth/...) and the OAuth
+    # flow appears to silently succeed in the URL bar but never finishes.
+    @backend path /flow/* /webhooks/* /widget* /healthz /lf/* /auth/oauth/*
     handle @backend {
         reverse_proxy api:8000
     }
