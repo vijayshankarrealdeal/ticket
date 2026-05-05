@@ -59,6 +59,10 @@ export default function ApiPlayground() {
   const [schemaDialogOpen, setSchemaDialogOpen] = useState(false);
   const [toast, setToast] = useState(null);
   const [expandedFolders, setExpandedFolders] = useState([]);
+  const [descOpen, setDescOpen] = useState(false);
+  const [curlOpen, setCurlOpen] = useState(false);
+  const [curlText, setCurlText] = useState('');
+  const [curlError, setCurlError] = useState('');
 
   useEffect(() => {
     if (activeEnvId) localStorage.setItem(ACTIVE_ENV_KEY, activeEnvId);
@@ -258,6 +262,7 @@ export default function ApiPlayground() {
       body: ep.body || '',
     });
     setResult(null);
+    if (ep.description) setDescOpen(true);
   };
 
   async function saveCurrentAsEndpoint(folderId) {
@@ -731,9 +736,15 @@ export default function ApiPlayground() {
               {req.endpointId ? (
                 <button
                   className="btn secondary"
-                  onClick={updateCurrentEndpoint}
-                  disabled={!req.description.trim()}
-                  title={!req.description.trim() ? 'Add a description before saving' : 'Save changes'}
+                  onClick={() => {
+                    if (!req.description.trim()) {
+                      setDescOpen(true);
+                      setToast({ tone: 'danger', msg: 'Add a tool description before saving.' });
+                      return;
+                    }
+                    updateCurrentEndpoint();
+                  }}
+                  title="Save changes"
                 >
                   <Icon.Check /> Save
                 </button>
@@ -741,9 +752,15 @@ export default function ApiPlayground() {
                 <div className="pg-save-menu">
                   <button
                     className="btn secondary"
-                    onClick={() => setSavePickerOpen((v) => !v)}
-                    disabled={!req.description.trim()}
-                    title={!req.description.trim() ? 'Add a description before saving' : 'Save to folder'}
+                    onClick={() => {
+                      if (!req.description.trim()) {
+                        setDescOpen(true);
+                        setToast({ tone: 'danger', msg: 'Add a tool description before saving.' });
+                        return;
+                      }
+                      setSavePickerOpen((v) => !v);
+                    }}
+                    title="Save to folder"
                   >
                     <Icon.Check /> Save…
                   </button>
@@ -764,25 +781,6 @@ export default function ApiPlayground() {
                 </button>
               )}
             </div>
-          </div>
-
-          <div className={'pg-desc-field' + (req.description.trim() ? '' : ' required')}>
-            <div className="pg-desc-label">
-              <span>Description</span>
-              <span className="pg-desc-meta">
-                {req.description.trim()
-                  ? 'Shown to LLMs when this is used as a tool'
-                  : 'Required — LLMs use this to decide when to call this tool'}
-              </span>
-            </div>
-            <textarea
-              className="pg-desc-input"
-              value={req.description}
-              onChange={(e) => setField('description', e.target.value)}
-              placeholder="What does this API do? When should the agent call it? What arguments matter?"
-              rows={2}
-              spellCheck={false}
-            />
           </div>
 
           <div className="pg-url-row">
@@ -814,8 +812,99 @@ export default function ApiPlayground() {
             </div>
           )}
 
-          {!req.endpointId && !req.url && !req.body && (
-            <GettingStartedCard onLoad={(ex) => setReq((r) => ({ ...r, ...ex }))} />
+          <div className="pg-toolbar">
+            <button
+              type="button"
+              className={'pg-toolbar-chip' + (curlOpen ? ' active' : '')}
+              onClick={() => { setCurlOpen((v) => !v); setCurlError(''); }}
+              title="Paste a curl command and we'll fill in the request"
+            >
+              <Icon.Code /> Import curl
+            </button>
+            <button
+              type="button"
+              className={'pg-toolbar-chip' + (descOpen || req.description ? ' active' : '')}
+              onClick={() => setDescOpen((v) => !v)}
+            >
+              {req.description.trim() ? <Icon.Check /> : <Icon.Info />}
+              Tool description
+              {!req.description.trim() && (
+                <span className="pg-toolbar-chip-hint">optional · needed to save as tool</span>
+              )}
+            </button>
+            {!req.endpointId && !req.url && !req.body && (
+              <button
+                type="button"
+                className="pg-toolbar-chip subtle"
+                onClick={() => setReq((r) => ({ ...r, ...GEMINI_EXAMPLE }))}
+              >
+                <Icon.Bolt /> Try a sample request
+              </button>
+            )}
+          </div>
+
+          {curlOpen && (
+            <div className="pg-curl-import">
+              <textarea
+                value={curlText}
+                onChange={(e) => { setCurlText(e.target.value); setCurlError(''); }}
+                placeholder={'curl -X POST https://api.example.com/v1/foo \\\n  -H "Authorization: Bearer XYZ" \\\n  -d \'{"hello":"world"}\''}
+                rows={5}
+                spellCheck={false}
+              />
+              {curlError && <div className="pg-curl-error"><Icon.AlertTriangle /> {curlError}</div>}
+              <div className="pg-curl-actions">
+                <span className="pg-hint">We&rsquo;ll fill the URL, headers and body for you.</span>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    onClick={() => { setCurlOpen(false); setCurlText(''); setCurlError(''); }}
+                  >Cancel</button>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={!curlText.trim()}
+                    onClick={() => {
+                      const parsed = parseCurl(curlText);
+                      if (!parsed) {
+                        setCurlError('Could not parse — make sure it starts with `curl`.');
+                        return;
+                      }
+                      setReq((r) => ({
+                        ...r,
+                        method: parsed.method || r.method,
+                        url: parsed.url || r.url,
+                        headers: parsed.headers.length ? parsed.headers : r.headers,
+                        body: parsed.body || r.body,
+                      }));
+                      setCurlOpen(false);
+                      setCurlText('');
+                      setToast({ tone: 'success', msg: 'Imported from curl' });
+                    }}
+                  >Import</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {(descOpen || req.description) && (
+            <div className="pg-desc-panel">
+              <div className="pg-desc-panel-head">
+                <span className="pg-desc-panel-title">Tool description</span>
+                <span className="pg-desc-panel-sub">
+                  Shown to LLMs so they know when to call this tool. Required only when saving.
+                </span>
+              </div>
+              <textarea
+                className="pg-desc-input"
+                value={req.description}
+                onChange={(e) => setField('description', e.target.value)}
+                placeholder="What does this API do? When should the agent call it? What arguments matter?"
+                rows={3}
+                spellCheck={false}
+              />
+            </div>
           )}
 
           <div className="ch-segment pg-sub-seg">
@@ -1862,70 +1951,73 @@ const GEMINI_EXAMPLE = {
   ),
 };
 
-function GettingStartedCard({ onLoad }) {
-  return (
-    <div className="pg-getting-started">
-      <div className="pg-getting-started-head">
-        <span className="pg-getting-started-icon"><Icon.Bolt /></span>
-        <div>
-          <div className="pg-getting-started-title">First time? Load an example</div>
-          <div className="pg-getting-started-sub">
-            Translates a curl-style request into the editor below. Edit anything,
-            hit Send, then save it as a tool for your agents.
-          </div>
-        </div>
-      </div>
+// Best-effort curl parser. Handles common shapes: -X METHOD, multiple -H "K: V",
+// -d / --data / --data-raw with single or double quotes and \-line-continuations.
+// Doesn't try to be a full shell parser — just enough to seed the playground.
+function parseCurl(input) {
+  if (!input) return null;
+  const trimmed = String(input).trim();
+  if (!/^curl\b/i.test(trimmed)) return null;
 
-      <div className="pg-example">
-        <div className="pg-example-meta">
-          <span className="ch-method ch-method-post">POST</span>
-          <span className="pg-example-name">{GEMINI_EXAMPLE.name}</span>
-          <button
-            className="btn pg-example-load"
-            onClick={() => onLoad(GEMINI_EXAMPLE)}
-            type="button"
-          >
-            Load this example
-          </button>
-        </div>
+  const tokens = tokenizeCurl(trimmed.replace(/\\\s*\n/g, ' '));
+  if (tokens.length === 0) return null;
 
-        <div className="pg-example-grid">
-          <div className="pg-example-col">
-            <div className="pg-example-label">Original curl</div>
-            <pre className="pg-example-code">{`curl -X POST \\
-  -H "Content-Type: application/json" \\
-  "https://generativelanguage.googleapis.com/v1beta/models/\\
-gemini-3-flash-preview:streamGenerateContent\\
-?key=$GEMINI_API_KEY" \\
-  -d '@request.json'`}</pre>
-          </div>
-          <div className="pg-example-col">
-            <div className="pg-example-label">Maps to the Playground</div>
-            <ul className="pg-example-map">
-              <li>
-                <strong>Method</strong> dropdown ← <code>-X POST</code>
-              </li>
-              <li>
-                <strong>URL</strong> bar ← the request URL.
-                <br />
-                Replace <code>$GEMINI_API_KEY</code> with{' '}
-                <code>{'{{GEMINI_API_KEY}}'}</code> and add it as a variable in
-                the Environments tab on the left.
-              </li>
-              <li>
-                <strong>Headers</strong> tab ← every <code>-H</code> flag, one
-                row per header.
-              </li>
-              <li>
-                <strong>Body</strong> tab ← the JSON after <code>-d</code>{' '}
-                (the contents of <code>request.json</code> here).
-              </li>
-            </ul>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
+  let method = '';
+  let url = '';
+  const headers = [];
+  let body = '';
+
+  for (let i = 1; i < tokens.length; i += 1) {
+    const tok = tokens[i];
+    if (tok === '-X' || tok === '--request') {
+      method = (tokens[++i] || '').toUpperCase();
+    } else if (tok === '-H' || tok === '--header') {
+      const raw = tokens[++i] || '';
+      const idx = raw.indexOf(':');
+      if (idx > 0) headers.push({ key: raw.slice(0, idx).trim(), value: raw.slice(idx + 1).trim() });
+    } else if (tok === '-d' || tok === '--data' || tok === '--data-raw' || tok === '--data-binary') {
+      body = tokens[++i] || '';
+      if (!method) method = 'POST';
+    } else if (tok === '-u' || tok === '--user') {
+      const creds = tokens[++i] || '';
+      headers.push({ key: 'Authorization', value: 'Basic ' + btoa(creds) });
+    } else if (tok === '--url') {
+      url = tokens[++i] || '';
+    } else if (!tok.startsWith('-') && !url) {
+      url = tok;
+    }
+  }
+  if (!url) return null;
+  if (!method) method = 'GET';
+  if (headers.length === 0) headers.push({ key: '', value: '' });
+  return { method, url, headers, body };
+}
+
+function tokenizeCurl(s) {
+  const out = [];
+  let buf = '';
+  let quote = null;
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s[i];
+    if (quote) {
+      if (c === '\\' && quote === '"' && s[i + 1] != null) {
+        buf += s[i + 1];
+        i += 1;
+      } else if (c === quote) {
+        quote = null;
+      } else {
+        buf += c;
+      }
+    } else if (c === '"' || c === "'") {
+      quote = c;
+    } else if (/\s/.test(c)) {
+      if (buf) { out.push(buf); buf = ''; }
+    } else {
+      buf += c;
+    }
+  }
+  if (buf) out.push(buf);
+  return out;
 }
 
 function EnvHelpButton() {
